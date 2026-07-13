@@ -1,0 +1,8 @@
+[package]
+name = "skeleton-server"
+version = "0.0.0"
+edition.workspace = true
+
+[dependencies]
+ziee-core = { path = "../../crates/ziee-core" }
+ziee-framework = { path = "../../crates/ziee-framework" }

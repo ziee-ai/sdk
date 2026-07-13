@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "desktop/*", "examples/*"]
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+# Shared dependency versions for the SDK workspace will live here.
+# Intentionally left mostly empty during the scaffold phase.

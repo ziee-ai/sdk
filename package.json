@@ -1,0 +1,7 @@
+{
+  "name": "@ziee/sdk-root",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ]
+}
