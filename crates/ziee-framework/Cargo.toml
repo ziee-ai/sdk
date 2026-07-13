@@ -6,3 +6,16 @@ edition.workspace = true
 [dependencies]
 ziee-core = { path = "../ziee-core" }
 ziee-identity = { path = "../ziee-identity" }
+
+# Versions match the ziee server crate's [workspace.dependencies] catalog
+# (src-app/Cargo.toml) so the single src-app/Cargo.lock unifies them without a
+# duplicate build when ziee consumes ziee-framework by path. These crates are
+# TYPES + machinery only (module system + app_builder); build-DB-free (plan §7).
+aide = { version = "0.15", features = ["axum", "axum-json", "macros"] }
+axum = { version = "0.8.4", features = ["macros", "multipart"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres"] }
+tower-http = { version = "0.6.2", features = ["cors"] }
+tower_governor = "0.7"
+linkme = "0.3"
+async-trait = "0.1"
+tracing = "0.1"

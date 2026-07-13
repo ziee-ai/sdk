@@ -1,8 +1,19 @@
-//! `ziee-framework` — module machinery + codegen + sync (build-DB-free).
+//! `ziee-framework` — module machinery + app_builder (build-DB-free).
 //!
-//! Future contents: the module system (`AppModule`/`ModuleContext`/`MODULE_ENTRIES`),
-//! `app_builder`, aide `with_permission`, the `emit_ts` generator + OpenAPI driver,
-//! sync core (`SyncEntityKind`), `declare_repositories!`, the EventBus, and
-//! `RequirePermissions` built on `ziee-identity`.
+//! Chunk B2 moved the module system (`AppModule` / `ModuleContext` /
+//! `ModuleEntry` / `MODULE_ENTRIES`) and `app_builder` (module discovery,
+//! router assembly, CORS + rate-limit layers) here from the ziee server crate.
+//! The domain-free `EventHandler` trait lives here too, since `AppModule`
+//! returns it; the domain-coupled `AppEvent` enum + `EventBus` dispatcher stay
+//! app-side (they move in a later chunk — plan B5).
+//!
+//! ziee consumes these via equivalence-preserving re-export shims (decision
+//! N2): `crate::module_api` and `crate::core::app_builder` re-export from here,
+//! so the module registration sites and boot path stay unchanged.
 
-pub fn _placeholder() {}
+pub mod app_builder;
+pub mod events;
+pub mod module_api;
+
+pub use events::EventHandler;
+pub use module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
