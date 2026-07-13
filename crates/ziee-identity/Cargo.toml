@@ -5,3 +5,13 @@ edition.workspace = true
 
 [dependencies]
 ziee-core = { path = "../ziee-core" }
+# Versions match the ziee server crate's [workspace.dependencies] catalog
+# (src-app/Cargo.toml) so the single src-app/Cargo.lock unifies them without a
+# duplicate build when ziee consumes ziee-identity by path. `PermissionInfo`
+# keeps its `JsonSchema`/serde derives (it is a non-OpenAPI-registered
+# projection today, so moving it is E8-neutral).
+serde = { version = "1.0.219", features = ["derive"] }
+schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+
+[dev-dependencies]
+serde_json = "1.0.141"
