@@ -33,6 +33,8 @@
 //! so its ~59 store consumers compile unchanged, plus its still-local
 //! processing/handlers/routes/ingest-orchestration.
 
+#[cfg(feature = "routes")]
+pub mod http;
 pub mod ingest;
 pub mod models;
 pub mod permissions;
