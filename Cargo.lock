@@ -8000,9 +8000,12 @@ dependencies = [
 name = "ziee-file"
 version = "0.0.0"
 dependencies = [
+ "aide",
  "async-trait",
+ "axum",
  "chrono",
  "hex",
+ "jsonwebtoken",
  "mime_guess",
  "schemars 0.9.0",
  "serde",
@@ -8012,7 +8015,9 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "ziee-auth",
  "ziee-core",
+ "ziee-framework",
  "ziee-identity",
  "zip",
 ]

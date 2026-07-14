@@ -3,6 +3,18 @@ name = "ziee-file"
 version = "0.0.0"
 edition = "2024"
 
+[features]
+# `routes` (default-on) turns on the mountable file HTTP/aide surface
+# (`http::file_routes` — the store-generic management/download/versions handlers)
+# and its aide/axum/ziee-framework/ziee-auth + jsonwebtoken deps. The file STORE
+# ENGINE (models, storage, repository, types, utils, permissions, seams, ingest)
+# compiles with `default-features = false` — no aide/axum — so an engine-only
+# consumer stays lean. The routes surface has NO `query!` macros beyond those the
+# engine already carries, so this feature does not change the file-only build-DB
+# story.
+default = ["routes"]
+routes = ["dep:aide", "dep:axum", "dep:ziee-framework", "dep:ziee-auth", "dep:jsonwebtoken"]
+
 [dependencies]
 # `ziee-file` is the generic, domain-agnostic multi-derivative blob STORE:
 # the `File`/`FileVersion` wire+insert models (+ the pure-data
@@ -33,6 +45,23 @@ sha2 = "0.10"
 hex = "0.4"
 mime_guess = "2.0"
 zip = "6.0.0"
+
+# HTTP/aide surface (routes feature only). `ziee-framework` provides the
+# resolver-generic permission extractors (`RequirePermissions<R,_>` +
+# `with_permission`) + the `SyncOrigin` header extractor; `ziee-auth` provides
+# the concrete `User`/`Group` wire types the routes fix their resolver to (every
+# file response is owner-scoped by `user.id`). Versions match ziee-framework so
+# the single aide/axum version unifies. `jsonwebtoken` signs download tokens.
+ziee-framework = { path = "../ziee-framework", optional = true }
+ziee-auth = { path = "../ziee-auth", optional = true }
+# `axum-query` supplies `OperationInput` for `axum::extract::Query` (the file
+# handlers' pagination/preview/page query params). The workspace-level aide the
+# server links already enables it, so the full-build feature union is unchanged;
+# it is declared here so `ziee-file` compiles STANDALONE (sdk `cargo check
+# --workspace`).
+aide = { version = "0.15", features = ["axum", "axum-json", "axum-query", "macros"], optional = true }
+axum = { version = "0.8.4", features = ["macros", "multipart"], optional = true }
+jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"], optional = true }
 
 [build-dependencies]
 # File-only build DB provisioning (mirrors ziee-auth): create + migrate
