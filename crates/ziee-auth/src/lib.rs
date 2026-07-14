@@ -1,8 +1,13 @@
 //! `ziee-auth` — the DEFAULT (optional, replaceable) schema-bound auth module.
 //!
-//! Future contents: users/groups/permissions/`refresh_tokens`/sessions/
-//! `session_settings` tables + queries, login/register/LDAP/OAuth2, admin CRUD,
-//! the full Session & Token-Refresh subsystem, and the dual-mode auth strategies
-//! (multi-user + single-user auto-login/owner-`*`). Owns its migrations.
+//! Owns the concrete user/group/session wire types + (progressively) the auth
+//! module's queries, login/register/LDAP/OAuth2, admin CRUD, the Session &
+//! Token-Refresh subsystem, and the dual-mode auth strategies. Owns its
+//! migrations. Consumed by ziee via equivalence-preserving re-export shims
+//! (decision N2), so the ~hundreds of call sites + the wire schemas are
+//! unchanged (schemars keys types by short ident, so moving the crate that
+//! defines `User`/`Group` does not move the OpenAPI schema name).
 
-pub fn _placeholder() {}
+mod models;
+
+pub use models::{Group, User};

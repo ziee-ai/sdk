@@ -1,0 +1,170 @@
+/*
+ * @ziee/kit — design tokens (shadcn CSS variable layer).
+ *
+ * The self-contained token contract the kit's components render against
+ * (bg-primary / text-muted-foreground / rounded-md / …). Extracted VERBATIM
+ * from ziee's `src-app/ui/src/index.css` (lines 47–205), which remains the
+ * application's single source of truth + the input to `npm run gen:design-spec`.
+ * A consuming app either imports this file or supplies its own equivalent layer;
+ * ziee keeps importing its own index.css, so this copy changes nothing for ziee.
+ */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* Semantic status tokens (distinct meanings — not part of nova-base, kept). */
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* Stock shadcn new-york-v4 oklch palette. The accent (primary/ring + sidebar
+ * primary/ring) is the one brand-driven token: its first-paint default below is
+ * the neutral slate-blue preset, and ThemeProvider.applyAccent overrides it per
+ * the user's chosen preset once JS runs. */
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: hsl(220 47% 43%);
+  --primary-foreground: hsl(0 0% 100%);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  /* Darkened from 0.556 so muted text (text-xs) clears WCAG-AA 4.5:1 even on the
+   * muted/secondary surface (oklch 0.97): grayscale luminance = L³, so on that bg
+   * 0.556→4.34:1 (fails) while 0.52→5.05:1. Still AA on white (5.5:1). */
+  --muted-foreground: oklch(0.52 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  /* Darkened from 0.577 so `text-destructive` clears WCAG-AA 4.5:1 as small
+   * text on the destructive/10 tint used by the soft-danger button variant and
+   * the attachment error description (white-on-solid destructive only gains
+   * contrast). */
+  --destructive: oklch(0.505 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: hsl(220 47% 43%);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: hsl(220 47% 43%);
+  --sidebar-primary-foreground: hsl(0 0% 100%);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: hsl(220 47% 43%);
+
+  /* Status — AA as text on the page background. info = teal, kept distinct from
+   * the (blue) accent so "informational" never reads as the brand color. */
+  --success: hsl(142 64% 30%);
+  --success-foreground: hsl(0 0% 100%);
+  --warning: hsl(32 80% 34%);
+  --warning-foreground: hsl(0 0% 100%);
+  --info: hsl(199 80% 34%);
+  --info-foreground: hsl(0 0% 100%);
+
+  /* Decorative backdrop color for the unauthenticated screens (login + setup).
+   * = the navy sky edge color of the cloud illustration; drives the backdrop
+   * solid fallback AND the iOS status/nav-bar tint (via useMetaThemeColor), so
+   * the screen-edge color follows the theme. Not a semantic UI token (kept out
+   * of @theme inline) — text never sits on it (cards are opaque --card). */
+  --auth-backdrop: hsl(205 96% 18%);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: hsl(216 56% 64%);
+  --primary-foreground: hsl(222 47% 11%);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0.985 0 0);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: hsl(216 56% 64%);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: hsl(216 56% 64%);
+  --sidebar-primary-foreground: hsl(222 47% 11%);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: hsl(216 56% 64%);
+
+  /* status — brighter fills for legibility as text on the dark background. */
+  --success: hsl(142 60% 55%);
+  --success-foreground: hsl(142 40% 9%);
+  --warning: hsl(38 90% 60%);
+  --warning-foreground: hsl(38 60% 10%);
+  --info: hsl(199 75% 60%);
+  --info-foreground: hsl(199 60% 9%);
+
+  /* Dark: a very dark navy so the darkening layer over the cloud image reads as
+   * "night sky" and the iOS bars match the darkened backdrop edge. */
+  --auth-backdrop: hsl(205 78% 7%);
+}
