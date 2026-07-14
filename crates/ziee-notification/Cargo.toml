@@ -1,0 +1,26 @@
+[package]
+name = "ziee-notification"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+# `ziee-notification` owns the DB-free wire/insert types (`models`:
+# `Notification`/`NewNotification`/`NotificationPage`/`UnreadCount`, schemars
+# keys preserved; `Notification` derives `sqlx::FromRow` but issues no `query!`)
+# + the `NotificationsRead` permission key (`ziee_identity::PermissionCheck`),
+# and CARRIES THE MODULE'S MIGRATIONS (`migrations/`, globbed into the app's
+# merged set). The schema-bound `repository` (compile-time `query_as!`) +
+# `events` (concrete `SyncEntity::Notification`) + aide/axum handlers/routes +
+# prune + registration stay in ziee: the fkeys reference other modules' tables
+# (users/conversations/scheduled_tasks/workflow_runs), so the queries verify
+# only against the app's FULL merged build DB — this crate needs NO build DB.
+# Versions match the ziee server crate so the single src-app/Cargo.lock unifies
+# them. Build-DB-free.
+ziee-identity = { path = "../ziee-identity" }
+
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "time", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
