@@ -2284,6 +2284,9 @@ dependencies = [
 name = "ziee-control-mcp"
 version = "0.0.0"
 dependencies = [
+ "aide",
+ "serde_json",
+ "tracing",
  "ziee-framework",
  "ziee-identity",
 ]

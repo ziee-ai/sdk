@@ -13,6 +13,13 @@
 
 pub mod app_builder;
 pub mod events;
+// Chunk C1: shared built-in-MCP-server scaffolding — the JSON-RPC 2.0 envelope
+// types (`JsonRpcRequest`/`JsonRpcResponse`/`JsonRpcError`) + the `loopback_host`
+// self-dial pin, dependency-free (serde/serde_json/ziee_core::AppError). Moved
+// from ziee's `code_sandbox` so `ziee-control-mcp` + any fresh app's built-in MCP
+// servers reuse them; ziee re-exports both via shims (code_sandbox::types /
+// code_sandbox::loopback_host) so all call sites are unchanged.
+pub mod mcp;
 pub mod module_api;
 // Chunk B6: the OpenAPI TypeScript-client generator (`emit_ts`, a pure function
 // of the spec) + the app-agnostic generation driver TAIL (`finish_and_emit`,
@@ -34,6 +41,7 @@ pub mod sync;
 pub mod repository;
 
 pub use events::EventHandler;
+pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, loopback_host};
 pub use module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
 pub use permissions::{IdentityResolver, RequireAdmin, RequirePermissions, with_permission};
 pub use sync::{

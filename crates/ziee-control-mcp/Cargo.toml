@@ -4,5 +4,18 @@ version = "0.0.0"
 edition.workspace = true
 
 [dependencies]
+# Dependency direction per plan §1.2 (framework + identity). The v1 tool-dispatch
+# core (catalog/policy/tools) is self-contained, but these are retained: the v1.5
+# handlers/permission-filter extraction needs the injected `IdentityResolver`
+# (ziee-framework) + the RBAC traits (ziee-identity).
 ziee-framework = { path = "../ziee-framework" }
 ziee-identity = { path = "../ziee-identity" }
+
+# `catalog::init_from_openapi` ingests the finished `aide::openapi::OpenApi`
+# document. serde_json backs the pure catalog builder + the tool descriptors;
+# tracing logs catalog init. Versions match the ziee server crate's
+# [workspace.dependencies] catalog so the single src-app/Cargo.lock unifies them
+# without a duplicate build when ziee consumes this crate by path. Build-DB-free.
+aide = { version = "0.15", features = ["axum", "axum-json", "macros"] }
+serde_json = "1.0.141"
+tracing = "0.1"
