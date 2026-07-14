@@ -7810,6 +7810,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ziee-build-support"
+version = "0.0.0"
+dependencies = [
+ "sqlx 0.8.6",
+ "tokio",
+]
+
+[[package]]
 name = "ziee-control-mcp"
 version = "0.0.0"
 dependencies = [
@@ -7831,6 +7839,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "sqlx 0.8.6",
+ "tempfile",
  "tracing",
  "uuid",
 ]
@@ -7876,6 +7885,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "ziee-build-support",
  "ziee-core",
  "ziee-identity",
 ]

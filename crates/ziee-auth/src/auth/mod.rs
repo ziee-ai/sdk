@@ -28,11 +28,23 @@ pub mod types;
 #[cfg(feature = "routes")]
 pub mod http;
 
+/// Turnkey auth wiring (chunk sdk-batteries / G1): `DefaultIdentityResolver` +
+/// `mount_auth` so an app mounts working auth in one call. Gated on `routes`
+/// (needs aide/axum). ADDITIVE — ziee keeps its own `ZieeIdentityResolver`.
+#[cfg(feature = "routes")]
+pub mod turnkey;
+
 #[cfg(feature = "routes")]
 pub use http::{auth_admin_routes, auth_routes};
 
+#[cfg(feature = "routes")]
+pub use turnkey::{mount_auth, AuthMountOptions, DefaultIdentityResolver};
+
 // Re-exports (mirror the app auth module's public surface).
-pub use context::{AuthContext, AuthEventSink, AuthSyncAction, AuthSyncEntity, AuthSyncSink};
+pub use context::{
+    AuthContext, AuthEventSink, AuthSyncAction, AuthSyncEntity, AuthSyncSink, NoopAuthEventSink,
+    NoopAuthSyncSink,
+};
 pub use jwt::JwtService;
 #[allow(unused_imports)]
 pub use password::hash_password;

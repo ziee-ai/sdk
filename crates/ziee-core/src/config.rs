@@ -17,6 +17,28 @@
 //! type can own the `ServerConfig` name. ziee re-exports both.
 
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+/// Minimum acceptable JWT secret length (bytes). HMAC-SHA256 ideally uses ≥ 32
+/// bytes of entropy. Mirrors ziee-auth's `JwtService::try_new` guard so an app
+/// using the SDK config loader gets the same refusal without depending on the
+/// auth crate.
+pub const MIN_JWT_SECRET_LEN: usize = 32;
+
+/// Known shipped placeholder secrets — refuse to boot with any of these (an
+/// operator whose config still contains a template value almost certainly forgot
+/// to override it, and the value is in public source control). Plain string
+/// match (not substring) so genuine 32+-char operator secrets aren't rejected.
+/// Kept in lockstep with ziee-auth's `jwt::BANNED_JWT_SECRETS`; the first entry
+/// is the `config/dev.example.yaml` placeholder the docs call out.
+const BANNED_JWT_SECRETS: &[&str] = &[
+    "dev-secret-change-in-production-min-32-chars-long",
+    "REPLACE_ME_WITH_A_LONG_RANDOM_SECRET_AT_LEAST_32_CHARS",
+    "your-secret-key-here",
+    "change-me",
+    "secret",
+    "changeme",
+];
 
 /// Framework server configuration: the app-agnostic settings a framework
 /// consumer needs. ziee's `Config` flattens this in, so on the wire the
@@ -66,6 +88,74 @@ impl ServerConfig {
 
     pub fn server_address(&self) -> String {
         format!("{}:{}", self.server.host, self.server.port)
+    }
+
+    /// Load + validate a `ServerConfig` from a YAML file (chunk sdk-batteries /
+    /// G2). Parses the framework keys (`postgresql`/`server`/`logging`/`jwt`);
+    /// any extra app-specific top-level keys are ignored (serde default). Refuses
+    /// a weak/placeholder `jwt.secret` so an app never boots with a known signer
+    /// — the same guard ziee documents in its own `Config::load_from`.
+    ///
+    /// ADDITIVE: ziee keeps its own monolithic `Config` loader; this is the SDK
+    /// helper a fresh app calls instead of re-implementing YAML load + validation.
+    pub fn load_from(path: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read config file '{}': {}", path.display(), e))?;
+        let config: ServerConfig = serde_norway::from_str(&content)
+            .map_err(|e| format!("failed to parse config file '{}': {}", path.display(), e))?;
+        config.validate_jwt_secret()?;
+        Ok(config)
+    }
+
+    /// Discover a config file: the `CONFIG_FILE` env var takes precedence, then a
+    /// short list of conventional locations relative to the current dir. Returns
+    /// the first existing path, or `None`.
+    pub fn discover() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("CONFIG_FILE") {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        for candidate in ["config/dev.yaml", "config/config.yaml", "config.yaml"] {
+            let path = PathBuf::from(candidate);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Discover (via [`discover`](Self::discover)) then [`load_from`](Self::load_from).
+    /// Errors if no config file is found.
+    pub fn load() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let path = Self::discover().ok_or_else(|| {
+            "no config file found — set CONFIG_FILE or place one at \
+             config/dev.yaml (e.g. CONFIG_FILE=config/dev.yaml)"
+                .to_string()
+        })?;
+        Self::load_from(&path)
+    }
+
+    /// Refuse a weak/placeholder `jwt.secret`. Mirrors ziee-auth's
+    /// `JwtService::try_new`.
+    pub fn validate_jwt_secret(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let secret = &self.jwt.secret;
+        if secret.len() < MIN_JWT_SECRET_LEN {
+            return Err(format!(
+                "jwt.secret is {} bytes; minimum is {}. Set jwt.secret to a random \
+                 ≥32-char string (e.g. `openssl rand -base64 48`).",
+                secret.len(),
+                MIN_JWT_SECRET_LEN
+            )
+            .into());
+        }
+        if BANNED_JWT_SECRETS.contains(&secret.as_str()) {
+            return Err("jwt.secret matches a shipped placeholder value. Set jwt.secret to a \
+                        unique random ≥32-char string (e.g. `openssl rand -base64 48`)."
+                .into());
+        }
+        Ok(())
     }
 }
 
@@ -293,6 +383,69 @@ mod rate_limit_config_tests {
         assert!(cfg.enabled);
         assert_eq!(cfg.per_second, 100);
         assert_eq!(cfg.burst_size, 200);
+    }
+}
+
+#[cfg(test)]
+mod load_from_tests {
+    use super::ServerConfig;
+    use std::io::Write;
+
+    const STRONG_SECRET: &str = "0123456789abcdef0123456789abcdef-strong";
+
+    fn yaml_with_secret(secret: &str) -> String {
+        format!(
+            "postgresql:\n  use_embedded: true\n  embedded:\n    version: '18.3.0'\n    port: 0\n    bind_address: 127.0.0.1\n    username: postgres\n    password: pw\n    database: app\n    timezone: UTC\n    log_timezone: UTC\n    logging:\n      collector: false\n      directory: log\n      filename: pg.log\n      statement: none\nserver:\n  host: 127.0.0.1\n  port: 3000\n  api_prefix: /api\njwt:\n  secret: '{secret}'\n  issuer: app\n  audience: app-api\n  access_token_expiry_hours: 24\n"
+        )
+    }
+
+    fn write_tmp(contents: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn loads_valid_config() {
+        let f = write_tmp(&yaml_with_secret(STRONG_SECRET));
+        let cfg = ServerConfig::load_from(f.path()).expect("valid config loads");
+        assert_eq!(cfg.server.port, 3000);
+        assert_eq!(cfg.jwt.issuer, "app");
+        assert!(cfg.postgresql.use_embedded);
+    }
+
+    #[test]
+    fn refuses_example_placeholder_secret() {
+        let f = write_tmp(&yaml_with_secret("dev-secret-change-in-production-min-32-chars-long"));
+        let err = ServerConfig::load_from(f.path()).unwrap_err().to_string();
+        assert!(err.contains("placeholder"), "got: {err}");
+    }
+
+    #[test]
+    fn refuses_too_short_secret() {
+        let f = write_tmp(&yaml_with_secret("short"));
+        let err = ServerConfig::load_from(f.path()).unwrap_err().to_string();
+        assert!(err.contains("minimum is 32"), "got: {err}");
+    }
+
+    #[test]
+    fn ignores_extra_app_specific_keys() {
+        // A real app YAML carries many keys ServerConfig doesn't model; they must
+        // be ignored, not rejected.
+        let mut yaml = yaml_with_secret(STRONG_SECRET);
+        yaml.push_str("app:\n  data_dir: /tmp/app\nmemory:\n  enabled: false\n");
+        let f = write_tmp(&yaml);
+        ServerConfig::load_from(f.path()).expect("extra keys ignored");
+    }
+
+    #[test]
+    fn discover_prefers_config_file_env() {
+        let f = write_tmp(&yaml_with_secret(STRONG_SECRET));
+        // SAFETY: single-threaded test; restore after.
+        unsafe { std::env::set_var("CONFIG_FILE", f.path()) };
+        let discovered = ServerConfig::discover();
+        unsafe { std::env::remove_var("CONFIG_FILE") };
+        assert_eq!(discovered.as_deref(), Some(f.path()));
     }
 }
 

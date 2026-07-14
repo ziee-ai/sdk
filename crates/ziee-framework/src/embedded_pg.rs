@@ -36,6 +36,32 @@ static DATABASE_POOL: OnceCell<Arc<PgPool>> = OnceCell::const_new();
 static POSTGRESQL_INSTANCE: OnceCell<Arc<Mutex<PostgreSQL>>> = OnceCell::const_new();
 static CLEANUP_REGISTERED: AtomicBool = AtomicBool::new(false);
 
+/// Default embedded-Postgres subdir under the app data dir
+/// (`ziee_core::app_state::get_app_data_dir()` = `~/.<app_name>` unless the app
+/// set it via `set_app_data_dir`/`set_app_name`), matching ziee's config
+/// `resolve_paths` convention (`<app.data_dir>/postgres` + `/postgres-data`).
+/// Used when an app leaves `postgresql.embedded.{installation_dir,data_dir}`
+/// unset, so no ziee-side `Config::resolve_paths` is required to boot.
+fn default_embedded_dir(sub: &str) -> String {
+    ziee_core::app_state::get_app_data_dir()
+        .join(sub)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Fill unset `installation_dir` / `data_dir` on an embedded-PG config with the
+/// app-data-dir-derived defaults (`<data dir>/postgres` + `/postgres-data`), so
+/// an app can resolve them ONCE instead of hard-coding both paths in YAML. A
+/// no-op for fields already set (operator/app overrides win). Optional — the
+/// embedded bring-up applies the same defaults inline — but handy for an app
+/// that wants the resolved paths visible on its own config struct before boot.
+pub fn resolve_embedded_paths(cfg: &mut ziee_core::config::EmbeddedPostgreSqlConfig) {
+    cfg.installation_dir
+        .get_or_insert_with(|| default_embedded_dir("postgres"));
+    cfg.data_dir
+        .get_or_insert_with(|| default_embedded_dir("postgres-data"));
+}
+
 /// App-supplied Postgres-extension hooks, threaded through the generic embedded
 /// bring-up so the framework installs no app-specific extension itself. Both are
 /// plain `fn` pointers (no captured state) so they survive the multi-attempt
@@ -197,17 +223,23 @@ async fn try_initialize_database_once(
         settings.version = VersionReq::parse(&format!("={}", embedded.version))?;
         settings.temporary = false;
 
-        // Paths are filled by `Config::resolve_paths` from `app.data_dir`
-        // if the operator didn't set them explicitly — see core/config.rs.
+        // installation_dir / data_dir default to `<app data dir>/postgres` and
+        // `<app data dir>/postgres-data` when unset — the same convention ziee's
+        // config path-resolution uses — so a fresh app need NOT hard-code both
+        // in YAML. ziee always fills these before boot (its `resolve_paths`), so
+        // its `Some(...)` values win here and the behaviour is byte-identical;
+        // the app-data-dir defaults only fire for an app that left them unset.
+        // (Scrubbed the former `Config::resolve_paths` panic message — that is a
+        // ziee-app-side symbol absent from the SDK.)
         let installation_dir = embedded
             .installation_dir
-            .as_ref()
-            .expect("installation_dir filled by Config::resolve_paths");
+            .clone()
+            .unwrap_or_else(|| default_embedded_dir("postgres"));
         let data_dir_str = embedded
             .data_dir
-            .as_ref()
-            .expect("data_dir filled by Config::resolve_paths");
-        settings.installation_dir = PathBuf::from(installation_dir);
+            .clone()
+            .unwrap_or_else(|| default_embedded_dir("postgres-data"));
+        settings.installation_dir = PathBuf::from(&installation_dir);
 
         // Stop any existing PostgreSQL instance before proceeding
         stop_existing_postgres_instance(&settings.installation_dir, pg_ctl_version)?;
@@ -219,7 +251,7 @@ async fn try_initialize_database_once(
         } else {
             settings.password = embedded.password.clone();
         }
-        settings.data_dir = PathBuf::from(data_dir_str);
+        settings.data_dir = PathBuf::from(&data_dir_str);
 
         // Set timezone from config
         settings
@@ -532,6 +564,52 @@ mod tests {
     /// tests — mirrors ziee's `ZIEE_POSTGRES_VERSION` build env (the SDK
     /// workspace has no such env, so the tests use a literal).
     const TEST_PG_VERSION: &str = "18.3.0";
+
+    fn sample_embedded_cfg() -> ziee_core::config::EmbeddedPostgreSqlConfig {
+        // serde_json fills the struct without hand-writing every field name;
+        // installation_dir/data_dir omitted so they deserialize to None.
+        serde_json::from_str(
+            r#"{
+                "version":"18.3.0","port":50000,"bind_address":"127.0.0.1",
+                "username":"postgres","password":"pw","database":"app",
+                "timezone":"UTC","log_timezone":"UTC",
+                "logging":{"collector":false,"directory":"log","filename":"pg.log","statement":"none"}
+            }"#,
+        )
+        .unwrap()
+    }
+
+    /// P0-b: `resolve_embedded_paths` fills unset installation_dir/data_dir with
+    /// app-data-dir-derived defaults (`<data dir>/postgres` + `/postgres-data`),
+    /// with NO reference to a ziee-side `Config::resolve_paths`.
+    #[test]
+    fn resolve_embedded_paths_fills_unset_dirs() {
+        let mut cfg = sample_embedded_cfg();
+        assert!(cfg.installation_dir.is_none());
+        assert!(cfg.data_dir.is_none());
+        resolve_embedded_paths(&mut cfg);
+        let base = ziee_core::app_state::get_app_data_dir();
+        assert_eq!(
+            cfg.installation_dir.as_deref(),
+            Some(base.join("postgres").to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            cfg.data_dir.as_deref(),
+            Some(base.join("postgres-data").to_string_lossy().as_ref())
+        );
+    }
+
+    /// Operator/app overrides win — already-set dirs are never clobbered
+    /// (equivalence-preserving for ziee, which always fills them).
+    #[test]
+    fn resolve_embedded_paths_preserves_set_dirs() {
+        let mut cfg = sample_embedded_cfg();
+        cfg.installation_dir = Some("/custom/pg".to_string());
+        cfg.data_dir = Some("/custom/pgdata".to_string());
+        resolve_embedded_paths(&mut cfg);
+        assert_eq!(cfg.installation_dir.as_deref(), Some("/custom/pg"));
+        assert_eq!(cfg.data_dir.as_deref(), Some("/custom/pgdata"));
+    }
 
     /// No `data/postmaster.pid` under the installation dir → there's nothing
     /// running, so the stop is a clean no-op (never shells out to pg_ctl).

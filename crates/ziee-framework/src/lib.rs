@@ -12,6 +12,13 @@
 //! so the module registration sites and boot path stay unchanged.
 
 pub mod app_builder;
+// Chunk sdk-batteries (decision #11): the `build.rs` support crate — module-owned
+// migration composition + per-worktree build-DB keying/provisioning — re-exported
+// under the canonical framework path so runtime code + any app's `build.rs` reach
+// it as `ziee_framework::build_support::{compose_merged_migrations,
+// provision_build_db, worktree_db, ...}`. The lean `ziee-build-support` crate is
+// the single home (build-DB-free, cheap as a `[build-dependencies]` entry).
+pub use ziee_build_support as build_support;
 pub mod embedded_pg;
 pub mod events;
 // Chunk C1: shared built-in-MCP-server scaffolding — the JSON-RPC 2.0 envelope
@@ -52,6 +59,7 @@ pub mod secret;
 pub mod secrets;
 pub mod url_validator;
 
+pub use app_builder::serve;
 pub use events::EventHandler;
 pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, loopback_host};
 pub use module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};

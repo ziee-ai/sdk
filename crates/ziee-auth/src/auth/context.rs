@@ -146,3 +146,69 @@ impl AuthContext {
         SessionSettingsRepository::new((*self.pool).clone())
     }
 }
+
+/// A no-op [`AuthEventSink`] (chunk sdk-batteries / G1) for an app that has no
+/// in-process event bus yet. Auth handlers still emit their lifecycle events;
+/// this sink simply drops them. An app that later grows an event bus swaps in a
+/// real impl without touching the auth surface.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopAuthEventSink;
+
+impl AuthEventSink for NoopAuthEventSink {
+    fn emit_user(&self, _ev: UserEvent) {}
+    fn emit_auth_provider(&self, _ev: AuthProviderEvent) {}
+}
+
+/// A no-op [`AuthSyncSink`] (chunk sdk-batteries / G1) for an app with no
+/// cross-device sync stream yet. Auth handlers still call `publish`; this sink
+/// drops the notifications. Swap in a real (SSE-backed) impl later without
+/// touching the auth surface.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopAuthSyncSink;
+
+impl AuthSyncSink for NoopAuthSyncSink {
+    fn publish(
+        &self,
+        _entity: AuthSyncEntity,
+        _action: AuthSyncAction,
+        _id: Uuid,
+        _audience: Audience,
+        _origin: Option<Uuid>,
+    ) {
+    }
+    fn publish_session_to_users(&self, _user_ids: &[Uuid], _origin: Option<Uuid>) {}
+}
+
+#[cfg(test)]
+mod noop_sink_tests {
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn noop_sinks_are_send_sync_and_inert() {
+        assert_send_sync::<NoopAuthEventSink>();
+        assert_send_sync::<NoopAuthSyncSink>();
+        // Behaviourally inert — calling them does nothing and never panics.
+        let ev = NoopAuthEventSink;
+        ev.emit_user(UserEvent::Deleted { user_id: Uuid::nil() });
+        ev.emit_auth_provider(AuthProviderEvent::Created { id: Uuid::nil() });
+        let sync = NoopAuthSyncSink;
+        sync.publish(
+            AuthSyncEntity::User,
+            AuthSyncAction::Create,
+            Uuid::nil(),
+            Audience::owner(Uuid::nil()),
+            None,
+        );
+        sync.publish_session_to_users(&[Uuid::nil()], None);
+    }
+
+    /// They satisfy the `Arc<dyn ...>` slots `AuthContext::new` requires — the
+    /// whole point of shipping them (G1: apps stop hand-writing 2 trait impls).
+    #[test]
+    fn noop_sinks_fit_authcontext_slots() {
+        let _events: Arc<dyn AuthEventSink> = Arc::new(NoopAuthEventSink);
+        let _sync: Arc<dyn AuthSyncSink> = Arc::new(NoopAuthSyncSink);
+    }
+}

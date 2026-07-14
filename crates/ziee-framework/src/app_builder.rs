@@ -180,15 +180,33 @@ pub fn apply_rate_limit_layer(
 /// permissive CORS; the loud log is enough to catch the misconfig
 /// in `journalctl`/`docker logs` review.
 pub fn create_cors_layer(config: &ServerConfig) -> CorsLayer {
+    // Chunk sdk-batteries (P1): a permissive-CORS default is expected on a
+    // loopback (local-dev) bind, so downgrade the loud `SECURITY:` ERROR to a
+    // debug line there — it was scaring devs on every localhost boot. A public
+    // (non-loopback) bind still gets the full ERROR so a real misconfig is caught
+    // in `journalctl`/`docker logs`.
+    let is_loopback = matches!(
+        config.server.host.as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    );
     let permissive_warning = |reason: &str| {
-        tracing::error!(
-            "SECURITY: CORS is permissive ({}). Any origin can call \
-             the API and read non-credentialed responses. Set \
-             server.cors.allow_origins to an explicit allowlist for \
-             production deployments (see config/prod.example.yaml). \
-             Closes 14-core F-04.",
-            reason
-        );
+        if is_loopback {
+            tracing::debug!(
+                "CORS is permissive ({}) on a loopback bind — expected in local \
+                 dev. Set server.cors.allow_origins to an explicit allowlist for \
+                 public deployments (see config/prod.example.yaml).",
+                reason
+            );
+        } else {
+            tracing::error!(
+                "SECURITY: CORS is permissive ({}). Any origin can call \
+                 the API and read non-credentialed responses. Set \
+                 server.cors.allow_origins to an explicit allowlist for \
+                 production deployments (see config/prod.example.yaml). \
+                 Closes 14-core F-04.",
+                reason
+            );
+        }
     };
 
     if let Some(ref cors_config) = config.server.cors {
@@ -249,4 +267,61 @@ pub fn create_cors_layer(config: &ServerConfig) -> CorsLayer {
             .allow_methods(Any)
             .allow_headers(Any)
     }
+}
+
+/// Serve `router` on `listener` with the two things every app's boot path must
+/// remember but the obvious `axum::serve(listener, app)` omits (chunk
+/// sdk-batteries / P1, fixes G7):
+///   1. `into_make_service_with_connect_info::<SocketAddr>()` — surfaces the TCP
+///      peer address so `apply_rate_limit_layer`'s tower-governor
+///      `PeerIpKeyExtractor` can read it. Without it, EVERY request returns
+///      tower-governor's raw "Unable To Extract Key!" with no hint why.
+///   2. graceful shutdown on Ctrl-C / SIGTERM.
+///
+/// Drop-in for a plain `axum::serve(listener, router).await`.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+) -> std::io::Result<()> {
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+}
+
+/// Resolve on Ctrl-C or SIGTERM. Graceful-with-warning: a container that strips
+/// signal-handler installation logs + falls back to "never returns" rather than
+/// crashing (mirrors ziee's own `shutdown_signal`).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("Failed to install Ctrl+C handler: {}", e);
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("Shutdown signal received");
 }
