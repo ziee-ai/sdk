@@ -13,6 +13,16 @@ edition = "2024"
 # widen the auth-only build-DB story.
 default = ["routes"]
 routes = ["dep:aide", "dep:axum"]
+# `module` (gap N-3, default-OFF) ships the turnkey `AuthModule` — a
+# `#[distributed_slice(MODULE_ENTRIES)]`-registered `AppModule` for the standard
+# `build_api_router` path (routes at `/api/auth/*` + whole-app resolver/JWT
+# extensions), using `DefaultIdentityResolver`. Implies `routes` (needs the aide
+# surface) + the `linkme` module registration. OFF by default so ziee — which
+# keeps its own `ZieeIdentityResolver`-backed module — never links a second,
+# conflicting auth module (keeps ziee's route/OpenAPI surface byte-identical). A
+# fresh app that wants batteries-included auth on the module-system path enables
+# `features = ["module"]`.
+module = ["routes", "dep:linkme"]
 
 [dependencies]
 ziee-core = { path = "../ziee-core" }
@@ -23,6 +33,10 @@ ziee-identity = { path = "../ziee-identity" }
 # single src-app/Cargo.lock unifies them without a duplicate build.
 aide = { version = "0.15", features = ["axum", "axum-json", "macros"], optional = true }
 axum = { version = "0.8.4", features = ["macros", "multipart"], optional = true }
+# `module` feature only: the linkme distributed-slice registration for the
+# turnkey `AuthModule` (gap N-3). Version matches ziee-framework so the single
+# src-app/Cargo.lock unifies the `MODULE_ENTRIES` slice across the crate boundary.
+linkme = { version = "0.3", optional = true }
 
 # Versions match the ziee server crate (src-app/server/Cargo.toml) so the
 # single src-app/Cargo.lock unifies them without a duplicate build when ziee
@@ -54,6 +68,14 @@ jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 oauth2 = "5.0.0"
 openidconnect = "4.0.1"
+
+[dev-dependencies]
+# `module`-feature test (gap N-3): drive the finished axum router with a
+# `oneshot` request to prove the whole-app resolver extension reaches a non-auth
+# gated route (401, not the 500 a missing resolver would yield). Versions pinned
+# to the workspace Cargo.lock.
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1.4"
 
 [build-dependencies]
 # Auth-only build DB provisioning (mirrors the app's build.rs): create +
