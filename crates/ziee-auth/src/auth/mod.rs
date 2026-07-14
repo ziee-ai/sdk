@@ -15,11 +15,21 @@ pub mod cookie;
 pub mod events;
 pub mod jwt;
 pub mod password;
+pub mod permissions;
 pub mod providers;
 pub mod refresh_tokens;
 pub mod repository;
 pub mod session_settings;
 pub mod types;
+
+/// The mountable HTTP/aide routes bundle (decision N10). Gated behind the
+/// default-on `routes` feature so the auth ENGINE can be consumed without the
+/// aide/axum surface.
+#[cfg(feature = "routes")]
+pub mod http;
+
+#[cfg(feature = "routes")]
+pub use http::{auth_admin_routes, auth_routes};
 
 // Re-exports (mirror the app auth module's public surface).
 pub use context::{AuthContext, AuthEventSink, AuthSyncAction, AuthSyncEntity, AuthSyncSink};

@@ -7,6 +7,7 @@
 //! skill/file/hub cleanup) and consumes this crate via re-export shims.
 
 pub mod events;
+pub mod permissions;
 pub mod repository;
 pub mod service;
 pub mod types;

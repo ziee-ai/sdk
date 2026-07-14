@@ -3,10 +3,26 @@ name = "ziee-auth"
 version = "0.0.0"
 edition = "2024"
 
+[features]
+# `routes` (default-on) turns on the mountable HTTP/aide surface
+# (`auth::http` — handlers/routes/jwt_extractor/session_settings) and its
+# aide/axum deps. The auth ENGINE (repositories, JWT, providers, session
+# subsystem) compiles with `default-features = false` — no aide/axum — so a
+# second app that wants only the engine (or an engine-only build-DB lane) stays
+# lean. The routes surface has NO `query!` macros, so this feature does not
+# widen the auth-only build-DB story.
+default = ["routes"]
+routes = ["dep:aide", "dep:axum"]
+
 [dependencies]
 ziee-core = { path = "../ziee-core" }
 ziee-framework = { path = "../ziee-framework" }
 ziee-identity = { path = "../ziee-identity" }
+
+# HTTP/aide surface (routes feature only). Versions match ziee-framework so the
+# single src-app/Cargo.lock unifies them without a duplicate build.
+aide = { version = "0.15", features = ["axum", "axum-json", "macros"], optional = true }
+axum = { version = "0.8.4", features = ["macros", "multipart"], optional = true }
 
 # Versions match the ziee server crate (src-app/server/Cargo.toml) so the
 # single src-app/Cargo.lock unifies them without a duplicate build when ziee

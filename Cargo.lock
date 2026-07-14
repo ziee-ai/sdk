@@ -7523,7 +7523,9 @@ dependencies = [
 name = "ziee-auth"
 version = "0.0.0"
 dependencies = [
+ "aide",
  "async-trait",
+ "axum",
  "axum-login",
  "base64 0.22.1",
  "bcrypt",
