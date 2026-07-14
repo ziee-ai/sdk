@@ -14,6 +14,8 @@
 pub mod app_builder;
 pub mod events;
 pub mod module_api;
+pub mod permissions;
 
 pub use events::EventHandler;
 pub use module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
+pub use permissions::{IdentityResolver, RequireAdmin, RequirePermissions, with_permission};
