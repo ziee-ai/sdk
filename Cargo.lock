@@ -4006,6 +4006,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
 
 [[package]]
+name = "portpicker"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be97d76faf1bfab666e1375477b23fde79eccf0276e9b63b92a39d676a889ba9"
+dependencies = [
+ "rand 0.8.7",
+]
+
+[[package]]
 name = "postgresql_archive"
 version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8077,6 +8086,20 @@ dependencies = [
  "schemars 0.9.0",
  "serde",
  "ziee-identity",
+]
+
+[[package]]
+name = "ziee-test-harness"
+version = "0.0.0"
+dependencies = [
+ "portpicker",
+ "reqwest 0.12.28",
+ "sqlx 0.8.6",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+ "ziee-build-support",
 ]
 
 [[package]]
