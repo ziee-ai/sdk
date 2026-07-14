@@ -1,0 +1,35 @@
+[package]
+name = "ziee-test-harness"
+version = "0.0.0"
+edition.workspace = true
+
+# The SDK's integration-test harness support crate. The generic core of the
+# former `server/tests/common/harness_inner.rs`: spawn the app binary against a
+# per-test isolated DB cloned from a fully-migrated template, allocate a free
+# port, render + write a temp config, health-poll readiness, and reap
+# everything (process + temp config + DROP DATABASE + tempdirs) on Drop.
+#
+# App-neutral: the harness names ONLY the `HarnessApp` seam, never `ziee`. Each
+# consuming app implements `HarnessApp` once (binary name, template DB base,
+# migration dirs, config render, pre-spawn side effects) and reuses all the
+# spawn/isolation/DB-clone/Drop machinery for free — the same reuse posture the
+# other SDK crates hold.
+#
+# A LEAN dev/test-support crate: it opens only RUNTIME Postgres connections (no
+# compile-time `query!` macros → build-DB-FREE), so it compiles with no build DB
+# and stays cheap as a `[dev-dependencies]` entry. Deps' versions + feature sets
+# mirror the ziee server catalog so the single `src-app/Cargo.lock` unifies them
+# without a duplicate build. Re-exports `ziee_build_support::worktree_db` so
+# consumers keep one import for the per-worktree DB keying it shares with build.rs.
+
+[dependencies]
+ziee-build-support = { path = "../ziee-build-support" }
+
+# Runtime-only Postgres: no `macros` feature → no `query!` → build-DB-free.
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "migrate"] }
+tokio = { version = "1.47.1", features = ["rt", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2"] }
+uuid = { version = "1.18", features = ["v4"] }
+url = "2.5"
+tempfile = "3.15"
+portpicker = "0.1"
