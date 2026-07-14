@@ -2314,6 +2314,7 @@ dependencies = [
  "aide",
  "async-trait",
  "axum",
+ "indexmap",
  "linkme",
  "schemars",
  "serde",

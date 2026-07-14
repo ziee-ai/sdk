@@ -14,6 +14,11 @@
 pub mod app_builder;
 pub mod events;
 pub mod module_api;
+// Chunk B6: the OpenAPI TypeScript-client generator (`emit_ts`, a pure function
+// of the spec) + the app-agnostic generation driver TAIL (`finish_and_emit`,
+// with the output paths parameterized). The app-specific config-load + module
+// init stays app-side and feeds a finished router/doc into `finish_and_emit`.
+pub mod openapi;
 pub mod permissions;
 // Chunk B5: the realtime-sync core (per-user SSE connection registry + caps +
 // audience routing + self-echo + the `SyncOrigin` extractor), generic over the

@@ -1,0 +1,146 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ziee-framework emit_ts golden fixture",
+    "version": "0.0.0"
+  },
+  "paths": {
+    "/api/items": {
+      "get": {
+        "operationId": "listItems",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "nullable": true }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Item" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createItem",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateItemRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Item" }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": "forbidden",
+                  "details": {
+                    "required_permissions": [
+                      {
+                        "name": "ItemsCreate",
+                        "value": "items::create",
+                        "description": "Create a new item"
+                      },
+                      {
+                        "name": "ItemsRead",
+                        "value": "items::read",
+                        "description": "Read items"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/items/{id}": {
+      "get": {
+        "operationId": "getItem",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Item" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Item": {
+        "type": "object",
+        "description": "A stored item.",
+        "required": ["id", "name", "kind"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Stable identifier."
+          },
+          "name": { "type": "string" },
+          "kind": { "$ref": "#/components/schemas/ItemKind" },
+          "description": { "type": "string", "nullable": true },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "count": { "type": "integer" }
+        }
+      },
+      "CreateItemRequest": {
+        "type": "object",
+        "required": ["name", "kind"],
+        "properties": {
+          "name": { "type": "string" },
+          "kind": { "$ref": "#/components/schemas/ItemKind" },
+          "description": { "type": "string", "nullable": true }
+        }
+      },
+      "ItemKind": {
+        "type": "string",
+        "enum": ["alpha", "beta", "gamma"]
+      }
+    }
+  }
+}
