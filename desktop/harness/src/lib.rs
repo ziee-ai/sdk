@@ -14,19 +14,30 @@
 //! - [`boot`] — the `ServerBoot` seam the app implements to hand the harness a
 //!   booted server's `{addr, pool, jwt}`.
 //!
-//! ## Deferred to the BG-3 prerequisite (see `.extraction/D/STOP_REPORT.md`)
+//! ## Window + boot orchestration shell (Chunk D-full)
 //!
-//! The live Tauri shell (`run` / `run_headless`, `register_desktop_invoke_handler`,
-//! the two IPC commands, per-OS `create_main_window`) and the embedded-Postgres
-//! relocation into `ziee-framework`'s DB bootstrap MOVE here only after the
-//! app-side `Repos`/JWT/config globals are threaded behind [`boot::ServerBoot`].
-//! Moving that live boot path before the seam exists would force a broken tree
-//! (the harness cannot reference `ziee::`), so it is reported, not forced.
+//! - [`window`] — the per-OS main-window construction (`create_main_window`) +
+//!   the boot→window spawn skeleton ([`window::spawn_boot_then_window`]),
+//!   generic over [`boot::ServerBoot`]. Moved verbatim from the ziee desktop
+//!   shell; the app supplies its [`window::WindowConfig`] + its domain post-boot
+//!   closure and gets the identical window lifecycle for free.
+//!
+//! ## Kept app-side (fundamentally app-domain — see `.extraction/D-full/CUT.md`)
+//!
+//! `run` / `run_headless` wrap the app's whole module system + `ziee::Config`
+//! assembly (`start_server_with_routes` = "the app's entire server assembly",
+//! per [`boot`]); `register_desktop_invoke_handler` + the two IPC commands
+//! (`get_server_port`, `auto_login`) resolve the in-crate `#[tauri::command]`
+//! macros + reach app-domain repositories. None can move without the harness
+//! naming `ziee::`, so they stay in `ziee-desktop` as thin consumers of this
+//! crate's window/boot shell + the [`boot::ServerBoot`] seam.
 
 pub mod boot;
 pub mod manifest;
 pub mod single_user;
+pub mod window;
 
 pub use boot::{BootHandle, ServerBoot};
 pub use manifest::{CapabilityManifest, DeploymentMode, FrontendManifest};
 pub use single_user::{OwnerLogin, SingleUserStrategy, OWNER_WILDCARD_PERMISSION};
+pub use window::{create_main_window, spawn_boot_then_window, WindowConfig};
