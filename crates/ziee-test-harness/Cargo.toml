@@ -33,3 +33,30 @@ uuid = { version = "1.18", features = ["v4"] }
 url = "2.5"
 tempfile = "3.15"
 portpicker = "0.1"
+
+# --- `fixtures` feature only (app-neutral auth/sync test mocks) --------------
+# Optional so the lean spawn/isolation core stays dep-light. Versions/features
+# mirror the ziee server catalog so the single Cargo.lock unifies them.
+serde_json = { version = "1", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+testcontainers = { version = "0.27.3", optional = true }
+wiremock = { version = "0.6", optional = true }
+jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"], optional = true }
+base64 = { version = "0.22", optional = true }
+rsa = { version = "0.9", features = ["pem"], optional = true }
+
+[features]
+# Compiles the `fixtures` module (oauth/ldap/apple mocks + the SSE sync probe).
+# Pulls the heavier test-only deps + reqwest's `stream` (sync_probe's
+# `bytes_stream()`) + tokio's `macros` (the fixtures' `#[cfg(test)]` self-tests).
+fixtures = [
+    "dep:serde_json",
+    "dep:tokio-stream",
+    "dep:testcontainers",
+    "dep:wiremock",
+    "dep:jsonwebtoken",
+    "dep:base64",
+    "dep:rsa",
+    "reqwest/stream",
+    "tokio/macros",
+]

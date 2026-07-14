@@ -34,6 +34,20 @@ use uuid::Uuid;
 // on both sides.
 pub use ziee_build_support::worktree_db;
 
+// App-neutral auth/sync test fixtures (feature-gated; heavier test-only deps).
+#[cfg(feature = "fixtures")]
+pub mod fixtures;
+
+/// Seam for [`fixtures::sync_probe::SyncProbe::open`]: the consuming app's thin
+/// `TestServer` shim implements this so the probe can build the
+/// `/sync/subscribe` URL without the fixture naming any app-side server type.
+/// Dep-free and always compiled (the impl lives on the app side, so it must not
+/// hide behind the `fixtures` feature).
+pub trait ApiUrlTarget {
+    /// Absolute URL for an API path (e.g. `"/sync/subscribe"` → base + `/api…`).
+    fn api_url(&self, path: &str) -> String;
+}
+
 /// Which app crate this test binary is compiled into. Replaces the former
 /// compile-time `is_desktop()` (a `CARGO_PKG_NAME` check) with a RUNTIME value
 /// the consumer's per-crate shim seeds (the shim is still `#[path]`-compiled
