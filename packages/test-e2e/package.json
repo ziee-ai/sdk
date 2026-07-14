@@ -1,0 +1,33 @@
+{
+  "name": "@ziee/test-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Layer-B end-to-end scaffold for ziee-SDK apps: a parameterized Playwright preset (server + desktop variants), the Postgres-docker global-setup/teardown (per-run isolation + server/UI warmup + first-run setup hook), a generic port allocator, and the i18n-safe data-testid selector helpers. The app supplies its specs + fixtures; this package supplies the reusable scaffold via one E2EConfig seam.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./config": "./src/config.ts",
+    "./global-setup": "./src/global-setup.ts",
+    "./global-teardown": "./src/global-teardown.ts",
+    "./testid": "./src/testid.ts",
+    "./port-manager": "./src/port-manager.ts",
+    "./preset": "./src/playwright-preset.ts",
+    "./*": "./src/*"
+  },
+  "scripts": {
+    "validate": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@playwright/test": "*"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/node": "^25.9.1",
+    "@types/pg": "^8.20.0",
+    "dotenv": "^17.4.2",
+    "pg": "^8.21.0",
+    "typescript": "~6.0.3"
+  }
+}

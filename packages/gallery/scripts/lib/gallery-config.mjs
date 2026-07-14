@@ -13,10 +13,21 @@ import path from 'node:path'
 const DEFAULTS = {
   /** Output/anchor dir (also where RUNTIME_FINDINGS + generated artifacts land). */
   galleryDir: 'src/dev/gallery',
+  /** The workspace `src/` root the registry generators anchor on (relative to cwd). */
+  srcDir: 'src',
   /** Roots the registry generators (testid/state-matrix/overlay) walk. */
   surfaceRoots: ['src/modules', 'src/components/ui'],
   /** Kit import specifier (overlay-registry `isKit()`). */
   kitImport: '@ziee/kit',
+  /** Import specifiers an overlay primitive is legitimately imported from
+   *  (gen-overlay-registry). A binding from elsewhere sharing a primitive name
+   *  is NOT counted. Each entry P matches `source === P || source.startsWith(P + '/')`. */
+  overlayKitImports: [
+    '@/components/ui',
+    '@/modules/layouts/app-layout/components/Drawer',
+  ],
+  /** tsconfig (relative to cwd) the ts-morph state-matrix pass loads. */
+  tsconfig: 'tsconfig.json',
   /** Dev-server port for the gate + runtime passes. */
   port: 1420,
   /** Standalone gallery URL. */
