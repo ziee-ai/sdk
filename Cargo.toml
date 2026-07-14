@@ -5,6 +5,18 @@ members = ["crates/*", "desktop/*", "examples/*"]
 [workspace.package]
 edition = "2021"
 
+# Workspace-wide lint policy. Members opt in with `[lints] workspace = true`
+# (the relocated sandbox leaf crates carry this line verbatim). Mirrors the
+# src-app workspace policy so a relocated crate's `[lints] workspace = true`
+# resolves identically here; SDK crates that don't opt in are unaffected.
+[workspace.lints.rust]
+unused_imports = "deny"
+unused_mut = "deny"
+dead_code = "warn"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+
 [workspace.dependencies]
 # Shared dependency versions for the SDK workspace will live here.
 # Intentionally left mostly empty during the scaffold phase.

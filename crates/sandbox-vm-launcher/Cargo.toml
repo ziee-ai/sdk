@@ -1,0 +1,33 @@
+[package]
+name = "sandbox-vm-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "macOS libkrun microVM launcher for the code sandbox. Spawned by the server as a child process; configures a libkrun context and calls krun_start_enter (which becomes the VM and never returns)."
+publish = false
+
+# macOS-only: the whole point is the libkrun FFI. On other targets this builds
+# to a stub that errors, so `cargo build` of the workspace stays sane.
+
+[[bin]]
+name = "ziee-sandbox-vm-launcher"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# getppid() for the parent-death watcher (macOS has no PR_SET_PDEATHSIG).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# libkrun is linked at build time on macOS. The dylib is bundled in the app
+# (see RUNBOOK); for dev, `brew install libkrun` provides it under
+# /opt/homebrew/lib. The actual link directive lives in build.rs.
+
+# The boot_smoke integration test is mac-only (drives libkrun). Keep its
+# dev-deps off other platforms so non-mac builds don't pull them in.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+sandbox-vm-protocol = { path = "../sandbox-vm-protocol" }

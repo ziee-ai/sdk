@@ -1,0 +1,25 @@
+[package]
+name = "sandbox-guest-agent"
+version = "0.1.0"
+edition = "2021"
+description = "In-VM init/agent for the code-sandbox microVM backend: mounts the rootfs, listens on vsock, runs the host-supplied bwrap argv, streams output back"
+publish = false
+
+[[bin]]
+name = "ziee-sandbox-agent"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sandbox-vm-protocol = { path = "../sandbox-vm-protocol" }
+# Same seccomp policy crate the Linux host uses — the guest applies an
+# identical filter. Requires libseccomp for the guest arch at build time
+# (static, like the server) — see MACOS-RUNBOOK.
+sandbox-seccomp = { path = "../sandbox-seccomp" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "net", "time", "sync"] }
+tokio-vsock = "0.7"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = "0.3"

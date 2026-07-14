@@ -1,0 +1,18 @@
+[package]
+name = "sandbox-seccomp"
+version = "0.1.0"
+edition = "2021"
+description = "Single source of truth for the code-sandbox seccomp policy (denylist + BPF builder), shared by the server's Linux backend and the in-VM guest agent so the two never drift."
+publish = false
+
+# Linux-only: libseccomp is a Linux library. Other targets get an empty crate
+# (the build_bpf fn + consts are cfg(target_os = "linux")), so it can sit in a
+# workspace built on macOS/Windows without breaking.
+
+[lints]
+workspace = true
+
+[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+libseccomp = "0.3"
+tempfile = "3.15"
