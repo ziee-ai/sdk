@@ -1,0 +1,38 @@
+{
+  "name": "@ziee/config",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared dev-config + design-token quality-gate tooling for ziee-SDK apps: biome preset, tsconfig base, syncpack policy, and parameterized design-contract lints.",
+  "exports": {
+    "./biome": "./biome.base.json",
+    "./biome.base.json": "./biome.base.json",
+    "./tsconfig": "./tsconfig.base.json",
+    "./tsconfig.base.json": "./tsconfig.base.json",
+    "./syncpack": "./syncpack.base.mjs",
+    "./check": "./src/check.mjs",
+    "./lint/*": "./src/lint/*"
+  },
+  "bin": {
+    "ziee-check": "./src/check.mjs",
+    "ziee-lint-colors": "./src/lint/hardcoded-colors.mjs",
+    "ziee-lint-settings-field": "./src/lint/settings-field.mjs",
+    "ziee-lint-adjacent-inline": "./src/lint/adjacent-inline.mjs",
+    "ziee-lint-logical-direction": "./src/lint/logical-direction.mjs",
+    "ziee-lint-tooltip-placement": "./src/lint/tooltip-placement.mjs",
+    "ziee-design-spec": "./src/lint/design-spec.mjs",
+    "ziee-kit-manifest": "./src/lint/kit-manifest.mjs"
+  },
+  "scripts": {
+    "test": "node --test scripts/config.test.mjs"
+  },
+  "peerDependencies": {
+    "typescript": "*"
+  },
+  "peerDependenciesMeta": {
+    "typescript": { "optional": true }
+  },
+  "devDependencies": {
+    "typescript": "~6.0.3"
+  }
+}

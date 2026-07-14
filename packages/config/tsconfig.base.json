@@ -1,0 +1,25 @@
+{
+  // Base TS config for ziee-SDK apps. Extend it and add app-specific `paths`,
+  // `include`, `exclude`, and `references`. Override any compilerOption (child
+  // wins) — e.g. a narrower `lib` such as ["ES2020", "DOM", "DOM.Iterable"].
+  "compilerOptions": {
+    "target": "ESNext",
+    "useDefineForClassFields": true,
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  }
+}
