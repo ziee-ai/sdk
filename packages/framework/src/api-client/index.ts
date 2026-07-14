@@ -11,6 +11,8 @@ import { callAsync } from './core'
 export {
   callAsync,
   getAuthToken,
+  setAuthToken,
+  setAuthTokenProvider,
   getBaseUrl,
   setBaseUrlResolver,
   setUnauthorizedHandler,

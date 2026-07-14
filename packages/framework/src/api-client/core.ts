@@ -21,9 +21,53 @@ export const setBaseUrlResolver = (fn: () => Promise<string>): void => {
 /** Resolve the API base URL via the registered resolver (default: same-origin). */
 export const getBaseUrl = (): Promise<string> => baseUrlResolver()
 
-export const getAuthToken = () => {
+// ─────────────────────── Auth-token provider (injectable) ───────────────────
+//
+// The bearer token attached to every request is app/platform-specific — an app
+// might hold it in a zustand-`persist` store, an httpOnly-cookie mirror, a
+// desktop keychain, or a plain variable. The framework transport therefore
+// takes the token via an injection point (the same DI pattern as
+// `setBaseUrlResolver` / `setUnauthorizedHandler` above).
+//
+// DEFAULT (unchanged): read `localStorage['auth-storage']` with the
+// `{ state: { token } }` zustand-persist shape — so ziee (and any app already
+// relying on that contract) keeps working with NO code change. An app that
+// stores its token elsewhere registers a provider via `setAuthTokenProvider`
+// (or the `setAuthToken` convenience) and its requests then authenticate; this
+// closes the silent-unauthenticated foot-gun where a non-`auth-storage` app
+// invisibly sent every request without a bearer token.
+
+let authTokenProvider: (() => string | null) | null = null
+
+/**
+ * Register a custom auth-token provider. When set, `getAuthToken()` calls this
+ * function on every request instead of reading `localStorage['auth-storage']`.
+ * Pass `null` to restore the default localStorage behavior.
+ */
+export const setAuthTokenProvider = (
+  fn: (() => string | null) | null,
+): void => {
+  authTokenProvider = fn
+}
+
+/**
+ * Convenience: authenticate with a static bearer token (or clear it with
+ * `null`). Installs a provider that always returns the given value — the
+ * common case for an app that fetches/refreshes its token out of band and
+ * just wants the transport to use it.
+ */
+export const setAuthToken = (token: string | null): void => {
+  authTokenProvider = () => token
+}
+
+/** The default token source: `localStorage['auth-storage']` (zustand-persist
+ *  `{ state: { token } }` shape). Used when no provider is injected. */
+const defaultAuthToken = (): string | null => {
   // eslint-disable-next-line no-undef
-  const authData = localStorage.getItem('auth-storage')
+  const authData =
+    typeof localStorage !== 'undefined'
+      ? localStorage.getItem('auth-storage')
+      : null
   if (!authData) return null
   try {
     const parsed = JSON.parse(authData)
@@ -35,6 +79,13 @@ export const getAuthToken = () => {
     console.error('[getAuthToken] Failed to parse auth-storage:', error)
     return null
   }
+}
+
+/** Resolve the current bearer token via the injected provider if one is
+ *  registered, else the default `localStorage['auth-storage']` source. */
+export const getAuthToken = (): string | null => {
+  if (authTokenProvider) return authTokenProvider()
+  return defaultAuthToken()
 }
 
 // ─────────────────────── Silent-refresh integration ───────────────────────

@@ -8,11 +8,18 @@
   "exports": {
     ".": "./src/index.ts",
     "./api-client": "./src/api-client/index.ts",
+    "./router": "./src/router/index.ts",
     "./*": "./src/*"
   },
   "peerDependencies": {
     "react": "^19.2.6",
-    "react-dom": "^19.2.6"
+    "react-dom": "^19.2.6",
+    "react-router-dom": "^7.15.1"
+  },
+  "peerDependenciesMeta": {
+    "react-router-dom": {
+      "optional": true
+    }
   },
   "dependencies": {
     "immer": "^11.1.8",
