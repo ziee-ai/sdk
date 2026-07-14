@@ -39,6 +39,17 @@ pub mod sync;
 // Its expansion generates the `Repos` global + factory machinery in the invoking
 // crate; the concrete repo LIST + `Repos.xxx` call sites stay in ziee.
 pub mod repository;
+// Chunk BG-2: shared infra prerequisites for the auth (BA-full) extraction.
+// `url_validator` is the domain-free SSRF outbound-URL guard (BG deferred this
+// move; `ziee-auth`'s `core::outbound` now retargets it here). `secret` is the
+// build-DB-free at-rest secret crypto (RATIFIED home = ziee-framework); it reads
+// its storage key from the `secrets` process-global (moved alongside so
+// `resolve_optional_secret` keeps its exact signature). ziee re-exports all three
+// via `crate::utils::url_validator` / `crate::common::secret` / `crate::core::secrets`
+// shims, so every consumer stays byte-unchanged.
+pub mod secret;
+pub mod secrets;
+pub mod url_validator;
 
 pub use events::EventHandler;
 pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, loopback_host};
