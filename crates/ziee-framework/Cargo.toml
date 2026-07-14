@@ -34,6 +34,15 @@ schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
 # single src-app/Cargo.lock unifies them.
 tokio = { version = "1.47.1", features = ["sync", "rt", "rt-multi-thread", "time", "macros", "signal", "net"] }
 uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
+# Chunk sdk-surfaces: the mountable `sync_routes()` SSE subscribe handler (moved
+# from ziee's `modules/sync/handlers.rs`) drives its per-connection stream with
+# `async_stream::stream!`, boxes the resulting `Stream` behind `futures_util`, and
+# bounds the stream deadline against the access token's unix `exp` via `chrono`.
+# Versions match the ziee server catalog (src-app/Cargo.toml) so the single
+# src-app/Cargo.lock unifies them.
+async-stream = "0.3"
+futures-util = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
 # Chunk B6: the emit_ts generator deserializes the OpenAPI spec into an
 # insertion-order-preserving value (indexmap, NOT serde_json::Value which would
 # alphabetize) and the driver tail serializes the finished doc + reads the JSON

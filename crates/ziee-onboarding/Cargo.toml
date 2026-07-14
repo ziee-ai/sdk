@@ -1,0 +1,39 @@
+[package]
+name = "ziee-onboarding"
+version = "0.0.0"
+edition = "2024"
+
+# `ziee-onboarding` is a SELF-CONTAINED schema-bound SDK module crate: a generic
+# guide/step completion tracker with ZERO domain coupling. It owns the
+# `user_onboarding` table (`migrations/`, globbed into the app's merged set), the
+# DB-free wire type (`OnboardingProgress`), AND the schema-bound repository
+# (compile-time `query!`/`query_as!` over `user_onboarding` ONLY). Because those
+# queries touch no other table, the crate carries its OWN `build.rs` provisioning
+# an onboarding-only build DB from its own `migrations/` — unlike
+# `ziee-notification`, whose repository stayed app-side (its FKs referenced other
+# modules' tables). The concrete GUIDES + step content are frontend (app-side);
+# the sync-coupled handlers/routes/registration stay in ziee (they name
+# `SyncEntity::Onboarding` / `Repos` / `RequirePermissions` / `JwtAuth`).
+#
+# STANDALONE-APPLICABLE (gap N-1): `migrations/` creates `user_onboarding` with
+# `user_id` as a PLAIN NOT-NULL uuid column with NO foreign key, so it applies on
+# a bare DB. ziee re-adds the `user_id → users(id)` FK in a ziee-side module
+# migration (`server/src/modules/onboarding/migrations/*_onboarding_fkeys.sql`),
+# sorted after both `user_onboarding` and `users` exist in the merged set.
+#
+# Versions match the ziee server crate (src-app/Cargo.toml) so the single
+# src-app/Cargo.lock unifies them without a duplicate build.
+
+[dependencies]
+ziee-core = { path = "../ziee-core" }
+
+serde = { version = "1.0.219", features = ["derive"] }
+schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid", "macros"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
+
+[build-dependencies]
+# Provisions the onboarding-only build DB from `migrations/` for the crate's
+# compile-time `query!` verification (per-worktree-keyed; honors a real external
+# `DATABASE_URL`). The one-call SDK contract (decision N7 / G4).
+ziee-build-support = { path = "../ziee-build-support" }
