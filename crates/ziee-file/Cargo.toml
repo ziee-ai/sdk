@@ -1,0 +1,43 @@
+[package]
+name = "ziee-file"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+# `ziee-file` is the generic, domain-agnostic multi-derivative blob STORE:
+# the `File`/`FileVersion` wire+insert models (+ the pure-data
+# `ProcessingResult`/`ProcessingMetadata`), the `FileStorage` trait +
+# `FilesystemStorage` impl + global manager, the schema-bound `FileRepository`
+# (`query!` macros over `files`/`file_versions` — this crate carries a build.rs
+# provisioning a file-only build DB, mirroring ziee-auth), the download-token /
+# pagination DTOs, the `extension_of` blob-key + magic-sniff + zip-bomb upload
+# validators, the `files::*` permission keys (`ziee_identity::PermissionCheck`),
+# and the two injected seams (`FileProcessor` / `FileEvents`) that sever the
+# app's processing engine + sync/RAG from the store. It CARRIES the base
+# `files`/`file_versions` migration (`migrations/`, globbed into the app's
+# merged set). NO domain reference (no workflow_run_id column, no chat/llm/
+# project imports).
+ziee-core = { path = "../ziee-core" }
+ziee-identity = { path = "../ziee-identity" }
+
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros", "migrate"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
+tokio = { version = "1.47.1", features = ["fs"] }
+async-trait = "0.1"
+tracing = "0.1"
+sha2 = "0.10"
+hex = "0.4"
+mime_guess = "2.0"
+zip = "6.0.0"
+
+[build-dependencies]
+# File-only build DB provisioning (mirrors ziee-auth): create + migrate
+# `ziee_file_build_<key>` on the shared :54321 cluster and point sqlx
+# compile-time `query!` verification at it. The base `files`/`file_versions`
+# tables carry no cross-module FK, so the file subset provisions standalone.
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "migrate"] }
