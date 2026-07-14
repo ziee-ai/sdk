@@ -56,9 +56,29 @@ export { DivScrollY, type DivScrollYProps } from './components/DivScrollY'
 
 // Layouts
 export { BlankLayout } from './layouts/BlankLayout'
+export { AppLayout, type AppLayoutProps } from './layouts/AppLayout'
+export type {
+  SidebarNavItem,
+  SidebarToolItem,
+  SidebarActionItem,
+  SidebarWidgetItem,
+} from './layouts/appLayoutSlots'
+
+// Settings scaffold (generic; the platform-variant `SettingsPage` stays
+// app-side behind the `@/` override seam)
+export { SettingsPageContainer } from './settings/SettingsPageContainer'
 
 // Bootstrap
 export { AppShell, type AppShellProps } from './bootstrap/AppShell'
 
 // Hooks
 export { usePrefetchModules } from './hooks/usePrefetchModules'
+export {
+  useWindowMinSize,
+  useElementMinSize,
+  calculateMinSize,
+  applyHysteresis,
+  breakpointValues,
+  type Breakpoint,
+  type MinSize,
+} from './hooks/useWindowMinSize'
