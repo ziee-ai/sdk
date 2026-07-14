@@ -3,4 +3,32 @@ name = "ziee-desktop-harness"
 version = "0.0.0"
 edition.workspace = true
 
+# `ziee-desktop-harness` — the REUSABLE desktop shell for an SDK app.
+#
+# It depends ONLY on the SDK crates (never on `ziee`/the app), so a second app
+# (CytoAnalyst) gets the desktop experience for free. What lives here today:
+#   - the FOUR-part capability manifest keyed by deployment mode (`manifest`),
+#   - the single-user auto-login strategy + owner-`*` model (`single_user`),
+#   - the `ServerBoot` seam (`boot`) the app implements to hand the harness a
+#     booted server's {addr, pool, jwt}.
+#
+# The Tauri shell itself (window/titlebar, the 2 IPC commands, the embed-server
+# spawn) lands here once the app-side `ServerBoot` seam is threaded — see
+# `.extraction/D/STOP_REPORT.md` (the BG-3 prerequisite). Adding `tauri` is
+# deferred until then so `cargo check --workspace` stays fast + green.
+
 [dependencies]
+# SDK crates only — NEVER the `ziee` app crate (reusability contract).
+ziee-core = { path = "../../crates/ziee-core" }
+ziee-identity = { path = "../../crates/ziee-identity" }
+ziee-auth = { path = "../../crates/ziee-auth" }
+
+# Versions match the ziee server crate + ziee-auth so the single
+# src-app/Cargo.lock unifies them (no duplicate build when ziee consumes the
+# harness by path).
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0.219", features = ["derive"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "uuid"] }
+uuid = { version = "1.18", features = ["v4"] }
+tracing = "0.1"
