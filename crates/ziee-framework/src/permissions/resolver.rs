@@ -53,4 +53,15 @@ pub trait IdentityResolver: Send + Sync + 'static {
     /// the `group.is_active` guard in ziee's `check_permission_union`, keeping
     /// the generic union check byte-identical to the concrete one.
     fn active_group_permissions(group: &Self::Group) -> Option<&[String]>;
+
+    /// The access token's unix `exp` (seconds), read from the request parts,
+    /// used by [`crate::sync::sync_routes`] to bound an SSE stream's lifetime:
+    /// when the token lapses the client reconnects with a fresh token and
+    /// re-runs [`authenticate`](IdentityResolver::authenticate). `None` (the
+    /// default) → the stream falls back to a far-future deadline. The resolver
+    /// owns token verification, so exposing the expiry here keeps the mountable
+    /// sync handler generic over the app's JWT scheme (chunk sdk-surfaces).
+    fn access_token_exp(&self, _parts: &Parts) -> Option<i64> {
+        None
+    }
 }

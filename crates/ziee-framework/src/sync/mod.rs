@@ -25,6 +25,10 @@
 pub mod audience;
 pub mod extractor;
 pub mod registry;
+// Chunk sdk-surfaces: the mountable `GET /sync/subscribe` SSE handler, generic
+// over the app's `IdentityResolver` + `SyncSurface` (the concrete wire/registry
+// surface). Moved from ziee's `modules::sync::handlers`.
+pub mod routes;
 
 use axum::response::sse::Event;
 use uuid::Uuid;
@@ -32,6 +36,7 @@ use uuid::Uuid;
 pub use audience::{Audience, PermRule};
 pub use extractor::{SyncOrigin, SYNC_CONNECTION_HEADER};
 pub use registry::{ClientConn, SyncRegistry, SYNC_CHANNEL_CAPACITY};
+pub use routes::{RecheckOutcome, SyncSurface, sync_routes};
 
 /// The app's sync-entity vocabulary, abstracted to exactly what the framework
 /// registry needs: how to build the SSE event fanned to a user's devices when

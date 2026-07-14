@@ -65,6 +65,6 @@ pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, loopback_host};
 pub use module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
 pub use permissions::{IdentityResolver, RequireAdmin, RequirePermissions, with_permission};
 pub use sync::{
-    Audience, ClientConn, PermRule, SyncEntityKind, SyncOrigin, SyncRegistry,
-    SYNC_CHANNEL_CAPACITY, SYNC_CONNECTION_HEADER,
+    Audience, ClientConn, PermRule, RecheckOutcome, SyncEntityKind, SyncOrigin, SyncRegistry,
+    SyncSurface, sync_routes, SYNC_CHANNEL_CAPACITY, SYNC_CONNECTION_HEADER,
 };
