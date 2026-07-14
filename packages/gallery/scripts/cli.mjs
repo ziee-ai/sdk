@@ -12,6 +12,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const COMMANDS = {
   'gate-ui': 'gate-ui.mjs',
   'runtime-health': 'runtime-health.mjs',
+  'gen-state-matrix': 'gen-state-matrix.mjs',
+  'gen-overlay-registry': 'gen-overlay-registry.mjs',
+  'gen-gallery-coverage': 'gen-gallery-coverage.mjs',
+  'gen-gallery-seed-registry': 'gen-gallery-seed-registry.mjs',
+  'gallery-coverage': 'gallery-coverage.mjs',
+  'check-gallery-prod-exclusion': 'check-gallery-prod-exclusion.mjs',
+  'capture-screenshots': 'capture-gallery-screenshots.mjs',
+  'capture-states': 'capture-gallery-states.mjs',
 }
 
 const [cmd, ...rest] = process.argv.slice(2)
