@@ -1,0 +1,18 @@
+[package]
+name = "ziee-server-update"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+# `ziee-server-update` owns the DB-free wire type (`UpdateStatusResponse`,
+# schemars key preserved) + the `ServerUpdateRead` permission key
+# (`ziee_identity::PermissionCheck`). The daily-poll `checker` is DELIBERATELY
+# retained in ziee: it embeds `env!("CARGO_PKG_VERSION")` (must resolve to
+# ziee's version, not this crate's 0.0.0 — behavioral equivalence) and a
+# `#[cfg(test)]` names `crate::core::config::UpdateCheckConfig`. Versions match
+# the ziee server crate so the single src-app/Cargo.lock unifies them.
+# Build-DB-free.
+ziee-identity = { path = "../ziee-identity" }
+
+serde = { version = "1.0.219", features = ["derive"] }
+schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }

@@ -1,0 +1,47 @@
+[package]
+name = "ziee-hardware"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+# Dependency direction: `ziee-core` for the shared `sse_event_enum!` macro (the
+# hardware-usage SSE stream) and `ziee-identity` for the `PermissionCheck` trait
+# the hardware permission keys implement. The rest is DB-free detection +
+# monitoring: `sysinfo` reads OS/CPU/mem, `detection` shells trusted vendor
+# binaries (nvidia-smi/rocm) and parses their JSON, `monitoring` fans a 2s SSE
+# broadcast to capped clients. Versions match the ziee server crate so the single
+# src-app/Cargo.lock unifies them without a duplicate build. Build-DB-free.
+ziee-core = { path = "../ziee-core" }
+ziee-identity = { path = "../ziee-identity" }
+
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+axum = { version = "0.8.4", features = ["macros", "multipart"] }
+sysinfo = "0.37.2"
+tokio = { version = "1.47.1", features = ["full"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
+lazy_static = "1.4"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+
+# GPU detection libs — optional, gated by the `gpu-detect` feature (moved
+# verbatim from the ziee server crate; `detection.rs`'s
+# `#[cfg(feature = "gpu-detect")]` branches use nvml/opencl/ash and the feature
+# also pulls wgpu-hal). ziee's own `gpu-detect` feature forwards to this one
+# (see src-app/server/Cargo.toml), so a default ziee build compiles the exact
+# same detection code paths. dlopen-runtime GPU detection stays on in
+# self-contained builds.
+nvml-wrapper = { version = "0.11.0", optional = true }
+opencl3 = { version = "0.12.0", optional = true }
+ash = { version = "0.38", optional = true }
+wgpu-hal = { version = "27.0.4", optional = true }
+
+[features]
+gpu-detect = ["nvml-wrapper", "opencl3", "ash", "wgpu-hal"]
+
+[dev-dependencies]
+# The `monitoring` tests mutate the process-global SSE-client pool + the
+# MONITORING_ACTIVE flag, so they run under `#[serial(hw_monitoring)]` (moved
+# verbatim with the tests). Version matches the ziee server crate.
+serial_test = "3.2"

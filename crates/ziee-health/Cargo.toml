@@ -1,0 +1,19 @@
+[package]
+name = "ziee-health"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+# `ziee-health` owns the DB-free, domain-agnostic liveness surface: the
+# `HealthResponse` wire type (schemars key preserved) + the pure `health_check`
+# handler + its aide route builder. Versions match the ziee server crate
+# (src-app/server/Cargo.toml) so the single src-app/Cargo.lock unifies them
+# without a duplicate build when ziee consumes this crate by path. Build-DB-free.
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+axum = { version = "0.8.4", features = ["macros", "multipart"] }
+aide = { version = "0.15", features = ["axum", "axum-json", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
