@@ -3,6 +3,19 @@ name = "skeleton-server"
 version = "0.0.0"
 edition.workspace = true
 
+# The permanent, app-agnostic second-consumer guard (plan §4, gate E11).
+# It links ONLY the SDK platform crates (ziee-core + ziee-framework) plus
+# third-party crates — and NO ziee domain crate (chat/memory/mcp/…). If a
+# domain coupling ever leaks into the framework, THIS crate stops building
+# (or `cargo tree` shows a domain crate), which is the boundary proof.
 [dependencies]
 ziee-core = { path = "../../crates/ziee-core" }
 ziee-framework = { path = "../../crates/ziee-framework" }
+
+# Third-party only — matches the framework's own versions so the SDK
+# workspace unifies without a duplicate build.
+aide = { version = "0.15", features = ["axum", "axum-json", "macros"] }
+axum = { version = "0.8.4" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio"] }
+linkme = "0.3"
