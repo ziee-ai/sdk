@@ -15,6 +15,13 @@ pub mod app_builder;
 pub mod events;
 pub mod module_api;
 pub mod permissions;
+// Chunk B5: the realtime-sync core (per-user SSE connection registry + caps +
+// audience routing + self-echo + the `SyncOrigin` extractor), generic over the
+// app's `Principal` snapshot + `SyncEntityKind` entity seam. ziee keeps its
+// concrete wire types (`SyncEntity`/`SyncEvent`/`SyncSseEvent`, all in the
+// OpenAPI surface) + the process-wide singleton, consuming this via re-export
+// shims so every `publish(...)` emit site is unchanged.
+pub mod sync;
 // Chunk B4: the `declare_repositories!` macro lives here (exported at crate root
 // via `#[macro_export]`, so ziee invokes `ziee_framework::declare_repositories!`).
 // Its expansion generates the `Repos` global + factory machinery in the invoking
@@ -24,3 +31,7 @@ pub mod repository;
 pub use events::EventHandler;
 pub use module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
 pub use permissions::{IdentityResolver, RequireAdmin, RequirePermissions, with_permission};
+pub use sync::{
+    Audience, ClientConn, PermRule, SyncEntityKind, SyncOrigin, SyncRegistry,
+    SYNC_CHANNEL_CAPACITY, SYNC_CONNECTION_HEADER,
+};

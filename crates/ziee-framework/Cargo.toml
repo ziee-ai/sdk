@@ -25,6 +25,12 @@ tracing = "0.1"
 # the single src-app/Cargo.lock unifies them.
 serde = { version = "1.0.219", features = ["derive"] }
 schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+# Chunk B5: the realtime-sync core (per-user SSE connection registry + caps +
+# audience routing + self-echo). The registry holds `tokio::sync::mpsc` senders
+# and keys connections by `uuid`. Versions match the ziee server catalog so the
+# single src-app/Cargo.lock unifies them.
+tokio = { version = "1.47.1", features = ["sync"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
 
 [dev-dependencies]
 serde_json = "1.0.141"
