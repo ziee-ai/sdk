@@ -12,6 +12,7 @@
 //! so the module registration sites and boot path stay unchanged.
 
 pub mod app_builder;
+pub mod embedded_pg;
 pub mod events;
 // Chunk C1: shared built-in-MCP-server scaffolding — the JSON-RPC 2.0 envelope
 // types (`JsonRpcRequest`/`JsonRpcResponse`/`JsonRpcError`) + the `loopback_host`

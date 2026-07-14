@@ -1,0 +1,15 @@
+# SDK standalone-workspace Cargo build configuration.
+#
+# Applies ONLY when the SDK is built as its own workspace (`cd sdk && cargo ...`).
+# It is NOT used when ziee consumes the SDK crates as path deps — cargo's config
+# lookup walks up from the INVOCATION dir (the ziee root, whose
+# `src-app/.cargo/config.toml` wins for the whole graph). So this file cannot
+# perturb ziee's build; it only makes the standalone SDK build reproducible.
+#
+# Chunk BG-3: `ziee-framework` gained `postgresql_embedded` (the generic
+# embedded-PG bootstrap). Its build script reads `POSTGRESQL_VERSION` to pick the
+# theseus binary; pinning it here to ziee's exact version keeps the standalone
+# SDK build (a) network-consistent and (b) fingerprint-identical to ziee's build
+# so the shared target dir is reused rather than rebuilt.
+[env]
+POSTGRESQL_VERSION = "=18.3.0"
