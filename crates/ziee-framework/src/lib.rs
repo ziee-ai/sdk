@@ -15,6 +15,11 @@ pub mod app_builder;
 pub mod events;
 pub mod module_api;
 pub mod permissions;
+// Chunk B4: the `declare_repositories!` macro lives here (exported at crate root
+// via `#[macro_export]`, so ziee invokes `ziee_framework::declare_repositories!`).
+// Its expansion generates the `Repos` global + factory machinery in the invoking
+// crate; the concrete repo LIST + `Repos.xxx` call sites stay in ziee.
+pub mod repository;
 
 pub use events::EventHandler;
 pub use module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
