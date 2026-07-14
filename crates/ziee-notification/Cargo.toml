@@ -11,9 +11,19 @@ edition = "2024"
 # and CARRIES THE MODULE'S MIGRATIONS (`migrations/`, globbed into the app's
 # merged set). The schema-bound `repository` (compile-time `query_as!`) +
 # `events` (concrete `SyncEntity::Notification`) + aide/axum handlers/routes +
-# prune + registration stay in ziee: the fkeys reference other modules' tables
-# (users/conversations/scheduled_tasks/workflow_runs), so the queries verify
-# only against the app's FULL merged build DB — this crate needs NO build DB.
+# prune + registration stay in ziee: the queries verify only against the app's
+# FULL merged build DB — this crate needs NO build DB.
+#
+# STANDALONE-APPLICABLE (gap N-1): this crate's `migrations/` is now
+# DOMAIN-AGNOSTIC — the schema keeps `scheduled_task_id`/`workflow_run_id`/
+# `conversation_id`/`user_id` as PLAIN nullable UUID columns with NO foreign
+# keys, so `migrations/` applies alone on a fresh DB that has none of chat's
+# `conversations`, scheduler's `scheduled_tasks`, workflow's `workflow_runs`,
+# or ziee-auth's `users`. ziee (or any app that DOES have those domain tables)
+# re-adds the FK constraints in a ziee-side module migration
+# (`server/src/modules/notification/migrations/*_notification_fkeys.sql`),
+# sorted after both `notifications` and the domain tables exist. Only
+# `ziee-identity` is a declared dep, and it ships no migrations.
 # Versions match the ziee server crate so the single src-app/Cargo.lock unifies
 # them. Build-DB-free.
 ziee-identity = { path = "../ziee-identity" }

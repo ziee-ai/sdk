@@ -16,4 +16,4 @@ mod build_db;
 mod migrations;
 
 pub use build_db::{ensure_build_db, provision_build_db, provision_build_db_named};
-pub use migrations::compose_merged_migrations;
+pub use migrations::{compose_merged_migrations, compose_merged_migrations_from};

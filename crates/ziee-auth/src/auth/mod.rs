@@ -34,11 +34,23 @@ pub mod http;
 #[cfg(feature = "routes")]
 pub mod turnkey;
 
+/// Turnkey auth MODULE for the standard `build_api_router` path (gap N-3): an
+/// [`AppModule`](ziee_framework::module_api::AppModule) that registers the auth
+/// routes through the module system (so they land at `/api/auth/*`) AND installs
+/// the resolver/JWT/AuthContext extensions at the whole-app router level. Gated
+/// behind the non-default `module` feature (implies `routes`); inert for ziee,
+/// which keeps its own resolver-backed module.
+#[cfg(feature = "module")]
+pub mod module;
+
 #[cfg(feature = "routes")]
 pub use http::{auth_admin_routes, auth_routes};
 
 #[cfg(feature = "routes")]
 pub use turnkey::{mount_auth, AuthMountOptions, DefaultIdentityResolver};
+
+#[cfg(feature = "module")]
+pub use module::AuthModule;
 
 // Re-exports (mirror the app auth module's public surface).
 pub use context::{
