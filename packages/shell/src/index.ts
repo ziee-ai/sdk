@@ -53,6 +53,8 @@ export {
   WidgetRenderer,
 } from './components/LazyComponentRenderer'
 export { DivScrollY, type DivScrollYProps } from './components/DivScrollY'
+export { Drawer, type DrawerProps } from './components/Drawer'
+export { ResizeHandle } from './components/ResizeHandle'
 
 // Layouts
 export { BlankLayout } from './layouts/BlankLayout'
