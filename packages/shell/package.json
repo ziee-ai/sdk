@@ -1,5 +1,5 @@
 {
-  "name": "@ziee/framework",
+  "name": "@ziee/shell",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -7,24 +7,17 @@
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./api-client": "./src/api-client/index.ts",
-    "./permissions": "./src/permissions/index.ts",
-    "./router": "./src/router/index.ts",
     "./*": "./src/*"
   },
   "peerDependencies": {
+    "@ziee/framework": "*",
+    "@ziee/kit": "*",
     "react": "^19.2.6",
-    "react-dom": "^19.2.6",
-    "react-router-dom": "^7.15.1"
-  },
-  "peerDependenciesMeta": {
-    "react-router-dom": {
-      "optional": true
-    }
+    "react-dom": "^19.2.6"
   },
   "dependencies": {
-    "immer": "^11.1.8",
-    "zustand": "^5.0.13"
+    "overlayscrollbars-react": "^0.5.6",
+    "react-use": "^17.6.0"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

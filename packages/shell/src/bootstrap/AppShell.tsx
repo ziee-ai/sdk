@@ -1,0 +1,92 @@
+import { useEffect, useMemo } from 'react'
+import type { ComponentRegistration } from '@ziee/framework/module-system/types'
+import { Stores } from '@ziee/framework/stores'
+import { initSync } from '@ziee/framework/sync'
+import { AppErrorBoundary } from '../error/AppErrorBoundary'
+import { ThemeProvider } from '../theme/ThemeProvider'
+import { LazyComponentRenderer } from '../components/LazyComponentRenderer'
+import { usePrefetchModules } from '../hooks/usePrefetchModules'
+
+/**
+ * ConditionalComponent — wrapper that checks a module component's `shouldMount`
+ * hook before rendering.
+ */
+function ConditionalComponent({
+  registration,
+}: {
+  registration: ComponentRegistration
+}) {
+  // Call shouldMount hook if provided, default to true
+  const shouldMount = registration.shouldMount?.() ?? true
+
+  // Memoize the component renderer to prevent recreating it when shouldMount changes
+  const renderer = useMemo(
+    () => (
+      <LazyComponentRenderer
+        component={registration.component}
+        fallback={null}
+      />
+    ),
+    [registration.component],
+  )
+
+  if (!shouldMount) {
+    return null
+  }
+
+  return renderer
+}
+
+export interface AppShellProps {
+  /**
+   * The app's auth store (a zustand store exposing the auth session). Wired to
+   * the realtime-sync SSE lifecycle via `initSync` — idempotent; starts on
+   * login, stops on logout, restarts on user switch.
+   *
+   * SEAM: the app owns module discovery (`loadModules()`) — call it at the app
+   * entry BEFORE mounting `<AppShell>`. AppShell only renders whatever modules
+   * registered components (sorted by `order`).
+   */
+  authStore: Parameters<typeof initSync>[0]
+}
+
+/**
+ * AppShell — the generic, slot-driven application body.
+ *
+ * Renders every module-registered component (sorted by `order`, so the router's
+ * order-0 component mounts first) inside a `ThemeProvider`, each wrapped in its
+ * own error boundary so a single module crash isolates to that module — the
+ * shell + other modules keep working. The outer boundary at the app entry
+ * catches anything that escapes this layer (e.g. a ThemeProvider throw).
+ *
+ * The shell hard-codes NO pages or modules: an app fills the slots (sidebar,
+ * settings, routes) via the module system, and supplies its own branding/nav.
+ */
+export function AppShell({ authStore }: AppShellProps) {
+  const { components } = Stores.ModuleSystem
+
+  // Wire the realtime-sync SSE stream to the auth lifecycle.
+  useEffect(() => {
+    initSync(authStore)
+  }, [authStore])
+
+  // Prefetch lazy-loaded modules when the browser is idle
+  usePrefetchModules()
+
+  // Sort components by order (the router component has order: 0, so it renders first)
+  const sortedComponents = useMemo(() => {
+    return [...components].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+  }, [components])
+
+  return (
+    <ThemeProvider>
+      <div data-testid="app-root" className="h-full">
+        {sortedComponents.map(comp => (
+          <AppErrorBoundary key={comp.id} label={comp.id} fallback={() => null}>
+            <ConditionalComponent registration={comp} />
+          </AppErrorBoundary>
+        ))}
+      </div>
+    </ThemeProvider>
+  )
+}

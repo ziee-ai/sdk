@@ -28,7 +28,7 @@ test('TEST-FE1-2: setRouterConfig merges partial overrides', () => {
 })
 
 test('TEST-FE1-3: a permission gate can be injected and invoked', () => {
-  const gate = ({ permission, children }: { permission: unknown; children: unknown }) =>
+  const gate = ({ permission, children }: { permission: unknown; children: import('react').ReactNode }) =>
     permission === 'admin' ? children : 'DENIED'
   setRouterConfig({ permissionGate: gate })
   const g = getRouterConfig().permissionGate!
