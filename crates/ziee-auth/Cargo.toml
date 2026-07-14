@@ -1,21 +1,48 @@
 [package]
 name = "ziee-auth"
 version = "0.0.0"
-edition.workspace = true
+edition = "2024"
 
 [dependencies]
+ziee-core = { path = "../ziee-core" }
 ziee-framework = { path = "../ziee-framework" }
 ziee-identity = { path = "../ziee-identity" }
 
-# Versions match the ziee server crate's [workspace.dependencies] catalog
-# (src-app/Cargo.toml) so the single src-app/Cargo.lock unifies them without a
-# duplicate build when ziee consumes ziee-auth by path. ziee-auth owns the
-# concrete auth/user wire types (User/Group/...) which derive serde/schemars +
-# sqlx::FromRow and implement the pluggable identity traits.
+# Versions match the ziee server crate (src-app/server/Cargo.toml) so the
+# single src-app/Cargo.lock unifies them without a duplicate build when ziee
+# consumes ziee-auth by path. ziee-auth owns the concrete auth/user wire types
+# (User/Group/...) which derive serde/schemars + sqlx::FromRow, the schema-bound
+# auth repositories (`query!` macros), login/register/LDAP/OAuth2, the Session &
+# Token-Refresh subsystem, and its own migrations (AUTH_MIGRATOR).
 serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
 schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "macros", "migrate"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "time", "macros", "migrate"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
+tokio = { version = "1.47.1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2.0.12"
+tracing = "0.1"
+time = "0.3"
+http = "1.2"
+url = "2.5"
+base64 = "0.22"
+rand = "0.9.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2", "json"] }
 # `User` implements axum_login's `AuthUser` for the tower-sessions session store.
 axum-login = "0.18.0"
+# Auth-provider + token deps (versions from src-app/server/Cargo.toml).
+bcrypt = "0.17.1"
+jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
+oauth2 = "5.0.0"
+openidconnect = "4.0.1"
+
+[build-dependencies]
+# Auth-only build DB provisioning (mirrors the app's build.rs): create +
+# migrate `ziee_auth_build_<key>` on the shared :54321 cluster and point sqlx
+# compile-time `query!` verification at it. ziee-auth is the ONE schema-bound
+# SDK crate; framework/core/identity stay build-DB-free.
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "migrate"] }

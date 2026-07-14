@@ -10,4 +10,17 @@
 
 mod models;
 
+pub mod auth;
+pub mod user;
+
 pub use models::{Group, User};
+
+/// The auth module's own migrations (structural auth-table DDL), embedded at
+/// build time. The app composes these ∪ its remaining migrations into one
+/// version-sorted merged set for BOTH its runtime `migrate` and its build-DB
+/// provisioner; ziee-auth's own `build.rs` provisions an auth-only build DB
+/// from exactly this set for its `query!` verification. The moved files keep
+/// their original version numbers + byte content (checksums preserved), so the
+/// merged set reproduces ziee's exact `_sqlx_migrations` history — deployed DBs
+/// are unaffected.
+pub static AUTH_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
