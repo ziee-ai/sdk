@@ -98,6 +98,34 @@ mod tests {
         assert!(!p.has_permission("config::proxy::read"));
     }
 
+    /// A `Principal` that overrides only the two required methods gets the
+    /// DEFAULT `active_group_permissions()` (empty), so `has_permission` checks
+    /// direct grants only. This pins the default trait-method behavior that the
+    /// other tests bypass by always overriding it.
+    struct DirectOnly {
+        direct: Vec<String>,
+    }
+    impl Principal for DirectOnly {
+        fn is_admin(&self) -> bool {
+            false
+        }
+        fn direct_permissions(&self) -> &[String] {
+            &self.direct
+        }
+        // active_group_permissions() intentionally NOT overridden → default [].
+    }
+
+    #[test]
+    fn default_active_group_permissions_is_empty() {
+        let p = DirectOnly {
+            direct: v(&["users::read"]),
+        };
+        assert!(p.active_group_permissions().is_empty());
+        assert!(p.has_permission("users::read"));
+        // With no groups, a permission not directly granted is denied.
+        assert!(!p.has_permission("groups::edit"));
+    }
+
     #[test]
     fn is_admin_is_not_folded_into_has_permission() {
         // An admin with no explicit grants does NOT auto-pass has_permission —

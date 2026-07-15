@@ -450,6 +450,59 @@ mod load_from_tests {
 }
 
 #[cfg(test)]
+mod url_helper_tests {
+    use super::ServerConfig;
+
+    const STRONG_SECRET: &str = "0123456789abcdef0123456789abcdef-strong";
+
+    fn embedded_yaml() -> String {
+        format!(
+            "postgresql:\n  use_embedded: true\n  embedded:\n    version: '18.3.0'\n    port: 5433\n    bind_address: 127.0.0.1\n    username: pguser\n    password: pgpw\n    database: appdb\n    timezone: UTC\n    log_timezone: UTC\n    logging:\n      collector: false\n      directory: log\n      filename: pg.log\n      statement: none\nserver:\n  host: 0.0.0.0\n  port: 8080\n  api_prefix: /api\njwt:\n  secret: '{STRONG_SECRET}'\n  issuer: app\n  audience: app-api\n  access_token_expiry_hours: 24\n"
+        )
+    }
+
+    fn external_yaml() -> String {
+        format!(
+            "postgresql:\n  use_embedded: false\n  external:\n    host: db.example.com\n    port: 6543\n    username: ext\n    password: extpw\n    database: extdb\nserver:\n  host: 127.0.0.1\n  port: 3000\n  api_prefix: /api\njwt:\n  secret: '{STRONG_SECRET}'\n  issuer: app\n  audience: app-api\n  access_token_expiry_hours: 24\n"
+        )
+    }
+
+    #[test]
+    fn database_url_from_embedded() {
+        let cfg: ServerConfig = serde_norway::from_str(&embedded_yaml()).unwrap();
+        assert_eq!(
+            cfg.database_url(),
+            "postgresql://pguser:pgpw@127.0.0.1:5433/appdb"
+        );
+    }
+
+    #[test]
+    fn database_url_from_external() {
+        let cfg: ServerConfig = serde_norway::from_str(&external_yaml()).unwrap();
+        assert_eq!(
+            cfg.database_url(),
+            "postgresql://ext:extpw@db.example.com:6543/extdb"
+        );
+    }
+
+    #[test]
+    fn server_address_joins_host_and_port() {
+        let cfg: ServerConfig = serde_norway::from_str(&embedded_yaml()).unwrap();
+        assert_eq!(cfg.server_address(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn validate_jwt_secret_rejects_short_and_placeholder_but_accepts_strong() {
+        let mut cfg: ServerConfig = serde_norway::from_str(&embedded_yaml()).unwrap();
+        assert!(cfg.validate_jwt_secret().is_ok());
+        cfg.jwt.secret = "secret".to_string();
+        assert!(cfg.validate_jwt_secret().is_err());
+        cfg.jwt.secret = "x".repeat(super::MIN_JWT_SECRET_LEN - 1);
+        assert!(cfg.validate_jwt_secret().is_err());
+    }
+}
+
+#[cfg(test)]
 mod max_file_upload_tests {
     use super::{default_max_file_upload_mb, HttpServerConfig};
 

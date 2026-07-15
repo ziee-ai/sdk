@@ -72,3 +72,8 @@ postgresql_embedded = { version = "0.20.0", default-features = false, features =
 
 [dev-dependencies]
 tempfile = "3.15"
+# Crate-scoped router tests (tests/permission_extractors.rs,
+# tests/sync_origin_extractor.rs) drive the real extractors in-process via
+# `tower::ServiceExt::oneshot`. axum/tokio/uuid/ziee-core/ziee-identity/
+# async-trait/serde_json are already regular deps and available to the tests.
+tower = { version = "0.5.3", features = ["util"] }

@@ -337,4 +337,112 @@ mod tests {
         // sensitive that a developer would need to correlate.
         assert!(body.get("details").is_none() || body["details"].is_null());
     }
+
+    /// The convenience constructors must map to the correct HTTP status +
+    /// stable machine-readable error_code — both feed the wire contract and
+    /// callers branch on `status_code()` (e.g. tolerate idempotent 404 deletes).
+    #[test]
+    fn convenience_constructors_map_status_and_code() {
+        let cases: &[(AppError, u16, &str)] = &[
+            (AppError::not_found("X"), 404, "RESOURCE_NOT_FOUND"),
+            (AppError::conflict("X"), 409, "RESOURCE_CONFLICT"),
+            (
+                AppError::bad_request("BAD", "m"),
+                400,
+                "BAD",
+            ),
+            (
+                AppError::unprocessable_entity("UNPROC", "m"),
+                422,
+                "UNPROC",
+            ),
+            (
+                AppError::unauthorized("UNAUTH", "m"),
+                401,
+                "UNAUTH",
+            ),
+            (AppError::forbidden("FORB", "m"), 403, "FORB"),
+            (
+                AppError::internal_error("m"),
+                500,
+                "SYSTEM_INTERNAL_ERROR",
+            ),
+        ];
+        for (err, status, code) in cases {
+            assert_eq!(err.status_code(), *status, "status for {code}");
+            assert_eq!(err.error_code(), *code, "error_code for {code}");
+        }
+    }
+
+    #[test]
+    fn conflict_and_not_found_messages_name_the_resource() {
+        assert_eq!(AppError::not_found("User").to_string(), "User not found");
+        assert_eq!(
+            AppError::conflict("User").to_string(),
+            "User already exists"
+        );
+    }
+
+    #[test]
+    fn with_details_attaches_and_serializes_details() {
+        let err = AppError::bad_request("BAD", "nope")
+            .with_details(serde_json::json!({ "field": "email" }));
+        let body = serde_json::to_value(&err).unwrap();
+        assert_eq!(body["details"]["field"], "email");
+    }
+
+    /// `IntoResponse` must translate the stored u16 status into the real HTTP
+    /// response status and emit the `ApiError` body (error/error_code/details).
+    #[tokio::test]
+    async fn into_response_uses_stored_status_and_body() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let err = AppError::forbidden("FORBIDDEN", "denied")
+            .with_details(serde_json::json!({ "k": "v" }));
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "denied");
+        assert_eq!(body["error_code"], "FORBIDDEN");
+        assert_eq!(body["details"]["k"], "v");
+    }
+
+    /// An out-of-range stored status falls back to 500 rather than panicking.
+    #[tokio::test]
+    async fn into_response_bad_status_falls_back_to_500() {
+        use axum::response::IntoResponse;
+        // Construct via serde to smuggle in an impossible status code (below the
+        // http crate's valid 100..=999 range).
+        let err: AppError = serde_json::from_value(serde_json::json!({
+            "status_code": 42,
+            "error_code": "WAT",
+            "message": "m",
+            "details": null
+        }))
+        .unwrap();
+        let resp = err.into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn to_api_error_and_tuple_from_carry_matching_status() {
+        let (status, err) = AppError::unauthorized("UNAUTH", "m").to_api_error();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.status_code(), 401);
+
+        // `From<AppError> for (StatusCode, AppError)` (used by `?` in handlers).
+        let tuple: (StatusCode, AppError) = AppError::conflict("Y").into();
+        assert_eq!(tuple.0, StatusCode::CONFLICT);
+    }
+
+    /// `From<sqlx::Error>` maps `RowNotFound` to a clean 404 (not the redacted
+    /// 500 database_error path) so `?` on a missing row yields NOT_FOUND.
+    #[test]
+    fn from_sqlx_row_not_found_is_404() {
+        let err: AppError = sqlx::Error::RowNotFound.into();
+        assert_eq!(err.status_code(), 404);
+        assert_eq!(err.error_code(), "RESOURCE_NOT_FOUND");
+    }
 }

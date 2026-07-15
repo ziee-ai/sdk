@@ -72,3 +72,65 @@ pub fn tool_list() -> Value {
         ]
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        tool_list, DESCRIBE_CAPABILITY, INVOKE_CAPABILITY, LIST_CAPABILITIES,
+    };
+
+    /// `tools/list` is the MCP contract advertised to the model: exactly the
+    /// three control tools, named by their public consts, each with an object
+    /// `inputSchema`.
+    #[test]
+    fn tool_list_advertises_the_three_control_tools() {
+        let v = tool_list();
+        let tools = v["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 3);
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![LIST_CAPABILITIES, DESCRIBE_CAPABILITY, INVOKE_CAPABILITY]
+        );
+        for t in tools {
+            assert_eq!(t["inputSchema"]["type"], "object", "tool {:?}", t["name"]);
+            assert!(t["description"].as_str().is_some_and(|d| !d.is_empty()));
+        }
+    }
+
+    /// `describe_capability` + `invoke_capability` REQUIRE `operation_id`;
+    /// `list_capabilities` requires nothing (its query/tag filters are optional).
+    #[test]
+    fn required_inputs_match_each_tool() {
+        let v = tool_list();
+        let tools = v["tools"].as_array().unwrap();
+        let by_name = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()
+                .clone()
+        };
+
+        let list = by_name(LIST_CAPABILITIES);
+        assert!(list["inputSchema"].get("required").is_none());
+        assert!(list["inputSchema"]["properties"].get("query").is_some());
+        assert!(list["inputSchema"]["properties"].get("tag").is_some());
+
+        for name in [DESCRIBE_CAPABILITY, INVOKE_CAPABILITY] {
+            let t = by_name(name);
+            let req = t["inputSchema"]["required"].as_array().unwrap();
+            assert!(
+                req.iter().any(|r| r == "operation_id"),
+                "{name} must require operation_id"
+            );
+        }
+
+        // invoke exposes path_params / query / body inputs.
+        let invoke = by_name(INVOKE_CAPABILITY);
+        let props = &invoke["inputSchema"]["properties"];
+        assert!(props.get("path_params").is_some());
+        assert!(props.get("query").is_some());
+        assert!(props.get("body").is_some());
+    }
+}

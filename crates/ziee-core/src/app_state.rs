@@ -101,4 +101,21 @@ mod tests {
         let retrieved_path = get_app_data_dir();
         assert_eq!(retrieved_path, test_path);
     }
+
+    #[test]
+    fn server_addr_defaults_then_roundtrips_after_set() {
+        // Default before any set() reflects the documented boot fallback.
+        // (This may observe a value another test already set, so only assert
+        // the shape of the default when it is still the untouched tuple.)
+        let (h, p, prefix) = get_server_addr();
+        assert!(!h.is_empty());
+        assert!(p > 0);
+        assert!(prefix.starts_with('/'));
+
+        set_server_addr("example.com".to_string(), 9090, "/v2".to_string());
+        assert_eq!(
+            get_server_addr(),
+            ("example.com".to_string(), 9090, "/v2".to_string())
+        );
+    }
 }

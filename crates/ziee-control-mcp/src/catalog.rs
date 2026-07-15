@@ -544,6 +544,37 @@ mod tests {
     }
 
     #[test]
+    fn iter_yields_all_ops_and_components_roundtrip() {
+        let cat = build_catalog(&fixture_spec());
+        // `iter()` visits every parsed op exactly once.
+        let mut ids: Vec<String> = cat.iter().map(|o| o.operation_id.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "File.upload",
+                "Health.check",
+                "User.create",
+                "User.delete",
+                "User.list",
+            ]
+        );
+        assert!(!cat.is_empty());
+        // `components()` retains the shared schemas for later $ref resolution.
+        assert!(cat.components()["schemas"].get("UserCreate").is_some());
+    }
+
+    #[test]
+    fn empty_spec_yields_empty_catalog() {
+        // No `paths` key → an empty (is_empty) catalog with a defaulted
+        // components object, not a panic.
+        let cat = build_catalog(&json!({}));
+        assert_eq!(cat.len(), 0);
+        assert!(cat.is_empty());
+        assert!(cat.components().is_object());
+    }
+
+    #[test]
     fn parse_permission_edge_cases() {
         assert_eq!(
             parse_required_permission("**Required Permission:** `a::b::c`").as_deref(),
