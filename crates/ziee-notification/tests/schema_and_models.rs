@@ -6,10 +6,12 @@
 //! tests only reach indirectly:
 //!   1. STANDALONE MIGRATION APPLY (gap N-1) — the migration must apply on a bare
 //!      DB with none of chat/scheduler/workflow/auth's domain tables present
-//!      (it keeps `*_id` columns as plain nullable UUIDs, no FKs). A negative
-//!      control asserts the FK-free posture directly.
-//!   2. MIGRATION ↔ MODEL mapping — every `Notification` field selects back from
-//!      the migrated schema, so a column rename / type drift fails the suite.
+//!      (the R2 schema knows no domain: kind-specific data rides one `payload`
+//!      jsonb column, and there are NO FKs). A negative control asserts the
+//!      FK-free posture directly.
+//!   2. MIGRATION ↔ MODEL mapping — every `Notification` field (incl. the
+//!      `payload` jsonb) selects back from the migrated schema, so a column
+//!      rename / type drift fails the suite.
 //!
 //! The full inbox flow (scheduler → notification, auth gating, owner-scope)
 //! stays in ziee's `tests/notification` — that's assembled-app behavior.
@@ -66,12 +68,15 @@ async fn drop_db(dbname: &str) {
 async fn migration_applies_standalone_and_model_round_trips() {
     let (pool, dbname) = fresh_db().await;
 
+    // R2 payload model: kind-specific ids (conversation_id here) ride the
+    // `payload` jsonb column, not dedicated FK columns.
+    let payload = serde_json::json!({ "conversation_id": Uuid::new_v4().to_string() });
     let new = NewNotification::new(Uuid::new_v4(), "task_done", "Task finished")
         .body("your scheduled task completed")
-        .conversation(Uuid::new_v4());
+        .payload(payload.clone());
 
     let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO notifications (user_id, kind, title, body, interrupt, conversation_id)
+        "INSERT INTO notifications (user_id, kind, title, body, interrupt, payload)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(new.user_id)
@@ -79,7 +84,7 @@ async fn migration_applies_standalone_and_model_round_trips() {
     .bind(&new.title)
     .bind(&new.body)
     .bind(new.interrupt)
-    .bind(new.conversation_id)
+    .bind(&new.payload)
     .fetch_one(&pool)
     .await
     .expect("insert notification");
@@ -97,14 +102,58 @@ async fn migration_applies_standalone_and_model_round_trips() {
     assert_eq!(row.title, "Task finished");
     assert_eq!(row.body, "your scheduled task completed");
     assert!(row.interrupt);
-    assert_eq!(row.conversation_id, new.conversation_id);
-    assert_eq!(row.scheduled_task_id, None);
-    assert_eq!(row.workflow_run_id, None);
+    assert_eq!(
+        row.payload, payload,
+        "the payload jsonb round-trips verbatim through the FromRow model"
+    );
+    assert_eq!(
+        row.payload["conversation_id"], payload["conversation_id"],
+        "a kind-specific id is read back out of the payload"
+    );
     assert!(
         row.is_unread(),
         "a freshly-inserted notification has NULL read_at → unread"
     );
     assert!(row.created_at.timestamp() > 0, "created_at defaulted to now()");
+
+    drop_db(&dbname).await;
+}
+
+#[tokio::test]
+async fn payload_defaults_to_empty_object() {
+    let (pool, dbname) = fresh_db().await;
+
+    // Omit payload on insert → the column DEFAULT '{}'::jsonb applies, and the
+    // builder's own default is likewise an empty object.
+    let new = NewNotification::new(Uuid::new_v4(), "digest", "Daily digest");
+    assert_eq!(
+        new.payload,
+        serde_json::json!({}),
+        "the builder defaults payload to {{}}"
+    );
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO notifications (user_id, kind, title, interrupt)
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(new.user_id)
+    .bind(&new.kind)
+    .bind(&new.title)
+    .bind(new.interrupt)
+    .fetch_one(&pool)
+    .await
+    .expect("insert notification with no payload");
+
+    let row: Notification = sqlx::query_as("SELECT * FROM notifications WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.payload,
+        serde_json::json!({}),
+        "the column DEFAULT '{{}}'::jsonb yields an empty object row"
+    );
 
     drop_db(&dbname).await;
 }
@@ -140,8 +189,8 @@ async fn silent_builder_yields_a_durable_only_row() {
 }
 
 /// Negative control for N-1: the migrated schema must carry NO foreign-key
-/// constraints (the domain FKs live in a ziee-side migration), otherwise it
-/// couldn't apply on a bare DB.
+/// constraints (an app that has a users table adds the `user_id` FK in its own
+/// module migration), otherwise it couldn't apply on a bare DB.
 #[tokio::test]
 async fn schema_has_no_foreign_keys() {
     let (pool, dbname) = fresh_db().await;
@@ -161,18 +210,52 @@ async fn schema_has_no_foreign_keys() {
     drop_db(&dbname).await;
 }
 
-/// Pure builder-setter coverage (no DB): `.task(id)` sets `scheduled_task_id`
-/// and `.workflow_run(id)` sets `workflow_run_id`. The existing DB tests cover
-/// `.body()`/`.conversation()`/`.silent()` but never these two.
-#[test]
-fn builder_task_and_workflow_run_setters() {
-    let task_id = Uuid::new_v4();
-    let n = NewNotification::new(Uuid::new_v4(), "task_done", "Task finished").task(task_id);
-    assert_eq!(n.scheduled_task_id, Some(task_id));
-    assert_eq!(n.workflow_run_id, None, ".task() leaves workflow_run_id unset");
+/// Negative control for the R2 schema: the former domain-specific FK columns
+/// (`scheduled_task_id` / `workflow_run_id` / `conversation_id`) are GONE — the
+/// only structured slot is `payload`. Asserting their absence guards a
+/// regression that re-introduces domain columns into the SDK schema.
+#[tokio::test]
+async fn schema_has_payload_and_no_domain_fk_columns() {
+    let (pool, dbname) = fresh_db().await;
 
-    let run_id = Uuid::new_v4();
-    let n = NewNotification::new(Uuid::new_v4(), "run_done", "Run finished").workflow_run(run_id);
-    assert_eq!(n.workflow_run_id, Some(run_id));
-    assert_eq!(n.scheduled_task_id, None, ".workflow_run() leaves scheduled_task_id unset");
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'notifications'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert!(
+        cols.iter().any(|c| c == "payload"),
+        "the R2 schema carries a single `payload` jsonb column"
+    );
+    for gone in ["scheduled_task_id", "workflow_run_id", "conversation_id"] {
+        assert!(
+            !cols.iter().any(|c| c == gone),
+            "domain FK column `{gone}` must NOT exist in the SDK schema (moved into payload)"
+        );
+    }
+
+    drop_db(&dbname).await;
+}
+
+/// Pure builder-setter coverage (no DB): `.payload(json)` sets the structured
+/// slot and `.body()` / `.silent()` behave. This replaces the removed
+/// `.task()` / `.workflow_run()` / `.conversation()` setters (the R2 model has
+/// only `payload`).
+#[test]
+fn builder_payload_setter() {
+    let n = NewNotification::new(Uuid::new_v4(), "task_done", "Task finished")
+        .payload(serde_json::json!({ "scheduled_task_id": "t-1" }));
+    assert_eq!(n.payload["scheduled_task_id"], "t-1");
+    assert!(n.interrupt, "interrupts by default");
+
+    let silent = NewNotification::new(Uuid::new_v4(), "run_done", "Run finished").silent();
+    assert!(!silent.interrupt);
+    assert_eq!(
+        silent.payload,
+        serde_json::json!({}),
+        ".silent() leaves payload at the empty-object default"
+    );
 }

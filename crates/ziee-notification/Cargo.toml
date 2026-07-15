@@ -6,26 +6,23 @@ edition = "2024"
 [dependencies]
 # `ziee-notification` owns the DB-free wire/insert types (`models`:
 # `Notification`/`NewNotification`/`NotificationPage`/`UnreadCount`, schemars
-# keys preserved; `Notification` derives `sqlx::FromRow` but issues no `query!`)
-# + the `NotificationsRead` permission key (`ziee_identity::PermissionCheck`),
-# and CARRIES THE MODULE'S MIGRATIONS (`migrations/`, globbed into the app's
-# merged set). The schema-bound `repository` (compile-time `query_as!`) +
-# `events` (concrete `SyncEntity::Notification`) + aide/axum handlers/routes +
-# prune + registration stay in ziee: the queries verify only against the app's
-# FULL merged build DB — this crate needs NO build DB.
+# keys preserved; `Notification` derives `sqlx::FromRow`) + the
+# `NotificationsRead` permission key (`ziee_identity::PermissionCheck`), and
+# CARRIES THE MODULE'S MIGRATIONS (`migrations/`, globbed into the app's merged
+# set). With NO features the crate is types-only + build-DB-free (no axum/aide).
 #
-# STANDALONE-APPLICABLE (gap N-1): this crate's `migrations/` is now
-# DOMAIN-AGNOSTIC — the schema keeps `scheduled_task_id`/`workflow_run_id`/
-# `conversation_id`/`user_id` as PLAIN nullable UUID columns with NO foreign
-# keys, so `migrations/` applies alone on a fresh DB that has none of chat's
-# `conversations`, scheduler's `scheduled_tasks`, workflow's `workflow_runs`,
-# or ziee-auth's `users`. ziee (or any app that DOES have those domain tables)
-# re-adds the FK constraints in a ziee-side module migration
-# (`server/src/modules/notification/migrations/*_notification_fkeys.sql`),
-# sorted after both `notifications` and the domain tables exist. Only
-# `ziee-identity` is a declared dep, and it ships no migrations.
-# Versions match the ziee server crate so the single src-app/Cargo.lock unifies
-# them. Build-DB-free.
+# STANDALONE-APPLICABLE (gap N-1): this crate's `migrations/` is DOMAIN-AGNOSTIC.
+# The former ziee-chat-specific FK-nullable columns
+# (`scheduled_task_id`/`workflow_run_id`/`conversation_id`) are replaced by ONE
+# `payload jsonb` column (R2 payload adoption), and there is NO FK to `users` in
+# the crate migration, so `migrations/` applies alone on a fresh DB that has none
+# of chat's `conversations`, scheduler's `scheduled_tasks`, workflow's
+# `workflow_runs`, or ziee-auth's `users`. An app that DOES have a users table
+# adds the `user_id` FK constraint in its own module migration
+# (`server/src/modules/notification/migrations/*_notification_fkeys.sql`), sorted
+# after both `notifications` and the users table exist. Only `ziee-identity` is a
+# declared dep of the types-only lane, and it ships no migrations. Versions match
+# the ziee server crate so the single src-app/Cargo.lock unifies them.
 ziee-identity = { path = "../ziee-identity" }
 
 serde = { version = "1.0.219", features = ["derive"] }
@@ -35,5 +32,58 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chr
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
 
+# HTTP/engine surface (the `routes` feature). Optional so a types-only consumer
+# never pulls axum/aide/tokio. `ziee-auth` supplies the concrete `{User, Group}`
+# wire types the generic router is bound over (mirrors `ziee-file`'s
+# `file_routes<R: IdentityResolver<User=User, Group=Group>>`), and — for the
+# `module` self-registration only — its `DefaultIdentityResolver`.
+linkme = { version = "0.3", optional = true }
+aide = { version = "0.15", features = ["axum", "axum-json", "axum-query", "macros"], optional = true }
+axum = { version = "0.8.4", features = ["macros"], optional = true }
+tokio = { version = "1", features = ["rt", "time", "macros"], optional = true }
+async-trait = { version = "0.1", optional = true }
+ziee-core = { path = "../ziee-core", optional = true }
+ziee-framework = { path = "../ziee-framework", optional = true }
+ziee-auth = { path = "../ziee-auth", optional = true }
+
+[features]
+default = []
+# `routes` — the mountable, RESOLVER-GENERIC engine: `repository`
+# (compile-time `query!`/`query_as!`), the `events` producer + pluggable
+# `set_sync_emitter` sync seam, the aide/axum `handlers` +
+# `notification_router::<R>()`, and the per-module `NOTIFICATION_KINDS`
+# contribution registry. An app that already owns its `IdentityResolver` (like
+# ziee, with `ZieeIdentityResolver`) enables ONLY this and mounts
+# `notification_router::<ItsResolver>()` from its own thin module — so it never
+# links a second, conflicting self-registered module (mirrors `ziee-auth`'s
+# `routes`-vs-`module` split, and `ziee-file`).
+routes = [
+    "dep:linkme",
+    "dep:aide",
+    "dep:axum",
+    "dep:tokio",
+    "dep:async-trait",
+    "dep:ziee-core",
+    "dep:ziee-framework",
+    "dep:ziee-auth",
+]
+# `module` (turnkey, default-OFF) — implies `routes` and adds the
+# `#[distributed_slice(MODULE_ENTRIES)]` self-registering `NotificationModule`
+# that mounts `notification_router::<DefaultIdentityResolver>()` + spawns the
+# retention prune, for a batteries-included app on the `build_api_router` path
+# (e.g. CytoAnalyst). OFF by default so ziee — which keeps its
+# `ZieeIdentityResolver`-backed thin module — never links a second, conflicting
+# notification module (keeps ziee's route/OpenAPI surface single-sourced).
+module = ["routes"]
+
+# build.rs provisions a per-worktree build DB (this crate's own migration) + sets
+# DATABASE_URL so the `routes`-feature `query!`/`query_as!` macros verify at
+# compile time. Runs its DB logic ONLY when CARGO_FEATURE_ROUTES is set (see
+# build.rs), so a types-only build never needs Postgres.
+[build-dependencies]
+ziee-build-support = { path = "../ziee-build-support" }
+
 [dev-dependencies]
+# Crate-scoped DB integration test (`tests/schema_and_models.rs`): applies the
+# crate migration to a throwaway DB + round-trips the model.
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }

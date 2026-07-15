@@ -16,3 +16,19 @@ impl PermissionCheck for NotificationsRead {
     const DESCRIPTION: &'static str = "Read and manage your own notifications.";
     const MODULE: &'static str = "notification";
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_constants_are_stable() {
+        // The PERMISSION string is a wire contract: the migration-142 grant, the
+        // handler `RequirePermissions<(NotificationsRead,)>`, and the FE refetch
+        // self-gate must all agree on `notifications::read`.
+        assert_eq!(NotificationsRead::NAME, "NotificationsRead");
+        assert_eq!(NotificationsRead::PERMISSION, "notifications::read");
+        assert_eq!(NotificationsRead::MODULE, "notification");
+        assert!(!NotificationsRead::DESCRIPTION.is_empty());
+    }
+}
