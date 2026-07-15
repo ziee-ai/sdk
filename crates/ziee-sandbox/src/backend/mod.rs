@@ -33,7 +33,11 @@ use crate::types::{CodeSandboxState, HostCapabilities, SandboxContext};
 mod linux_bwrap;
 // Shared host-side client for the in-guest agent (vsock/unix on macOS,
 // AF_HYPERV vsock on Windows) — used by both VM backends.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+// Also compiled under `test` on every platform so the untrusted-`rel_path`
+// path-confinement unit test (`write_artifact`) runs in CI on Linux. This adds
+// `test` ONLY to the cfg predicate — the production (non-test) build on Linux
+// is byte-identical (module still excluded); macOS/Windows unchanged.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 mod vm_client;
 // Long-lived multiplexed session over a single agent connection —
 // the host side of the MCP-in-sandbox protocol extension. Pure

@@ -323,3 +323,72 @@ fn run(_cfg: VmLaunchConfig) -> ! {
     eprintln!("ziee-sandbox-vm-launcher is only supported on macOS (libkrun)");
     std::process::exit(1);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The server writes this launch.json; the launcher reads it back with
+    /// `serde_json::from_slice`. This guards that write↔read field contract:
+    /// every field the server emits must deserialize onto the right field.
+    #[test]
+    fn vm_launch_config_round_trips_from_launch_json() {
+        let json = r#"{
+            "num_vcpus": 2,
+            "ram_mib": 2048,
+            "root_path": "/var/lib/ziee/vm/root",
+            "sandbox_disk_path": "/var/lib/ziee/vm/full.squashfs",
+            "workspace_host_path": "/var/lib/ziee/vm/ws",
+            "vsock_socket_path": "/tmp/ziee-vsock.sock",
+            "vsock_port": 1024,
+            "agent_exec_path": "/opt/ziee/ziee-sandbox-agent",
+            "extra_mounts": ["/host/data", "/host/models"]
+        }"#;
+
+        let cfg: VmLaunchConfig = serde_json::from_str(json).expect("deserialize launch.json");
+
+        assert_eq!(cfg.num_vcpus, 2);
+        assert_eq!(cfg.ram_mib, 2048);
+        assert_eq!(cfg.root_path, "/var/lib/ziee/vm/root");
+        assert_eq!(cfg.sandbox_disk_path, "/var/lib/ziee/vm/full.squashfs");
+        assert_eq!(cfg.workspace_host_path, "/var/lib/ziee/vm/ws");
+        assert_eq!(cfg.vsock_socket_path, "/tmp/ziee-vsock.sock");
+        assert_eq!(cfg.vsock_port, 1024);
+        assert_eq!(cfg.agent_exec_path, "/opt/ziee/ziee-sandbox-agent");
+        assert_eq!(cfg.extra_mounts, vec!["/host/data", "/host/models"]);
+
+        // Full serialize→deserialize round-trip preserves every field.
+        let reserialized = serde_json::to_string(&cfg).expect("serialize");
+        let back: VmLaunchConfig =
+            serde_json::from_str(&reserialized).expect("re-deserialize");
+        assert_eq!(back.num_vcpus, cfg.num_vcpus);
+        assert_eq!(back.ram_mib, cfg.ram_mib);
+        assert_eq!(back.root_path, cfg.root_path);
+        assert_eq!(back.sandbox_disk_path, cfg.sandbox_disk_path);
+        assert_eq!(back.workspace_host_path, cfg.workspace_host_path);
+        assert_eq!(back.vsock_socket_path, cfg.vsock_socket_path);
+        assert_eq!(back.vsock_port, cfg.vsock_port);
+        assert_eq!(back.agent_exec_path, cfg.agent_exec_path);
+        assert_eq!(back.extra_mounts, cfg.extra_mounts);
+    }
+
+    /// `extra_mounts` carries `#[serde(default)]`, so a launch.json that omits
+    /// it (the common no-host-mounts exec) must deserialize to an empty vec
+    /// rather than failing.
+    #[test]
+    fn vm_launch_config_extra_mounts_defaults_to_empty() {
+        let json = r#"{
+            "num_vcpus": 1,
+            "ram_mib": 1024,
+            "root_path": "/r",
+            "sandbox_disk_path": "/d",
+            "workspace_host_path": "/w",
+            "vsock_socket_path": "/s.sock",
+            "vsock_port": 1024,
+            "agent_exec_path": "/a"
+        }"#;
+
+        let cfg: VmLaunchConfig = serde_json::from_str(json).expect("deserialize without extra_mounts");
+        assert!(cfg.extra_mounts.is_empty());
+    }
+}

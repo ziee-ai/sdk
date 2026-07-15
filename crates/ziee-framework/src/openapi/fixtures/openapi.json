@@ -104,10 +104,30 @@
           }
         }
       }
+    },
+    "/api/download": {
+      "get": {
+        "operationId": "downloadBlob",
+        "responses": {
+          "200": {
+            "description": "raw bytes",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BlobType" }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
     "schemas": {
+      "AnyType": {},
+      "BlobType": {
+        "type": "string",
+        "format": "binary"
+      },
       "Item": {
         "type": "object",
         "description": "A stored item.",
@@ -140,6 +160,58 @@
       "ItemKind": {
         "type": "string",
         "enum": ["alpha", "beta", "gamma"]
+      },
+      "Envelope": {
+        "type": "object",
+        "description": "Carries an arbitrary JSON payload.",
+        "required": ["payload"],
+        "properties": {
+          "payload": { "$ref": "#/components/schemas/AnyType" }
+        }
+      },
+      "MessageContentData": {
+        "description": "A single content block of a chat message.",
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["type", "text"],
+            "properties": {
+              "type": { "type": "string", "const": "text" },
+              "text": { "type": "string" }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type", "image_url"],
+            "properties": {
+              "type": { "type": "string", "const": "image_url" },
+              "image_url": { "type": "string" }
+            }
+          }
+        ]
+      },
+      "SSEExampleStream": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+              "type": { "type": "string", "const": "progress" }
+            },
+            "allOf": [{ "$ref": "#/components/schemas/Item" }]
+          },
+          {
+            "type": "object",
+            "required": ["done"],
+            "properties": {
+              "done": { "type": "boolean" }
+            }
+          }
+        ]
+      },
+      "Permission": {
+        "type": "string",
+        "enum": ["users::read", "projects::edit", "*"]
       }
     }
   }

@@ -511,4 +511,85 @@ mod tests {
         cfg.secret = "dev-secret-change-in-production-min-32-chars-long".to_string();
         assert!(JwtService::try_new(cfg).is_err());
     }
+
+    /// REJECT PATH (gap E-1): a signature-tampered access token must fail
+    /// validation. A JWT is `header.payload.signature`; flipping a char in the
+    /// signature breaks the HMAC and `decode` must error rather than trust it.
+    #[test]
+    fn tampered_signature_is_rejected() {
+        let svc = JwtService::try_new(test_config(None)).unwrap();
+        let user = Uuid::new_v4();
+        let minted = svc
+            .generate_tokens_with_jti_expiry(user, "u", "u@x", false, 24, 30)
+            .unwrap();
+        let token = minted.pair.access_token;
+
+        // A pristine token still validates (control).
+        assert!(svc.validate_access_token(&token).is_ok());
+
+        // Flip the last char of the signature segment to a definitely-different
+        // base64url char.
+        let (head, sig) = token.rsplit_once('.').expect("jwt has 3 segments");
+        let last = sig.chars().last().expect("non-empty signature");
+        let replacement = if last == 'A' { 'B' } else { 'A' };
+        let mut new_sig: String = sig[..sig.len() - 1].to_string();
+        new_sig.push(replacement);
+        let tampered = format!("{head}.{new_sig}");
+        assert_ne!(tampered, token, "the tamper actually changed the token");
+
+        assert!(
+            svc.validate_access_token(&tampered).is_err(),
+            "a token with a corrupted signature must be rejected"
+        );
+    }
+
+    /// REJECT PATH (gap E-1): audience separation. A refresh token (audience
+    /// `ziee-api-refresh`) must NOT pass `validate_access_token` (audience
+    /// `ziee-api`), and vice-versa — otherwise a long-lived refresh token would
+    /// be usable as an access token.
+    #[test]
+    fn refresh_token_is_rejected_as_access_token() {
+        let svc = JwtService::try_new(test_config(None)).unwrap();
+        let user = Uuid::new_v4();
+        let minted = svc
+            .generate_tokens_with_jti_expiry(user, "u", "u@x", false, 24, 30)
+            .unwrap();
+
+        // The refresh token is a valid refresh token...
+        assert!(svc.validate_refresh_token(&minted.pair.refresh_token).is_ok());
+        // ...but must be rejected on the access-token path (wrong audience).
+        assert!(
+            svc.validate_access_token(&minted.pair.refresh_token).is_err(),
+            "a refresh token must not be accepted as an access token"
+        );
+        // And symmetrically: an access token is not a valid refresh token.
+        assert!(
+            svc.validate_refresh_token(&minted.pair.access_token).is_err(),
+            "an access token must not be accepted as a refresh token"
+        );
+    }
+
+    /// REJECT PATH (gap E-1): an already-expired access token is rejected.
+    /// The debug-only seconds seam mints with a NEGATIVE TTL so `exp` lands in
+    /// the past (well beyond the 5s leeway), and validation must fail.
+    #[test]
+    fn expired_access_token_is_rejected() {
+        let svc = JwtService::try_new(test_config(Some(-3600))).unwrap();
+        let user = Uuid::new_v4();
+        let minted = svc
+            .generate_tokens_with_jti_expiry(user, "u", "u@x", false, 24, 30)
+            .unwrap();
+
+        // Access token's exp is ~now-3600 → expired.
+        assert!(
+            svc.validate_access_token(&minted.pair.access_token).is_err(),
+            "an access token whose exp is in the past must be rejected"
+        );
+        // The refresh token is unaffected by the access-only seconds seam, so it
+        // remains valid — proving the rejection is expiry, not a broken signer.
+        assert!(
+            svc.validate_refresh_token(&minted.pair.refresh_token).is_ok(),
+            "the refresh token (30d TTL) is still valid"
+        );
+    }
 }

@@ -160,3 +160,19 @@ async fn schema_has_no_foreign_keys() {
 
     drop_db(&dbname).await;
 }
+
+/// Pure builder-setter coverage (no DB): `.task(id)` sets `scheduled_task_id`
+/// and `.workflow_run(id)` sets `workflow_run_id`. The existing DB tests cover
+/// `.body()`/`.conversation()`/`.silent()` but never these two.
+#[test]
+fn builder_task_and_workflow_run_setters() {
+    let task_id = Uuid::new_v4();
+    let n = NewNotification::new(Uuid::new_v4(), "task_done", "Task finished").task(task_id);
+    assert_eq!(n.scheduled_task_id, Some(task_id));
+    assert_eq!(n.workflow_run_id, None, ".task() leaves workflow_run_id unset");
+
+    let run_id = Uuid::new_v4();
+    let n = NewNotification::new(Uuid::new_v4(), "run_done", "Run finished").workflow_run(run_id);
+    assert_eq!(n.workflow_run_id, Some(run_id));
+    assert_eq!(n.scheduled_task_id, None, ".workflow_run() leaves scheduled_task_id unset");
+}

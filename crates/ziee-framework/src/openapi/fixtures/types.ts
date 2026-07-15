@@ -16,6 +16,11 @@ export interface CreateItemRequest {
   description?: string
 }
 
+/** Carries an arbitrary JSON payload. */
+export interface Envelope {
+  payload: any
+}
+
 /** A stored item. */
 export interface Item {
   /** Stable identifier. */
@@ -28,6 +33,29 @@ export interface Item {
 }
 
 export type ItemKind = 'alpha' | 'beta' | 'gamma'
+
+export interface MessageContentDataText {
+  type: 'text'
+  text: string
+}
+export interface MessageContentDataImageUrl {
+  type: 'image_url'
+  image_url: string
+}
+
+/** A single content block of a chat message. */
+export type MessageContentData = MessageContentDataText | MessageContentDataImageUrl
+
+export enum Permission {
+  UsersRead = 'users::read',
+  ProjectsEdit = 'projects::edit',
+  All = '*'
+}
+
+export type SSEExampleStream = {
+  progress: Item
+  done: boolean
+}
 
 // =============================================================================
 // PERMISSIONS
@@ -50,6 +78,7 @@ export const PermissionDescriptions: Record<string, string> = {
 // API endpoint definitions
 export const ApiEndpoints = {
   'createItem': 'POST /api/items',
+  'downloadBlob': 'GET /api/download',
   'getItem': 'GET /api/items/{id}',
   'listItems': 'GET /api/items'
 } as const
@@ -57,6 +86,7 @@ export const ApiEndpoints = {
 // API endpoint parameters
 export type ApiEndpointParameters = {
   'createItem': CreateItemRequest
+  'downloadBlob': void
   'getItem': { id: string }
   'listItems': { kind?: string; limit?: number }
 }
@@ -64,6 +94,7 @@ export type ApiEndpointParameters = {
 // API endpoint responses
 export type ApiEndpointResponses = {
   'createItem': Item
+  'downloadBlob': Blob
   'getItem': Item
   'listItems': Item[]
 }

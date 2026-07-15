@@ -175,6 +175,106 @@ mod tests {
         assert!(DENY_EPERM.contains(&"name_to_handle_at"));
     }
 
+    /// Security-critical breakout syscalls that MUST stay classified EPERM.
+    /// This table is the authoritative pin: derived from the current
+    /// `DENY_EPERM` contents AND ziee's `code_sandbox/tier4_seccomp.rs`
+    /// `PROD_DENY_LIST`. If anyone deletes one of these from `DENY_EPERM`,
+    /// `deny_eperm_pins_every_breakout_syscall` fails closed. Do NOT prune
+    /// this table to make it pass — a name missing from `DENY_EPERM` is a
+    /// hardening regression, not a stale test.
+    const MUST_CONTAIN_EPERM: &[&str] = &[
+        // Tracing / cross-process introspection
+        "ptrace",
+        "perf_event_open",
+        "process_vm_readv",
+        "process_vm_writev",
+        "pidfd_send_signal",
+        "pidfd_getfd",
+        "pidfd_open",
+        // Kernel modification
+        "bpf",
+        "userfaultfd",
+        "kexec_load",
+        "kexec_file_load",
+        "init_module",
+        "finit_module",
+        "delete_module",
+        // Keyring
+        "keyctl",
+        "add_key",
+        "request_key",
+        // Mount family (old API)
+        "mount",
+        "umount",
+        "umount2",
+        "pivot_root",
+        "chroot",
+        // Namespace manipulation
+        "setns",
+        "unshare",
+        // File-handle resolution — the "Shocker" container-breakout primitive.
+        "open_by_handle_at",
+        "name_to_handle_at",
+        // I/O ring — recent escape vectors
+        "io_uring_setup",
+        "io_uring_enter",
+        "io_uring_register",
+        // Direct hardware I/O ports
+        "iopl",
+        "ioperm",
+        // Reboot / swap / quota class
+        "reboot",
+        "swapon",
+        "swapoff",
+        "quotactl",
+        // Execution-domain switching
+        "personality",
+    ];
+
+    /// The ENOSYS-classified probe-and-fallback names that MUST stay in
+    /// `DENY_ENOSYS` (reclassifying any to EPERM would break threaded/forked
+    /// R/torch workloads; deleting one silently unblocks a mount/clone vector).
+    const MUST_CONTAIN_ENOSYS: &[&str] = &[
+        "clone3",
+        "fsopen",
+        "fsconfig",
+        "fsmount",
+        "move_mount",
+        "open_tree",
+        "mount_setattr",
+    ];
+
+    #[test]
+    fn deny_eperm_pins_every_breakout_syscall() {
+        for name in MUST_CONTAIN_EPERM {
+            assert!(
+                DENY_EPERM.contains(name),
+                "SECURITY REGRESSION: '{name}' was removed from DENY_EPERM — a \
+                 sandbox-breakout syscall is no longer denied. Restore it; do \
+                 not edit MUST_CONTAIN_EPERM."
+            );
+            // And it must NOT have been (mis)moved to the ENOSYS list, which
+            // would let a fallback path re-enable it.
+            assert!(
+                !DENY_ENOSYS.contains(name),
+                "SECURITY REGRESSION: breakout syscall '{name}' is classified \
+                 ENOSYS — that opens a caller fallback path; it must be EPERM."
+            );
+        }
+    }
+
+    #[test]
+    fn deny_enosys_pins_every_probe_and_fallback_syscall() {
+        for name in MUST_CONTAIN_ENOSYS {
+            assert!(
+                DENY_ENOSYS.contains(name),
+                "SECURITY REGRESSION: '{name}' was removed from DENY_ENOSYS — a \
+                 mount/clone probe-and-fallback syscall is no longer filtered. \
+                 Restore it; do not edit MUST_CONTAIN_ENOSYS."
+            );
+        }
+    }
+
     #[test]
     fn deny_lists_have_no_internal_duplicates() {
         // These are hand-maintained lists; a copy-paste dup is a real

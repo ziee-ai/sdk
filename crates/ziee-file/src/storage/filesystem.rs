@@ -386,6 +386,56 @@ mod tests {
         );
     }
 
+    /// Security (F-03): the upload-supplied `extension` feeds
+    /// `get_original_path`; without sanitization a value containing path
+    /// separators / `..` would let create_dir_all + write escape the per-user
+    /// `originals/` dir and clobber another user's file. `safe_ext` must
+    /// collapse any non-ASCII-alnum / empty / >16-char extension to `bin`,
+    /// confining the result under the user's originals dir.
+    #[test]
+    fn get_original_path_sanitizes_traversal_extensions() {
+        let (_dir, s) = storage();
+        let user = Uuid::new_v4();
+        let file = Uuid::new_v4();
+
+        let originals_dir = s.get_user_path(user, "originals");
+        let expected_bin = originals_dir.join(format!("{}.bin", file));
+
+        // Every hostile / malformed extension collapses to `.bin` under the
+        // user's own originals dir — no escape.
+        for evil in [
+            "x/../../victim/y",     // path-traversal via separators + ..
+            "e/../../../etc",       // deeper traversal
+            "png/../../../../root", // still contains separators
+            "a".repeat(17).as_str(),// >16 chars → rejected
+            "",                      // empty → rejected
+            "pn g",                  // space (non-alnum)
+            "p.g",                   // dot (non-alnum)
+            "évil",                  // non-ASCII
+        ] {
+            let path = s.get_original_path(user, file, evil);
+            assert_eq!(
+                path, expected_bin,
+                "extension {evil:?} must collapse to '.bin' under the user dir"
+            );
+            assert!(
+                path.starts_with(&originals_dir),
+                "sanitized path for {evil:?} escaped the user originals dir: {}",
+                path.display()
+            );
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.ends_with(".bin"),
+                "expected a .bin file name for {evil:?}, got {name}"
+            );
+        }
+
+        // A benign extension is preserved (lowercased).
+        let ok = s.get_original_path(user, file, "PNG");
+        assert_eq!(ok, originals_dir.join(format!("{}.png", file)));
+        assert!(ok.starts_with(&originals_dir));
+    }
+
     /// Security (F-15): a symlink planted in the storage tree must NOT be
     /// followed on load — the read is refused.
     #[cfg(unix)]

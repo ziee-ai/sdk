@@ -202,6 +202,58 @@ pub async fn generate_download_token<R: IdentityResolver<User = User, Group = Gr
     ))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::content_disposition;
+
+    /// Security (F-08): a filename carrying CRLF must NOT be able to inject
+    /// response headers. The emitted `Content-Disposition` value must contain
+    /// no raw CR/LF in EITHER the `filename=` or `filename*=` segment.
+    #[test]
+    fn content_disposition_neutralizes_crlf_injection() {
+        let evil = "evil\";\r\nSet-Cookie: a=b";
+        let out = content_disposition(evil);
+        assert!(
+            !out.contains('\r'),
+            "header value must not contain a raw CR: {out:?}"
+        );
+        assert!(
+            !out.contains('\n'),
+            "header value must not contain a raw LF: {out:?}"
+        );
+        // The injected header name must not survive verbatim in the ASCII form
+        // (unsafe bytes are replaced with '_', and CR/LF are percent-encoded in
+        // the RFC-5987 form).
+        assert!(
+            !out.contains("Set-Cookie: a=b"),
+            "raw injected header must not appear verbatim: {out:?}"
+        );
+        // CR/LF are percent-encoded in the filename* segment.
+        assert!(out.contains("%0D") && out.contains("%0A"), "CRLF must be percent-encoded: {out:?}");
+    }
+
+    /// A multibyte (non-ASCII) filename round-trips through the RFC-5987
+    /// `filename*=UTF-8''` segment as percent-encoded UTF-8 bytes.
+    #[test]
+    fn content_disposition_encodes_multibyte_filename() {
+        let out = content_disposition("réport.pdf");
+        assert!(
+            out.contains("filename*=UTF-8''"),
+            "must carry an RFC-5987 filename* segment: {out:?}"
+        );
+        // 'é' is U+00E9 → UTF-8 0xC3 0xA9 → "%C3%A9".
+        assert!(
+            out.contains("r%C3%A9port.pdf"),
+            "multibyte filename must be percent-encoded UTF-8: {out:?}"
+        );
+        // The ASCII fallback replaces the non-ASCII byte(s) with '_'.
+        assert!(
+            out.contains("filename=\"r_port.pdf\""),
+            "ASCII fallback must sanitize the non-ASCII char: {out:?}"
+        );
+    }
+}
+
 /// Download file OpenAPI documentation
 pub fn download_file_docs(op: TransformOperation) -> TransformOperation {
     use crate::types::BlobType;

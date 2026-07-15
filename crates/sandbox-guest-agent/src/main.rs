@@ -1373,6 +1373,88 @@ mod tests {
     use sandbox_vm_protocol::{Decoder, Frame, KillProcessRequest, ProcessRequest, StartedAck};
     use tokio::io::{duplex, AsyncWriteExt};
 
+    // --- walk_artifacts (directory-collection helper) ------------------------
+
+    /// Create a (sparse) file of the given logical length. `set_len` makes the
+    /// file report `len` via `metadata()` (which is what `walk_artifacts`
+    /// checks) without allocating that many physical blocks, so we can exercise
+    /// the 10 MiB / 100 MiB caps with near-zero disk usage.
+    fn make_file(path: &std::path::Path, len: u64) {
+        let f = std::fs::File::create(path).expect("create artifact file");
+        f.set_len(len).expect("set_len");
+    }
+
+    /// Run `walk_artifacts` over `root` and return the `rel_path`s of every
+    /// `ArtifactFile` frame it streamed, in send order.
+    fn collect_rel_paths(root: &std::path::Path) -> Vec<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let mut total: u64 = 0;
+        walk_artifacts(root, root, 0, &tx, &mut total);
+        drop(tx);
+        let mut out = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let Frame::ArtifactFile { rel_path, .. } = frame {
+                out.push(rel_path);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn walk_artifacts_skips_oversize_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        make_file(&root.join("small.txt"), 100);
+        // Strictly larger than the per-file cap → must be skipped.
+        make_file(&root.join("big.bin"), ARTIFACT_PER_FILE_CAP_BYTES + 1);
+
+        let rels = collect_rel_paths(root);
+        assert_eq!(
+            rels,
+            vec!["small.txt".to_string()],
+            "only the sub-cap file should stream; the oversize one is skipped"
+        );
+    }
+
+    #[test]
+    fn walk_artifacts_respects_total_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // Each file is exactly the per-file cap (passes the `>` per-file check).
+        // Ten of them sum to exactly the total cap; the eleventh would push the
+        // running total over it and is therefore not streamed.
+        let per = ARTIFACT_PER_FILE_CAP_BYTES;
+        let n = (ARTIFACT_TOTAL_CAP_BYTES / per) as usize; // 10
+        for i in 0..(n + 1) {
+            make_file(&root.join(format!("f{i:02}.bin")), per);
+        }
+
+        let rels = collect_rel_paths(root);
+        assert_eq!(
+            rels.len(),
+            n,
+            "once the cumulative total reaches the cap, further files are not streamed"
+        );
+    }
+
+    #[test]
+    fn walk_artifacts_skips_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        make_file(&root.join("real.txt"), 42);
+        // A symlink is a non-regular entry → must be skipped, even though its
+        // target is a valid small regular file.
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt"))
+            .expect("symlink");
+
+        let rels = collect_rel_paths(root);
+        assert_eq!(
+            rels,
+            vec!["real.txt".to_string()],
+            "the regular file streams; the symlink entry is skipped"
+        );
+    }
+
     /// Build a tiny PYTHON-FREE ProcessRequest that invokes `/bin/cat`
     /// directly (no bwrap). We point `bwrap_path` at `/bin/cat` so the
     /// agent simply execs cat with the given argv. cat with no args

@@ -77,3 +77,7 @@ tempfile = "3.15"
 # `tower::ServiceExt::oneshot`. axum/tokio/uuid/ziee-core/ziee-identity/
 # async-trait/serde_json are already regular deps and available to the tests.
 tower = { version = "0.5.3", features = ["util"] }
+# tests/sync_routes.rs reads the SSE response body frame-by-frame (the stream
+# stays open, so `to_bytes` would hang) to assert the `connected` handshake +
+# exp-deadline teardown. Version matches the ziee-auth dev-dep.
+http-body-util = "0.1.4"

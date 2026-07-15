@@ -45,3 +45,6 @@ gpu-detect = ["nvml-wrapper", "opencl3", "ash", "wgpu-hal"]
 # MONITORING_ACTIVE flag, so they run under `#[serial(hw_monitoring)]` (moved
 # verbatim with the tests). Version matches the ziee server crate.
 serial_test = "3.2"
+# detection.rs PATH-refusal test (gap F-06): stages a fake vendor binary on a
+# temp dir prepended to $PATH and asserts `resolve_system_binary` ignores it.
+tempfile = "3.15"

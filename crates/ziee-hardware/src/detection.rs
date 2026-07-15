@@ -859,6 +859,90 @@ mod tests {
         }
     }
 
+    /// SECURITY (12-hardware F-06): `resolve_system_binary` must NEVER honor a
+    /// vendor binary found via `$PATH` — a malicious prefix dir must not be able
+    /// to shadow the real `nvidia-smi`/`rocm-smi`/etc. Only the 7 trusted
+    /// absolute system dirs are consulted. We stage a fake `nvidia-smi` on a temp
+    /// dir, prepend it to `$PATH`, and assert the resolver refuses to return it.
+    ///
+    /// `$PATH` is process-global, so this shares the `hw_env` serial key with any
+    /// other env-mutating test to avoid interleaving.
+    #[test]
+    #[serial_test::serial(hw_env)]
+    fn resolve_system_binary_refuses_path_lookup() {
+        use std::io::Write;
+
+        // A temp dir holding a fake `nvidia-smi`, made executable on unix so a
+        // naive PATH lookup genuinely WOULD have found it.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fake = dir.path().join("nvidia-smi");
+        {
+            let mut f = std::fs::File::create(&fake).expect("create fake nvidia-smi");
+            writeln!(f, "#!/bin/sh\necho fake").expect("write fake");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake");
+        }
+        assert!(fake.is_file(), "sanity: the fake binary exists on disk");
+
+        // Prepend the temp dir to PATH, run the resolver, then restore PATH.
+        let orig_path = std::env::var_os("PATH");
+        let mut entries = vec![dir.path().to_path_buf()];
+        if let Some(p) = orig_path.as_ref() {
+            entries.extend(std::env::split_paths(p));
+        }
+        let joined = std::env::join_paths(entries).expect("join PATH");
+        // SAFETY: single-threaded test guarded by the `hw_env` serial key.
+        unsafe {
+            std::env::set_var("PATH", &joined);
+        }
+        let resolved = resolve_system_binary("nvidia-smi");
+        // Restore PATH before asserting so a failure can't leak the mutation.
+        unsafe {
+            match orig_path {
+                Some(p) => std::env::set_var("PATH", p),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+
+        assert_ne!(
+            resolved.as_deref(),
+            Some(fake.as_path()),
+            "resolve_system_binary must NOT return the PATH-shadowed temp binary"
+        );
+        // Anything it DOES return must live under a trusted absolute dir.
+        if let Some(p) = resolved {
+            let trusted = [
+                "/usr/bin",
+                "/usr/sbin",
+                "/usr/local/bin",
+                "/usr/local/cuda/bin",
+                "/opt/rocm/bin",
+                "/opt/homebrew/bin",
+                "/sbin",
+            ];
+            let parent = p.parent().and_then(|d| d.to_str()).unwrap_or("");
+            assert!(
+                trusted.contains(&parent),
+                "resolved path {p:?} is not under a trusted system dir"
+            );
+        }
+    }
+
+    /// A binary name that exists in NONE of the trusted dirs resolves to `None`
+    /// (the caller then skips spawning it). The unique name guarantees absence.
+    #[test]
+    fn resolve_system_binary_absent_name_is_none() {
+        let name = format!("ziee-nonexistent-vendor-tool-{}", uuid::Uuid::new_v4());
+        assert!(
+            resolve_system_binary(&name).is_none(),
+            "a name absent from every trusted dir must resolve to None"
+        );
+    }
+
     /// `get_gpu_usage_data` must likewise be panic-free and well-formed: each
     /// usage row has a non-empty `device_id`, and any present utilization /
     /// memory-usage percentage is within [0, 100].

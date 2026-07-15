@@ -1,3 +1,13 @@
+// When compiled ONLY for the Linux `test` build (backend/mod.rs adds `test` to
+// this module's cfg so the `write_artifact` path-confinement test runs on
+// Linux), the transport fns here have no caller. Silence the resulting
+// dead_code warnings — this attribute is inert on the real macOS/Windows
+// builds where those fns ARE used.
+#![cfg_attr(
+    all(test, not(any(target_os = "macos", target_os = "windows"))),
+    allow(dead_code)
+)]
+
 //! Host-side client for the in-guest `ziee-sandbox-agent`, shared by the macOS
 //! (libkrun → vsock-bridged unix socket) and Windows (WSL2 → localhost TCP)
 //! backends. Sends one `ExecRequest` over an already-connected stream and
@@ -184,6 +194,59 @@ fn write_artifact(host_dirs: &[PathBuf], mount_index: u32, rel_path: &str, data:
         tracing::warn!(path = %dest.display(), "vm_client: write artifact failed: {e}");
     } else {
         tracing::debug!(path = %dest.display(), bytes = data.len(), "vm_client: wrote streamed artifact");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_artifact;
+    use std::path::PathBuf;
+
+    /// Security: a guest-supplied `rel_path` is UNTRUSTED. Absolute paths,
+    /// `..` traversal, and any post-join escape must write NOTHING outside the
+    /// host artifact dir. Only a benign relative path lands under base.
+    #[test]
+    fn write_artifact_confines_untrusted_rel_path_under_base() {
+        let base_tmp = tempfile::tempdir().unwrap();
+        let base: PathBuf = base_tmp.path().to_path_buf();
+        // A sentinel dir OUTSIDE base that a traversal would target.
+        let outside_tmp = tempfile::tempdir().unwrap();
+        let host_dirs = vec![base.clone()];
+
+        // Each of these must be rejected (nothing written anywhere).
+        for evil in [
+            "../../etc/passwd",
+            "/etc/passwd",
+            "a/../../b",
+            format!("{}/pwned", outside_tmp.path().display()).as_str(), // absolute escape
+        ] {
+            write_artifact(&host_dirs, 0, evil, b"malicious");
+        }
+
+        // base must still be empty (no traversal wrote into or through it).
+        let entries: Vec<_> = std::fs::read_dir(&base).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "no rejected artifact may create anything under base: {entries:?}"
+        );
+        // The outside sentinel dir must be untouched by the escaping writes.
+        let outside_entries: Vec<_> =
+            std::fs::read_dir(outside_tmp.path()).unwrap().collect();
+        assert!(
+            outside_entries.is_empty(),
+            "a traversal must not write outside base"
+        );
+
+        // An out-of-range mount_index is dropped (no panic, nothing written).
+        write_artifact(&host_dirs, 99, "ok.txt", b"x");
+        assert!(std::fs::read_dir(&base).unwrap().next().is_none());
+
+        // A benign nested relative path is written UNDER base.
+        write_artifact(&host_dirs, 0, "sub/dir/f.txt", b"good bytes");
+        let landed = base.join("sub/dir/f.txt");
+        assert!(landed.exists(), "benign artifact must be written under base");
+        assert!(landed.starts_with(&base));
+        assert_eq!(std::fs::read(&landed).unwrap(), b"good bytes");
     }
 }
 
