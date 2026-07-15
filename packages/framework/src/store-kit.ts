@@ -259,7 +259,9 @@ export function defineExtensionStore<State extends object, Actions extends objec
 
 /** A per-instance store handle: reactive reads (`const {a}=s`), `s.$.a` snapshot,
  *  and `s.action()`. */
-export type LocalStoreInstance<FullState> = Readonly<FullState & { $: FullState }>
+export type LocalStoreInstance<FullState> = Readonly<
+  FullState & { $: FullState; __api__: StoreApi<FullState> }
+>
 
 export interface LocalStoreDef<FullState> {
   /** Instantiate a fresh store for THIS component (initial-state override
@@ -277,6 +279,7 @@ function createLocalProxy<S extends object>(
       // returned resolved from getState(), hook-free — callable in render AND
       // handlers with no `$`.
       if (prop === '$') return api.getState()
+      if (prop === '__api__') return api
       const value = (api.getState() as any)[prop]
       if (typeof value === 'function') return value
       // eslint-disable-next-line react-hooks/rules-of-hooks
