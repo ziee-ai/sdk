@@ -1,0 +1,72 @@
+[package]
+name = "ziee-sandbox"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+# Dependency direction: `ziee-core` for the shared `AppError` and the
+# `CodeSandboxConfig` split; `ziee-framework` for the MCP JSON-RPC envelopes +
+# `loopback_host` re-exported through this crate's `types`. The engine is
+# build-DB-FREE: `sqlx` is pulled with `default-features=false, features=[derive,
+# macros]` ONLY so `#[derive(sqlx::FromRow)]` on `CodeSandboxResourceLimits`
+# compiles — no `postgres`/runtime feature, so no `DATABASE_URL` is consulted at
+# build time. Versions match the ziee server crate so the single
+# src-app/Cargo.lock unifies them without a duplicate build.
+ziee-core = { path = "../ziee-core" }
+ziee-framework = { path = "../ziee-framework" }
+
+async-trait = "0.1"
+tokio = { version = "1.47.1", features = ["full"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
+once_cell = "1.21.3"
+dashmap = "6"
+axum = { version = "0.8.4", features = ["macros", "multipart"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+hex = "0.4"
+tracing = "0.1"
+rmcp = { version = "1.4", features = ["client", "transport-child-process"] }
+libc = "0.2"
+# FromRow derive macro ONLY — no postgres/runtime feature keeps the crate
+# build-DB-free (no compile-time query verification, no DATABASE_URL).
+sqlx = { version = "0.8.6", default-features = false, features = ["derive", "macros"] }
+
+# The microVM backends (macOS libkrun, Windows WSL2) talk to the in-guest agent
+# over this shared control protocol. Also compiled on Linux — `backend/vm_long_lived`
+# is intentionally not platform-gated (uniform `SandboxBackend` return signature),
+# so the dep must resolve on every supported OS.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+sandbox-vm-protocol = { path = "../sandbox-vm-protocol" }
+
+# The seccomp policy lives in the shared `sandbox-seccomp` crate; the
+# `code_sandbox_seccomp` feature statically links libseccomp at build time.
+# Optional + Linux-gated (libseccomp is Linux-only).
+[target.'cfg(target_os = "linux")'.dependencies]
+sandbox-seccomp = { path = "../sandbox-seccomp", optional = true }
+
+# Windows: AF_HYPERV / SOCKADDR_HV bindings + LocalSystem sandbox-helper service.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_NetworkManagement_IpHelper",
+] }
+windows-service = "0.7"
+winreg = "0.52"
+
+[features]
+code_sandbox_seccomp = ["dep:sandbox-seccomp"]
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[lints]
+workspace = true
