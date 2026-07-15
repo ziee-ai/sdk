@@ -1,0 +1,36 @@
+[package]
+name = "ziee-seed"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+ziee-core = { path = "../ziee-core" }
+ziee-framework = { path = "../ziee-framework" }
+
+# Versions match ziee-auth / the ziee server crate so the single Cargo.lock
+# unifies them without a duplicate build when an app consumes ziee-seed by path.
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.141"
+serde_norway = "0.9"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "time", "macros", "migrate"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1.47.1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2.0.12"
+tracing = "0.1"
+# The SeedProvider seam is a linkme distributed-slice, mirroring MODULE_ENTRIES;
+# the version matches ziee-framework so the single Cargo.lock unifies the slice
+# across the crate boundary.
+linkme = "0.3"
+# Per-provider panic isolation in the dispatch loop (catch_unwind on the apply future).
+futures = "0.3"
+
+[build-dependencies]
+# Seed-only build DB provisioning (mirrors ziee-auth): create + migrate
+# `ziee_seed_build_<key>` on the shared :54321 cluster so sqlx compile-time
+# `query!` verification for the seed_ledger table has a schema to check against.
+# ziee-seed is a schema-bound SDK crate (it owns the seed_ledger table);
+# framework/core stay build-DB-free.
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "migrate"] }

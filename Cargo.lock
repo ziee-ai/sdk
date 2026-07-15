@@ -8954,6 +8954,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ziee-seed"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "linkme",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "sqlx 0.8.6",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "ziee-core",
+ "ziee-framework",
+]
+
+[[package]]
 name = "ziee-server-update"
 version = "0.0.0"
 dependencies = [
