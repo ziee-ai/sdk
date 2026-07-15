@@ -17,3 +17,4 @@ aide = { version = "0.15", features = ["axum", "axum-json", "macros"] }
 
 [dev-dependencies]
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5.3", features = ["util"] }
