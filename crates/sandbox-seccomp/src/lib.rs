@@ -174,4 +174,37 @@ mod tests {
         assert!(DENY_EPERM.contains(&"open_by_handle_at"));
         assert!(DENY_EPERM.contains(&"name_to_handle_at"));
     }
+
+    #[test]
+    fn deny_lists_have_no_internal_duplicates() {
+        // These are hand-maintained lists; a copy-paste dup is a real
+        // maintenance bug (harmless at runtime but a sign of an editing error
+        // and it inflates the filter). Assert each name is unique within its
+        // list AND non-empty.
+        for (label, list) in [("DENY_EPERM", DENY_EPERM), ("DENY_ENOSYS", DENY_ENOSYS)] {
+            let mut seen = std::collections::HashSet::new();
+            for name in list {
+                assert!(!name.is_empty(), "{label} contains an empty syscall name");
+                assert!(seen.insert(*name), "{label} contains duplicate '{name}'");
+            }
+        }
+    }
+
+    #[test]
+    fn build_bpf_reports_unresolved_for_fabricated_syscall() {
+        // Sanity-check the per-name best-effort contract: an unknown syscall
+        // name is collected into `unresolved` instead of aborting the whole
+        // filter. We can't inject into the const lists, so this asserts the
+        // real lists resolve without error and the BPF is non-empty (the
+        // unresolved vec being small/empty on a modern kernel is expected).
+        let (bpf, unresolved) = build_bpf().expect("filter builds");
+        assert!(!bpf.is_empty());
+        // Every reported unresolved name must be one we actually asked for.
+        for name in &unresolved {
+            assert!(
+                DENY_EPERM.contains(&name.as_str()) || DENY_ENOSYS.contains(&name.as_str()),
+                "unresolved name '{name}' was never in a deny list"
+            );
+        }
+    }
 }

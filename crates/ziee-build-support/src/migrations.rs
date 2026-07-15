@@ -127,3 +127,133 @@ pub fn compose_merged_migrations_from(
     }
     println!("cargo:rerun-if-changed={}", merged_dir.display());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Create `<root>/<module>/migrations/<file>` with `body` and return the
+    /// `migrations` dir path.
+    fn write_module_migration(root: &Path, module: &str, file: &str, body: &str) -> PathBuf {
+        let dir = root.join(module).join("migrations");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(file), body).unwrap();
+        dir
+    }
+
+    fn sorted_merged_names(merged: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(merged)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn unions_globbed_module_migrations_and_ignores_non_sql() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("modules");
+        write_module_migration(&app_root, "foo", "00000000000001_foo_init.sql", "-- foo");
+        write_module_migration(&app_root, "bar", "00000000000002_bar_init.sql", "-- bar");
+        // A non-.sql file in a migrations dir must be ignored, not copied.
+        fs::write(
+            app_root.join("bar").join("migrations").join("README.md"),
+            "notes",
+        )
+        .unwrap();
+        // A module directory with no `migrations` subdir is simply skipped.
+        fs::create_dir_all(app_root.join("baz")).unwrap();
+
+        let merged = tmp.path().join("merged");
+        compose_merged_migrations(&merged, &[app_root]);
+
+        assert_eq!(
+            sorted_merged_names(&merged),
+            vec![
+                "00000000000001_foo_init.sql".to_string(),
+                "00000000000002_bar_init.sql".to_string(),
+            ]
+        );
+        // Content is copied verbatim.
+        assert_eq!(
+            fs::read_to_string(merged.join("00000000000001_foo_init.sql")).unwrap(),
+            "-- foo"
+        );
+    }
+
+    #[test]
+    fn merged_dir_is_wiped_before_recompose() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("modules");
+        write_module_migration(&app_root, "foo", "00000000000001_foo_init.sql", "-- foo");
+        let merged = tmp.path().join("merged");
+        // Seed a stale file that a prior compose would have left behind.
+        fs::create_dir_all(&merged).unwrap();
+        fs::write(merged.join("99999999999999_stale.sql"), "-- stale").unwrap();
+
+        compose_merged_migrations(&merged, &[app_root]);
+
+        assert_eq!(
+            sorted_merged_names(&merged),
+            vec!["00000000000001_foo_init.sql".to_string()],
+            "stale file must be removed by the wipe-and-recreate"
+        );
+    }
+
+    #[test]
+    fn includes_explicit_sdk_dirs_and_skips_missing_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("modules");
+        write_module_migration(&app_root, "foo", "00000000000001_foo_init.sql", "-- foo");
+
+        // An explicit SDK-crate migrations dir that exists → included.
+        let sdk_auth = tmp.path().join("sdk").join("ziee-auth").join("migrations");
+        fs::create_dir_all(&sdk_auth).unwrap();
+        fs::write(sdk_auth.join("00000000000003_auth.sql"), "-- auth").unwrap();
+
+        // An explicit SDK dir that does NOT exist → silently skipped (a linked
+        // crate may ship no migrations).
+        let sdk_missing = tmp.path().join("sdk").join("ziee-absent").join("migrations");
+
+        let merged = tmp.path().join("merged");
+        compose_merged_migrations_from(
+            &merged,
+            &[app_root],
+            &[sdk_auth.clone(), sdk_missing],
+        );
+
+        assert_eq!(
+            sorted_merged_names(&merged),
+            vec![
+                "00000000000001_foo_init.sql".to_string(),
+                "00000000000003_auth.sql".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate migration filename")]
+    fn panics_on_basename_collision_across_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("modules");
+        // Two different modules ship the SAME migration filename → must panic
+        // (silently dropping one would corrupt the schema history).
+        write_module_migration(&app_root, "foo", "00000000000001_dup.sql", "-- foo");
+        write_module_migration(&app_root, "bar", "00000000000001_dup.sql", "-- bar");
+
+        let merged = tmp.path().join("merged");
+        compose_merged_migrations(&merged, &[app_root]);
+    }
+
+    #[test]
+    fn empty_roots_produce_empty_merged_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let merged = tmp.path().join("merged");
+        compose_merged_migrations(&merged, &[]);
+        assert!(merged.is_dir(), "merged dir is created even with no sources");
+        assert_eq!(sorted_merged_names(&merged), Vec::<String>::new());
+    }
+}

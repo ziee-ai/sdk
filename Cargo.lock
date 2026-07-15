@@ -8737,6 +8737,7 @@ name = "ziee-build-support"
 version = "0.0.0"
 dependencies = [
  "sqlx 0.8.6",
+ "tempfile",
  "tokio",
 ]
 

@@ -161,4 +161,34 @@ mod tests {
             "postgresql://postgres:password@127.0.0.1:54321/ziee_build_ab12cd34"
         );
     }
+
+    #[test]
+    fn with_database_appends_when_url_has_no_path() {
+        // No db path after host:port → append one (don't corrupt host/port).
+        assert_eq!(
+            with_database("postgresql://postgres:password@127.0.0.1:54321", "mydb"),
+            "postgresql://postgres:password@127.0.0.1:54321/mydb"
+        );
+    }
+
+    #[test]
+    fn with_database_handles_trailing_slash() {
+        assert_eq!(
+            with_database("postgresql://postgres:password@127.0.0.1:54321/", "mydb"),
+            "postgresql://postgres:password@127.0.0.1:54321/mydb"
+        );
+    }
+
+    #[test]
+    fn with_database_admin_url_targets_maintenance_db() {
+        // The `ensure_build_db` admin path builds a maintenance URL by swapping
+        // in `postgres` — the swap must preserve userinfo + host + port.
+        assert_eq!(
+            with_database(
+                "postgresql://u:p@db.example:6543/ziee_build_deadbeef",
+                "postgres"
+            ),
+            "postgresql://u:p@db.example:6543/postgres"
+        );
+    }
 }

@@ -765,12 +765,60 @@ mod tests {
             TAG_EXEC, TAG_STDOUT, TAG_STDERR, TAG_EXIT, TAG_SHUTDOWN,
             TAG_START_PROCESS, TAG_STARTED, TAG_STDIN, TAG_PROCESS_STDOUT,
             TAG_PROCESS_STDERR, TAG_PROCESS_EXIT, TAG_KILL_PROCESS,
-            TAG_PING, TAG_PONG, TAG_ARTIFACT_FILE,
+            TAG_PING, TAG_PONG, TAG_ARTIFACT_FILE, TAG_PROGRESS,
         ];
         let mut seen = std::collections::HashSet::new();
         for t in tags {
             assert!(seen.insert(t), "tag {t} appears twice");
         }
+    }
+
+    #[test]
+    fn default_policy_matches_documented_limits() {
+        // The guest applies these to a cgroup v2 scope; they MUST stay in
+        // lock-step with the Linux host's `cgroup::CgroupScope` defaults
+        // (512 MiB / no swap / 256 PIDs / 1 CPU). A silent drift here would
+        // give VM-backend execs different resource caps than the Linux host.
+        let p = CgroupLimits::default_policy();
+        assert_eq!(p.memory_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(p.memory_swap_max_bytes, 0);
+        assert_eq!(p.pids_max, 256);
+        assert_eq!(p.cpu_max, "100000 100000");
+    }
+
+    #[test]
+    fn protocol_error_display_messages() {
+        assert_eq!(
+            ProtocolError::UnknownTag(99).to_string(),
+            "unknown frame tag 99"
+        );
+        assert_eq!(
+            ProtocolError::FrameTooLarge(1234).to_string(),
+            "frame payload too large (1234 bytes)"
+        );
+        assert_eq!(
+            ProtocolError::BadJson.to_string(),
+            "malformed JSON frame payload"
+        );
+    }
+
+    #[test]
+    fn exec_request_roundtrips_through_json_with_defaulted_optionals() {
+        // A minimal ExecRequest omitting every `#[serde(default)]` optional
+        // must deserialize with the documented defaults (older peers send no
+        // seccomp_fd/cgroup/progress/collect_artifacts fields).
+        let json = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": 5,
+            "bwrap_path": "/usr/bin/bwrap",
+            "argv": ["--version"],
+            "timeout_ms": 1000,
+        });
+        let req: ExecRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.seccomp_fd, None);
+        assert_eq!(req.cgroup, None);
+        assert!(!req.progress);
+        assert!(req.collect_artifacts.is_empty());
     }
 
     #[test]

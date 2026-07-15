@@ -124,10 +124,18 @@ enum Listen {
     Tcp(String),
 }
 
-/// Parse `--listen vsock:<port>` / `--listen tcp:<addr>` from argv; default
-/// `vsock:1024` (macOS/libkrun back-compat).
+/// Parse `--listen vsock:<port>` / `--listen tcp:<addr>` from process argv;
+/// default `vsock:1024` (macOS/libkrun back-compat).
 fn parse_listen() -> Listen {
-    let mut args = std::env::args().skip(1);
+    parse_listen_from(std::env::args().skip(1))
+}
+
+/// Pure core of [`parse_listen`]: parse the transport spec from an arbitrary
+/// argument iterator (already past argv[0]). Extracted so the parsing rules —
+/// `vsock:<port>` / `tcp:<addr>`, a malformed port falling back to
+/// [`VSOCK_PORT`], and the no-flag default — are unit-testable without touching
+/// the process environment.
+fn parse_listen_from(mut args: impl Iterator<Item = String>) -> Listen {
     while let Some(a) = args.next() {
         if a == "--listen" {
             if let Some(spec) = args.next() {
@@ -1396,27 +1404,22 @@ mod tests {
             let _ = handle_conn(agent_side, None).await;
         });
 
-        // Host sends every frame in order.
-        tokio::spawn(async move {
-            for f in host_input {
-                let bytes = encode(&f);
-                if host_wr.write_all(&bytes).await.is_err() {
-                    break;
-                }
-            }
-            // Close the writer so the agent observes EOF after the test
-            // has read what it expected.
-            let _ = host_wr.shutdown().await;
-        });
+        // Send every input frame but KEEP the write half open until `wait_for`
+        // is satisfied. Closing it early makes the agent observe a
+        // host-disconnect and SIGKILL any still-running process (e.g. `cat`
+        // mid-echo) before it flushes its output — the trailing ProcessStdout
+        // would then be lost. The callers of this harness run on a
+        // multi-thread runtime so the agent's per-process pump/wait tasks make
+        // progress concurrently with this reader.
+        for f in &host_input {
+            host_wr.write_all(&encode(f)).await.expect("send frame");
+        }
 
-        // Host reads frames into a buffer; stop when `wait_for` returns true.
+        // Phase 1: read (write half still open) until `wait_for` is satisfied.
         let mut decoder = Decoder::new();
         let mut collected = Vec::new();
         let mut buf = [0u8; 4096];
-        loop {
-            if wait_for(&collected) {
-                break;
-            }
+        while !wait_for(&collected) {
             let n = host_rd.read(&mut buf).await.unwrap_or(0);
             if n == 0 {
                 break;
@@ -1424,9 +1427,24 @@ mod tests {
             decoder.feed(&buf[..n]);
             while let Ok(Some(f)) = decoder.next_frame() {
                 collected.push(f);
-                if wait_for(&collected) {
-                    break;
-                }
+            }
+        }
+
+        // Phase 2: shut down the write half so the agent observes EOF and tears
+        // down cleanly, then drain any trailing frame (a ProcessStdout that
+        // raced ProcessExit from a separate task) until the connection reaches
+        // EOF. `shutdown()` (not `drop`) is required — with `split()` the read
+        // half keeps the duplex open, so merely dropping the write half would
+        // never deliver EOF to the agent.
+        let _ = host_wr.shutdown().await;
+        loop {
+            let n = host_rd.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            decoder.feed(&buf[..n]);
+            while let Ok(Some(f)) = decoder.next_frame() {
+                collected.push(f);
             }
         }
 
@@ -1434,7 +1452,7 @@ mod tests {
         collected
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn long_lived_echoes_stdin_to_stdout_then_exits() {
         let frames = run_long_lived_with_frames(
             vec![
@@ -1466,7 +1484,7 @@ mod tests {
         assert!(matches!(exit, Some(s) if s.code == 0 && !s.timed_out));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn long_lived_two_handles_multiplex_independently() {
         let frames = run_long_lived_with_frames(
             vec![
@@ -1507,7 +1525,7 @@ mod tests {
         assert_eq!(h2_stdout, b"BBB");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn long_lived_kill_terminates_handle() {
         // Spawn cat that will never receive EOF and never exit on its
         // own; verify KillProcess produces a ProcessExit.
@@ -1527,7 +1545,7 @@ mod tests {
         assert!(exit.is_some(), "expected ProcessExit for handle 7, got {frames:?}");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn long_lived_ping_responds_with_pong() {
         let frames = run_long_lived_with_frames(
             vec![
@@ -1545,7 +1563,7 @@ mod tests {
         assert!(frames.iter().any(|f| matches!(f, Frame::Pong)));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn long_lived_rejects_duplicate_handle() {
         let frames = run_long_lived_with_frames(
             vec![
@@ -1573,7 +1591,7 @@ mod tests {
         assert!(errs[0].as_deref().unwrap_or("").contains("already in use"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn long_lived_rejects_protocol_version_mismatch() {
         // Build a ProcessRequest with the wrong version (mimics a stale host).
         let bad = ProcessRequest {
@@ -1609,5 +1627,177 @@ mod tests {
         // Should not panic, should not log a warn (we can't easily
         // assert no-warn but the call returning cleanly is the contract).
         kill_pid(pid);
+    }
+
+    // ---- one-shot exec path (handle_conn → handle_one_shot) ----
+
+    /// Build a one-shot ExecRequest that runs `/bin/echo` directly (no bwrap,
+    /// no rootfs) so the happy path is exercisable without a VM. Mirrors the
+    /// `cat_request` fixture for the long-lived path.
+    fn echo_exec(argv: Vec<&str>) -> sandbox_vm_protocol::ExecRequest {
+        sandbox_vm_protocol::ExecRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: 1,
+            bwrap_path: "/bin/echo".into(),
+            argv: argv.into_iter().map(String::from).collect(),
+            timeout_ms: 60_000,
+            seccomp_fd: None,
+            cgroup: None,
+            progress: false,
+            collect_artifacts: vec![],
+        }
+    }
+
+    /// Drive one connection through the one-shot path: send `Exec`, read frames
+    /// until `Exit`, THEN close the host writer. (Closing early would let the
+    /// agent's host-EOF watch race the child and kill `/bin/echo` before it
+    /// finishes — so we hold the writer open until the terminal frame arrives.)
+    async fn run_one_shot(req: sandbox_vm_protocol::ExecRequest) -> Vec<Frame> {
+        let (host_side, agent_side) = duplex(64 * 1024);
+        let (mut host_rd, mut host_wr) = tokio::io::split(host_side);
+        let agent_task = tokio::spawn(async move {
+            let _ = handle_conn(agent_side, None).await;
+        });
+
+        host_wr
+            .write_all(&encode(&Frame::Exec(req)))
+            .await
+            .expect("send exec");
+
+        let mut decoder = Decoder::new();
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if collected.iter().any(|f| matches!(f, Frame::Exit(_))) {
+                break;
+            }
+            let n = host_rd.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break; // agent closed without an Exit (e.g. rejected the request)
+            }
+            decoder.feed(&buf[..n]);
+            while let Ok(Some(f)) = decoder.next_frame() {
+                collected.push(f);
+            }
+        }
+        drop(host_wr);
+        let _ = agent_task.await;
+        collected
+    }
+
+    #[tokio::test]
+    async fn one_shot_echo_streams_stdout_and_exit_zero() {
+        let frames = run_one_shot(echo_exec(vec!["hello-oneshot"])).await;
+        let stdout: Vec<u8> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Stdout(b) => Some(b.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(stdout, b"hello-oneshot\n", "unexpected stdout in {frames:?}");
+        let exit = frames.iter().find_map(|f| match f {
+            Frame::Exit(s) => Some(*s),
+            _ => None,
+        });
+        assert_eq!(exit, Some(ExitStatus { code: 0, timed_out: false }));
+    }
+
+    #[tokio::test]
+    async fn one_shot_rejects_protocol_version_mismatch_with_no_frames() {
+        // A stale host sends protocol_version=0/999; the agent must reject the
+        // exec and close WITHOUT running the command or emitting any frame.
+        let mut req = echo_exec(vec!["must-not-run"]);
+        req.protocol_version = 999;
+        let frames = run_one_shot(req).await;
+        assert!(
+            frames.is_empty(),
+            "version-mismatch exec must emit no frames, got {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shot_seccomp_requested_but_unavailable_fails_closed() {
+        // The host requested seccomp (seccomp_fd set) but the guest's filter
+        // failed to build (run_one_shot passes bpf=None). The agent must fail
+        // CLOSED: emit a Stderr note + Exit{-1} and never run the command.
+        let mut req = echo_exec(vec!["must-not-run"]);
+        req.seccomp_fd = Some(10);
+        let frames = run_one_shot(req).await;
+
+        let exit = frames.iter().find_map(|f| match f {
+            Frame::Exit(s) => Some(*s),
+            _ => None,
+        });
+        assert_eq!(exit, Some(ExitStatus { code: -1, timed_out: false }));
+
+        let stderr: Vec<u8> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Stderr(b) => Some(b.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let msg = String::from_utf8_lossy(&stderr);
+        assert!(
+            msg.contains("seccomp requested but the guest filter failed to build"),
+            "expected fail-closed stderr, got {msg:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| matches!(f, Frame::Stdout(_))),
+            "command must NOT have run"
+        );
+    }
+
+    // ---- parse_listen_from (transport-spec parsing) ----
+
+    #[test]
+    fn parse_listen_defaults_to_vsock_when_no_flag() {
+        match parse_listen_from(std::iter::empty()) {
+            Listen::Vsock(p) => assert_eq!(p, VSOCK_PORT),
+            Listen::Tcp(_) => panic!("expected default Vsock(1024)"),
+        }
+    }
+
+    #[test]
+    fn parse_listen_explicit_vsock_port() {
+        let args = ["--listen", "vsock:2048"].into_iter().map(String::from);
+        match parse_listen_from(args) {
+            Listen::Vsock(p) => assert_eq!(p, 2048),
+            Listen::Tcp(_) => panic!("expected Vsock(2048)"),
+        }
+    }
+
+    #[test]
+    fn parse_listen_tcp_addr() {
+        let args = ["--listen", "tcp:127.0.0.1:9000"].into_iter().map(String::from);
+        match parse_listen_from(args) {
+            Listen::Tcp(a) => assert_eq!(a, "127.0.0.1:9000"),
+            Listen::Vsock(_) => panic!("expected Tcp"),
+        }
+    }
+
+    #[test]
+    fn parse_listen_malformed_vsock_port_falls_back_to_default() {
+        let args = ["--listen", "vsock:not-a-number"]
+            .into_iter()
+            .map(String::from);
+        match parse_listen_from(args) {
+            Listen::Vsock(p) => assert_eq!(p, VSOCK_PORT),
+            Listen::Tcp(_) => panic!("expected Vsock fallback"),
+        }
+    }
+
+    #[test]
+    fn parse_listen_ignores_unrelated_leading_args() {
+        let args = ["--foo", "bar", "--listen", "vsock:5"]
+            .into_iter()
+            .map(String::from);
+        match parse_listen_from(args) {
+            Listen::Vsock(p) => assert_eq!(p, 5),
+            Listen::Tcp(_) => panic!("expected Vsock(5)"),
+        }
     }
 }

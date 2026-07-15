@@ -17,3 +17,8 @@ edition.workspace = true
 # build-DB-free.
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "migrate"] }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+# Isolated temp dirs for the migration-composition unit tests (pure filesystem
+# logic — no DB). Version matches sibling `sandbox-seccomp`.
+tempfile = "3.15"
