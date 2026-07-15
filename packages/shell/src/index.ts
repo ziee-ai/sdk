@@ -55,6 +55,8 @@ export {
 export { DivScrollY, type DivScrollYProps } from './components/DivScrollY'
 export { Drawer, type DrawerProps } from './components/Drawer'
 export { ResizeHandle } from './components/ResizeHandle'
+export { HeaderBarContainer } from './components/HeaderBarContainer'
+export { useHeaderLeftInset } from './hooks/useHeaderLeftInset'
 
 // Layouts
 export { BlankLayout } from './layouts/BlankLayout'
