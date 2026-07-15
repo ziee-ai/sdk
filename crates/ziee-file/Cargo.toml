@@ -71,6 +71,9 @@ jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"], optional = true
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 # The in-source `storage::filesystem` unit tests provision a scratch dir.
 tempfile = "3.15"
+# `tests/http_routes.rs` drives the mountable `file_routes` bundle in-process via
+# `tower::oneshot` (mirrors ziee-health's crate-scoped HTTP test).
+tower = { version = "0.5.3", features = ["util"] }
 
 [build-dependencies]
 # File-only build DB provisioning (mirrors ziee-auth): create + migrate

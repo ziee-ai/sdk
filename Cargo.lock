@@ -8805,6 +8805,7 @@ dependencies = [
  "sqlx 0.8.6",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
  "ziee-auth",

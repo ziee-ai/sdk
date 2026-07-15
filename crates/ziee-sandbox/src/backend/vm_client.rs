@@ -199,8 +199,38 @@ fn write_artifact(host_dirs: &[PathBuf], mount_index: u32, rel_path: &str, data:
 
 #[cfg(test)]
 mod tests {
-    use super::write_artifact;
+    use super::{append_capped, write_artifact, OUTPUT_CAP_BYTES};
     use std::path::PathBuf;
+
+    /// The 1 MiB output cap re-implemented here MUST behave like
+    /// `sandbox.rs::read_capped`: the collected buffer stops EXACTLY at the cap,
+    /// the `truncated` flag is set (and sticky), and every chunk pushed after the
+    /// cap is reached is ignored (no growth past the cap).
+    #[test]
+    fn append_capped_stops_at_the_cap_and_is_sticky() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut truncated = false;
+
+        // Fill to one byte under the cap — nothing truncated yet.
+        let almost = vec![b'a'; OUTPUT_CAP_BYTES - 1];
+        append_capped(&mut buf, &almost, &mut truncated);
+        assert_eq!(buf.len(), OUTPUT_CAP_BYTES - 1);
+        assert!(!truncated, "still under the cap → not truncated");
+
+        // A chunk that crosses the cap keeps EXACTLY the bytes up to the cap and
+        // sets the flag (only the 1-byte remainder is retained, not all 10).
+        append_capped(&mut buf, b"0123456789", &mut truncated);
+        assert_eq!(buf.len(), OUTPUT_CAP_BYTES, "buffer stops exactly at the cap");
+        assert!(truncated, "crossing the cap sets the truncated flag");
+        // The single kept byte is the FIRST of the crossing chunk.
+        assert_eq!(buf[OUTPUT_CAP_BYTES - 1], b'0');
+
+        // Subsequent chunks are ignored — the flag is sticky and the buffer
+        // never grows past the cap.
+        append_capped(&mut buf, b"more output that must be dropped", &mut truncated);
+        assert_eq!(buf.len(), OUTPUT_CAP_BYTES, "post-cap chunks are dropped");
+        assert!(truncated, "the truncated flag stays set");
+    }
 
     /// Security: a guest-supplied `rel_path` is UNTRUSTED. Absolute paths,
     /// `..` traversal, and any post-join escape must write NOTHING outside the

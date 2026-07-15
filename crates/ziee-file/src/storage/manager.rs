@@ -48,3 +48,45 @@ pub fn get_file_storage() -> Arc<dyn FileStorage> {
         guard.expect("File storage not initialized");
     Arc::clone(storage)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{get_file_storage, init_file_storage};
+    use uuid::Uuid;
+
+    /// Re-init SWAPS the active global storage. `init(A); init(B)` must make
+    /// `get_file_storage()` return B — proven by a save landing under B's temp
+    /// tree and NOT under A's (the bug the RwLock-over-OnceCell rewrite fixed:
+    /// the old `OnceCell::set` silently kept the first storage).
+    #[tokio::test]
+    async fn reinit_swaps_the_active_storage() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+
+        init_file_storage(dir_a.path());
+        init_file_storage(dir_b.path());
+
+        let user = Uuid::new_v4();
+        let file = Uuid::new_v4();
+        get_file_storage()
+            .save_original(user, file, "txt", b"lands under B")
+            .await
+            .unwrap();
+
+        let under_b = dir_b
+            .path()
+            .join("originals")
+            .join(user.to_string())
+            .join(format!("{file}.txt"));
+        assert!(
+            under_b.exists(),
+            "after re-init the save must land under the SECOND (current) storage"
+        );
+
+        let a_originals = dir_a.path().join("originals").join(user.to_string());
+        assert!(
+            !a_originals.exists(),
+            "nothing may be written under the FIRST (superseded) storage"
+        );
+    }
+}

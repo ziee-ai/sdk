@@ -436,6 +436,97 @@ mod tests {
         assert!(ok.starts_with(&originals_dir));
     }
 
+    /// `delete_user_dirs` removes the per-user directory under every storage
+    /// subdir it manages (originals / text / images / thumbnails) so deleting a
+    /// user leaves no orphaned dirs. Save one of every artifact kind, delete the
+    /// user's dirs, and assert each per-user subdir is gone.
+    #[tokio::test]
+    async fn delete_user_dirs_removes_every_per_user_subdir() {
+        let (dir, s) = storage();
+        let user = Uuid::new_v4();
+        let file = Uuid::new_v4();
+
+        // One of every artifact kind so each managed subdir exists on disk.
+        s.save_original(user, file, "txt", b"orig").await.unwrap();
+        s.save_text_page(user, file, 1, "page one").await.unwrap();
+        s.save_image(user, file, 1, false, b"img").await.unwrap(); // images/
+        s.save_image(user, file, 1, true, b"thumb").await.unwrap(); // thumbnails/
+
+        // Sanity: the per-user subdirs exist before the delete.
+        for subdir in ["originals", "text", "images", "thumbnails"] {
+            assert!(
+                s.get_user_path(user, subdir).exists(),
+                "{subdir} per-user dir must exist before delete"
+            );
+        }
+
+        s.delete_user_dirs(user).await.unwrap();
+
+        // Every managed per-user subdir is gone after the delete.
+        for subdir in ["originals", "text", "images", "thumbnails"] {
+            assert!(
+                !s.get_user_path(user, subdir).exists(),
+                "{subdir} per-user dir must be gone after delete_user_dirs"
+            );
+        }
+        // The storage root itself survives (only the user's dirs were removed).
+        assert!(dir.path().exists());
+    }
+
+    /// Per-page citation geometry round-trips through
+    /// `save_geometry_page`/`load_geometry_page` (the citation-highlight
+    /// derivative). A load of a page that was never saved is a not-found.
+    #[tokio::test]
+    async fn save_then_load_geometry_page_roundtrips() {
+        let (_dir, s) = storage();
+        let user = Uuid::new_v4();
+        let file = Uuid::new_v4();
+        let geom = r#"{"text":"hello","boxes":[[0.1,0.1,0.05,0.02]]}"#;
+
+        let path = s.save_geometry_page(user, file, 3, geom).await.unwrap();
+        assert!(path.exists(), "saved geometry page must exist on disk");
+
+        let loaded = s.load_geometry_page(user, file, 3).await.unwrap();
+        assert_eq!(loaded, geom, "geometry must round-trip byte-for-byte");
+
+        // A page that was never written is a not-found.
+        assert!(
+            s.load_geometry_page(user, file, 99).await.is_err(),
+            "an unsaved geometry page must be not-found"
+        );
+    }
+
+    /// Security (F-15), geometry path: a symlink planted at the geometry page's
+    /// location must NOT be followed on load — the read is refused (mirrors the
+    /// original-blob symlink guard).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_geometry_page_refuses_to_follow_a_symlink() {
+        let (dir, s) = storage();
+        let user = Uuid::new_v4();
+        let file = Uuid::new_v4();
+
+        // A secret outside the storage tree the symlink would point at.
+        let secret = dir.path().join("secret.json");
+        tokio::fs::write(&secret, b"{\"text\":\"TOP SECRET\"}").await.unwrap();
+
+        // Plant a symlink AT the path load_geometry_page will compute.
+        let target = s
+            .get_user_path(user, "geometry")
+            .join(file.to_string())
+            .join("page_1.json");
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        std::os::unix::fs::symlink(&secret, &target).unwrap();
+
+        let res = s.load_geometry_page(user, file, 1).await;
+        assert!(
+            res.is_err(),
+            "a symlinked geometry page must be refused, not followed"
+        );
+    }
+
     /// Security (F-15): a symlink planted in the storage tree must NOT be
     /// followed on load — the read is refused.
     #[cfg(unix)]

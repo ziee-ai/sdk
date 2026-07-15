@@ -224,6 +224,45 @@ mod tests {
     }
 
 
+    /// The TOTAL-size cap (256 MiB summed across entries) is a guard DISTINCT
+    /// from the per-entry ratio check. Stored (uncompressed) entries never trip
+    /// the ratio guard (compressed == uncompressed → ratio 1), so an archive
+    /// whose declared uncompressed sizes SUM past the cap must be rejected as
+    /// `TotalSizeExceeded`, not `RatioExceeded`. Uses stored entries so no single
+    /// entry is compressible enough to be flagged on ratio first.
+    #[test]
+    fn rejects_total_uncompressed_size_over_the_cap() {
+        // 8 MiB stored entries; keep adding until the declared total passes the
+        // 256 MiB cap (33 entries → 264 MiB). Stored == memcpy + CRC, so this is
+        // deterministic and fast; no entry is compressible → ratio stays 1.
+        let mut buf = Vec::new();
+        {
+            let mut zw = ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            let chunk = vec![0u8; 8 * 1024 * 1024];
+            let mut declared: u64 = 0;
+            let mut i = 0;
+            while declared <= MAX_UNCOMPRESSED_BYTES {
+                zw.start_file(format!("e{i}.bin"), opts).unwrap();
+                zw.write_all(&chunk).unwrap();
+                declared += chunk.len() as u64;
+                i += 1;
+            }
+            zw.finish().unwrap();
+        }
+
+        match validate(&buf) {
+            Err(ZipBombError::TotalSizeExceeded { declared, cap }) => {
+                assert_eq!(cap, MAX_UNCOMPRESSED_BYTES);
+                assert!(
+                    declared > cap,
+                    "reported declared total {declared} must exceed the cap {cap}"
+                );
+            }
+            other => panic!("expected TotalSizeExceeded (not a ratio flag), got {other:?}"),
+        }
+    }
+
     #[test]
     fn is_ooxml_or_odf_matches_zip_family_only() {
         // The processor only runs `validate` for these container mimes.
