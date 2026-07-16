@@ -47,6 +47,22 @@ export interface UnreadResult {
 }
 
 /**
+ * The app-supplied navigation SEAM. Called when a notification row is selected
+ * (whole-row click) in the bell or inbox. The app switches on `n.kind` /
+ * `n.payload` and deep-links wherever that kind belongs — a chat app to
+ * `/chat/:conversation_id`, a studies app to `/studies/:id`, etc. The SDK knows
+ * ZERO app routes; it only owns the router mechanism and hands the app a plain
+ * `navigate(to)` so the app needn't wire a global/imperative router of its own
+ * (the widget captures react-router's `useNavigate` and passes it through).
+ * Omit the seam entirely and rows simply aren't whole-row clickable (per-kind
+ * `renderer.actions` still work) — matching the bespoke-bell reference.
+ */
+export type NotificationNavigate = (
+  n: NotificationRow,
+  navigate: (to: string) => void,
+) => void
+
+/**
  * The app-data SEAM: the notification REST surface the store drives. The
  * consuming app injects its generated `ApiClient.Notification` (structurally
  * assignable) at `createNotificationsStore` time — the app's thin store
@@ -71,6 +87,19 @@ export interface NotificationsStoreDeps {
    * without the grant fetches nothing rather than 403-looping.
    */
   readPermission: PermissionExpr
+  /**
+   * Optional app-supplied navigation for a whole-row click (see
+   * `NotificationNavigate`). Omit → notification rows are not whole-row
+   * clickable (per-kind `renderer.actions` still work). Keeps the SDK free of
+   * any app route.
+   */
+  onNavigate?: NotificationNavigate
+  /**
+   * Optional app route for the full inbox page (where the app mounted
+   * `NotificationsPage`). The bell's "View all" links here. Omit → the bell
+   * hides "View all". A plain string so the SDK hardcodes no route.
+   */
+  inboxPath?: string
 }
 
 /**
@@ -96,4 +125,13 @@ export interface NotificationsStoreView {
   markAllRead: () => void
   remove: (id: string) => void
   clearError: () => void
+  /**
+   * The app-supplied whole-row navigation seam (or `undefined` when the app
+   * didn't bind one). The bell/inbox call this with react-router's `navigate`
+   * on row select. Exposed off the store view so the prop-less slot widgets
+   * reach it the same way they reach every other field.
+   */
+  onNavigate?: NotificationNavigate
+  /** The app route for the full inbox page (or `undefined`). See deps. */
+  inboxPath?: string
 }

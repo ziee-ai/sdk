@@ -19,6 +19,8 @@ import type { NotificationRow, NotificationsStoreDeps } from './types'
 export function createNotificationsStore({
   api,
   readPermission,
+  onNavigate,
+  inboxPath,
 }: NotificationsStoreDeps) {
   return defineStore('Notifications', {
     immer: true,
@@ -135,6 +137,11 @@ export function createNotificationsStore({
           set(draft => {
             draft.error = null
           }),
+        // Pass through the app-supplied whole-row navigation seam so the
+        // prop-less slot widgets reach it off the store view. Stable closure
+        // over the create-time dep; `undefined` when the app didn't bind one.
+        onNavigate,
+        inboxPath,
       }
     },
     init: ({ on, actions }) => {
