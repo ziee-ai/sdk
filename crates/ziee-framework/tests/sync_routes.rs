@@ -176,7 +176,7 @@ impl SyncSurface for TestSurface {
         Event::default().event("connected").data(conn_id.to_string())
     }
 
-    async fn recheck(_user_id: Uuid) -> RecheckOutcome<TestPrincipal> {
+    async fn recheck(_user_id: Uuid, _token_ver: Option<i32>) -> RecheckOutcome<TestPrincipal> {
         RecheckOutcome::Transient
     }
 }

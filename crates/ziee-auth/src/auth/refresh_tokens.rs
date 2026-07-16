@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use super::jwt::{JwtService, TokenPairWithJti};
 use super::session_settings::SessionSettingsRepository;
+use crate::user::UserRepository;
 
 /// The admin-configured token lifetimes `(access_hours, refresh_days)`
 /// from the `session_settings` singleton, falling back to the YAML
@@ -32,6 +33,84 @@ pub async fn session_expiries(pool: &PgPool, jwt_service: &JwtService) -> (i64, 
     }
 }
 
+/// Read the user's access-token revocation epoch (`users.token_version`) to
+/// stamp onto a freshly-minted access token.
+///
+/// Fail-CLOSED, deliberately unlike `session_expiries` above: that is a
+/// lifetime lookup where falling back to config is safe, whereas minting a
+/// token with a guessed epoch could hand out a credential that outlives a
+/// logout. A missing user row is likewise an error, not a `0` default.
+///
+/// Returns `Ok(None)` when the user row is absent (an auth failure the caller
+/// should surface as 401) and `Err` only for a genuine DB failure (a transient
+/// condition the caller must NOT report as 401 — a 401 from `/auth/refresh` is
+/// terminal to the client and would log the user out over a pool blip).
+pub async fn current_token_version(pool: &PgPool, user_id: Uuid) -> Result<Option<i32>, AppError> {
+    UserRepository::new(pool.clone())
+        .get_token_version(user_id)
+        .await
+}
+
+/// End every session the user holds, ATOMICALLY: bump the access-token
+/// revocation epoch AND revoke every outstanding refresh token in ONE
+/// transaction. Returns the new `token_version`.
+///
+/// Both writes must commit together or neither may. If the bump committed
+/// while the revoke failed, the user's still-live refresh token would re-mint
+/// through `mint_session_tokens` — which reads the NEW epoch — handing back a
+/// fully valid access token and defeating the very logout that was supposed to
+/// end the session. The reverse split is also wrong (old access tokens would
+/// survive). Callers MUST publish any `Session` signal only AFTER this returns,
+/// so a device racing to `/auth/me` on that signal observes the bump.
+///
+/// A refresh racing this call is serialized by the `users` row lock that
+/// `claim_rotation_and_register` takes FIRST (see the long comment there) — NOT
+/// by the `refresh_tokens` row lock alone, which is insufficient: under READ
+/// COMMITTED this revoke never even scans a successor row that a concurrent
+/// claim has INSERTed but not yet COMMITTed.
+///
+/// Scope of that guarantee: it covers ROTATION (`/auth/refresh`). It does not
+/// cover `mint_session_tokens`/`register`, which take no `users` lock — so a
+/// LOGIN racing this logout may leave its fresh refresh token active. That is
+/// deliberate and benign: a login is a fresh authentication, not a session this
+/// logout was ever meant to end.
+///
+/// Mirrors `claim_rotation_and_register` below (same file, same shape).
+/// NOTE: this is intentionally NOT a refactor of `revoke_all_for_user` — that
+/// function's other callers (change-password, admin reset) are out of scope and
+/// must keep their current semantics.
+pub async fn end_session_atomically(pool: &PgPool, user_id: Uuid) -> Result<i32, AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::database_error)?;
+
+    let new_version: i32 = sqlx::query_scalar!(
+        r#"
+        UPDATE users
+        SET token_version = token_version + 1
+        WHERE id = $1
+        RETURNING token_version
+        "#,
+        user_id,
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?;
+
+    sqlx::query!(
+        r#"
+        UPDATE refresh_tokens
+        SET revoked_at = NOW()
+        WHERE user_id = $1 AND revoked_at IS NULL
+        "#,
+        user_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?;
+
+    tx.commit().await.map_err(AppError::database_error)?;
+    Ok(new_version)
+}
+
 /// Mint a full session token pair for a user and whitelist the refresh
 /// token — the ONE mint path every login-shaped flow goes through
 /// (register / password / LDAP / OAuth / link-account / first-run setup /
@@ -51,6 +130,9 @@ pub async fn mint_session_tokens(
     is_admin: bool,
 ) -> Result<TokenPairWithJti, AppError> {
     let (access_hours, refresh_days) = session_expiries(pool, jwt_service).await;
+    let token_version = current_token_version(pool, user_id)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("USER_NOT_FOUND", "User not found"))?;
 
     let minted = jwt_service.generate_tokens_with_jti_expiry(
         user_id,
@@ -59,6 +141,7 @@ pub async fn mint_session_tokens(
         is_admin,
         access_hours,
         refresh_days,
+        token_version,
     )?;
     register(pool, minted.refresh_jti, user_id, minted.refresh_expires_at).await?;
     Ok(minted)
@@ -163,6 +246,34 @@ pub async fn claim_rotation_and_register(
     successor_expires_at: DateTime<Utc>,
 ) -> Result<bool, AppError> {
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
+
+    // Serialize against a concurrent logout — SECURITY, and subtler than it
+    // looks. `end_session_atomically` revokes with
+    // `UPDATE refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`. Under
+    // READ COMMITTED that UPDATE's scan only sees rows committed as of the
+    // command's start, so a successor this transaction has INSERTed but not yet
+    // COMMITTed is INVISIBLE to it — it is never scanned, and EvalPlanQual only
+    // re-checks rows the scan already found. Without this lock the successor
+    // would therefore SURVIVE the logout while the epoch still moved to N+1,
+    // and replaying it would mint a fresh access token stamped with the NEW
+    // epoch — i.e. a fully valid session, defeating the logout entirely.
+    //
+    // Taking the `users` row lock FIRST forces a strict order with logout:
+    //   - logout first  → this SELECT blocks; on release the presented token is
+    //     already revoked → 0 rows → `false` → 401, and no successor is written.
+    //   - this tx first → logout's `UPDATE users` blocks until we COMMIT, by
+    //     which time the successor IS committed and visible, so logout revokes
+    //     it too.
+    // Lock ORDER matters: logout takes users → refresh_tokens, so we must take
+    // users first as well. Reversing it here would invert the order and
+    // deadlock.
+    sqlx::query_scalar!(
+        r#"SELECT token_version FROM users WHERE id = $1 FOR SHARE"#,
+        user_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?;
 
     let r = sqlx::query!(
         r#"

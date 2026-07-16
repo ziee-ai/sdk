@@ -10,6 +10,32 @@ use ziee_core::AppError;
 // User Repository
 // =====================================================
 
+/// `users` row + its access-token revocation epoch, for the one query that
+/// needs both (`get_by_id_with_token_version`).
+///
+/// PRIVATE and NOT serializable, deliberately: `token_version` must never
+/// reach a response body. `User` itself is `Serialize + JsonSchema` and is
+/// embedded in `MeResponse` and the Tauri `AutoLoginResponse`, so the epoch
+/// lives here — split back out into `(User, i32)` at the call boundary —
+/// rather than as a field on `User` guarded only by a `#[serde(skip)]`.
+struct UserWithTokenVersion {
+    id: Uuid,
+    username: String,
+    email: String,
+    email_verified: bool,
+    password_hash: Option<String>,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+    is_active: bool,
+    is_admin: bool,
+    permissions: Vec<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    last_login_at: Option<chrono::DateTime<chrono::Utc>>,
+    password_changed_at: Option<chrono::DateTime<chrono::Utc>>,
+    token_version: i32,
+}
+
 #[derive(Clone, Debug)]
 pub struct UserRepository {
     pool: PgPool,
@@ -18,6 +44,71 @@ pub struct UserRepository {
 impl UserRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Get a user together with their access-token revocation epoch
+    /// (`users.token_version`), in ONE query.
+    ///
+    /// This exists so the auth hot path (the framework's permission extractor,
+    /// which already loads the user on every `RequirePermissions` request) can
+    /// check the epoch without paying a second round-trip.
+    ///
+    /// `token_version` is deliberately NOT a field on `User`: `User` is
+    /// `Serialize + JsonSchema` and is embedded in `MeResponse` and the Tauri
+    /// `AutoLoginResponse`, so a session-revocation value living there would be
+    /// one missing `#[serde(skip_serializing)]` away from a public response.
+    /// Returning it alongside keeps it off every serialized surface.
+    pub async fn get_by_id_with_token_version(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<(User, i32)>, AppError> {
+        let row = sqlx::query_as!(
+            UserWithTokenVersion,
+            r#"
+            SELECT id, username, email, email_verified, password_hash, display_name,
+                   avatar_url, is_active, is_admin, permissions,
+                   created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _",
+                   token_version
+            FROM users
+            WHERE id = $1
+            "#,
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(AppError::database_error)?;
+
+        Ok(row.map(|r| {
+            (
+                User {
+                    id: r.id,
+                    username: r.username,
+                    email: r.email,
+                    email_verified: r.email_verified,
+                    password_hash: r.password_hash,
+                    display_name: r.display_name,
+                    avatar_url: r.avatar_url,
+                    is_active: r.is_active,
+                    is_admin: r.is_admin,
+                    permissions: r.permissions,
+                    created_at: r.created_at,
+                    updated_at: r.updated_at,
+                    last_login_at: r.last_login_at,
+                    password_changed_at: r.password_changed_at,
+                },
+                r.token_version,
+            )
+        }))
+    }
+
+    /// Read just the access-token revocation epoch. Used by the bare `JwtAuth`
+    /// extractor, which (unlike the permission extractor) never loads the
+    /// user, so there is nothing to fold the read into.
+    pub async fn get_token_version(&self, id: Uuid) -> Result<Option<i32>, AppError> {
+        sqlx::query_scalar!(r#"SELECT token_version FROM users WHERE id = $1"#, id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(AppError::database_error)
     }
 
     /// Get user by ID
