@@ -20,6 +20,14 @@ pub mod app_builder;
 // the single home (build-DB-free, cheap as a `[build-dependencies]` entry).
 pub use ziee_build_support as build_support;
 pub mod embedded_pg;
+// Gap G8: the generic entity-extension registry primitive — the domain-agnostic
+// `#[distributed_slice]` of `{name, order, factory}` + `Vec<Arc<dyn Hooks>>`
+// registry (folds routes + fans in-tx hooks over ONE shared `&mut Transaction`)
+// + `auto_register` (sort-by-order) + `once_cell` singleton. ziee's `chat` +
+// `project` extension registries + CytoAnalyst's `study` are all this same
+// shape; they now build on this. Includes the OPTIONAL `on_<entity>_deleted`
+// in-tx hook via `fire_in_tx` (offered, not imposed on cascade-only parents).
+pub mod entity_extension;
 pub mod events;
 // Chunk C1: shared built-in-MCP-server scaffolding — the JSON-RPC 2.0 envelope
 // types (`JsonRpcRequest`/`JsonRpcResponse`/`JsonRpcError`) + the `loopback_host`
@@ -60,6 +68,10 @@ pub mod secrets;
 pub mod url_validator;
 
 pub use app_builder::serve;
+pub use entity_extension::{
+    auto_register as auto_register_extensions, ExtensionEntry, ExtensionRegistry,
+    ExtensionRegistrySingleton,
+};
 pub use events::EventHandler;
 pub use mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, loopback_host};
 pub use module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};

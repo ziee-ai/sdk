@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node", "react", "react-dom"],
+    "paths": {
+      "@ziee/kit": ["../kit/src/index.ts"],
+      "@ziee/kit/*": ["../kit/src/*"],
+      "@ziee/framework": ["../framework/src/index.ts"],
+      "@ziee/framework/api-client": ["../framework/src/api-client/index.ts"],
+      "@ziee/framework/*": ["../framework/src/*"],
+      "@ziee/shell": ["../shell/src/index.ts"],
+      "@ziee/shell/*": ["../shell/src/*"]
+    }
+  },
+  "include": ["src"]
+}
