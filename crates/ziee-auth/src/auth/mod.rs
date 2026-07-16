@@ -85,3 +85,69 @@ pub fn set_trust_forwarded_headers(trust: bool) {
 pub fn trust_forwarded_headers() -> bool {
     TRUST_FORWARDED_HEADERS.get().copied().unwrap_or(false)
 }
+
+/// Set once at module init from the operator-configured public origin (see
+/// `set_configured_public_origin`). Holds the https-validated origin, or
+/// `None` to fall back to request-header derivation.
+static CONFIGURED_PUBLIC_ORIGIN: OnceLock<Option<String>> = OnceLock::new();
+
+/// Install the operator-configured https public origin (called once at boot by
+/// the app's `AuthModule::init`, passing e.g. `code_sandbox.public_base_url`).
+/// The raw value passes through the `https_public_origin` gate — only a
+/// non-empty `https://` origin is adopted; an http/loopback value (the LOCAL
+/// dev default) is ignored so local dev keeps deriving the redirect_uri from
+/// request headers. Idempotent — a second call is a no-op.
+pub fn set_configured_public_origin(raw: Option<&str>) {
+    let _ = CONFIGURED_PUBLIC_ORIGIN.set(https_public_origin(raw));
+}
+
+/// The operator-configured https public origin (no trailing slash) that OAuth
+/// `redirect_uri`s should be rooted at, or `None` to derive the origin from
+/// request headers. Behind an HTTPS edge that terminates TLS and forwards plain
+/// HTTP to this container, the header-derived scheme is `http`, producing
+/// `http://` redirect_uris that Google rejects; a configured https origin fixes
+/// that deterministically. Safe against the header-spoofing class because the
+/// value is operator-controlled, not request-derived.
+pub fn configured_public_origin() -> Option<String> {
+    CONFIGURED_PUBLIC_ORIGIN.get().cloned().flatten()
+}
+
+/// Return the trimmed origin (no trailing slash) IFF `raw` is a non-empty
+/// `https://` URL; otherwise `None`. An http / loopback value — e.g. the LOCAL
+/// default `http://172.21.0.1:8080` that `code_sandbox.public_base_url` carries
+/// for host-gateway file fetches — returns `None`, so local dev keeps deriving
+/// the redirect_uri from request headers and is unaffected.
+pub(crate) fn https_public_origin(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    // Case-insensitive scheme check; must be EXACTLY the https scheme, not
+    // merely a string that contains "https".
+    if s.is_empty() || !s.to_ascii_lowercase().starts_with("https://") {
+        return None;
+    }
+    Some(s.trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod public_origin_tests {
+    use super::https_public_origin;
+
+    #[test]
+    fn only_https_origins_are_used() {
+        // Deploy: an https public origin is adopted (trailing slash trimmed).
+        assert_eq!(
+            https_public_origin(Some("https://biognosia.tinnguyen-lab.com")).as_deref(),
+            Some("https://biognosia.tinnguyen-lab.com")
+        );
+        assert_eq!(
+            https_public_origin(Some("https://x.example/")).as_deref(),
+            Some("https://x.example")
+        );
+        // Local/dev: http, loopback, empty, and None all fall through to header
+        // derivation (return None).
+        assert_eq!(https_public_origin(Some("http://172.21.0.1:8080")), None);
+        assert_eq!(https_public_origin(Some("http://localhost:8080")), None);
+        assert_eq!(https_public_origin(Some("")), None);
+        assert_eq!(https_public_origin(Some("   ")), None);
+        assert_eq!(https_public_origin(None), None);
+    }
+}

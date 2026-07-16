@@ -1076,19 +1076,31 @@ pub async fn oauth_authorize(
             .filter(|h| !h.is_empty())
             .map(|s| s.to_string())
     };
-    let origin = match host {
-        Some(h) => format!("{}://{}", scheme, h),
-        None => {
-            if cfg!(debug_assertions) {
-                "http://localhost".to_string()
-            } else {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    AppError::bad_request(
-                        "OAUTH_MISCONFIGURED",
-                        "Server cannot derive redirect URL",
-                    ),
-                ));
+    // Prefer the operator-configured https public origin when set (deploy
+    // behind an HTTPS edge): the header-derived scheme would be http there —
+    // the edge terminates TLS and forwards plain HTTP to this container — and
+    // Google rejects non-localhost http:// redirect_uris. A configured origin
+    // is operator-controlled (not request-derived), so it does not reintroduce
+    // the header-spoofing risk. Falls through to the header derivation below for
+    // local/direct deployments (whose configured value, if any, is an http
+    // loopback that fails the https gate).
+    let origin = if let Some(configured) = crate::auth::configured_public_origin() {
+        configured
+    } else {
+        match host {
+            Some(h) => format!("{}://{}", scheme, h),
+            None => {
+                if cfg!(debug_assertions) {
+                    "http://localhost".to_string()
+                } else {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        AppError::bad_request(
+                            "OAUTH_MISCONFIGURED",
+                            "Server cannot derive redirect URL",
+                        ),
+                    ));
+                }
             }
         }
     };
