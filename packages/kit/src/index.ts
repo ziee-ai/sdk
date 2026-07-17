@@ -28,6 +28,14 @@ export {
 export { ScrollArea } from './kit/scroll-area'
 export type { ScrollAreaProps } from './kit/scroll-area'
 
+// resizable panels (IDE dock frame) + collapsible + slider — vendored primitives,
+// already token-clean (data-slot + kit tokens); re-exported directly per the
+// menubar/context-menu precedent. `useIsMobile` = the responsive breakpoint hook.
+export { ResizablePanelGroup, ResizablePanel, ResizableHandle } from './shadcn/resizable'
+export { Collapsible, CollapsibleTrigger, CollapsibleContent } from './shadcn/collapsible'
+export { Slider } from './shadcn/slider'
+export { useIsMobile } from './hooks/use-mobile'
+
 // sidebar (composite — provider + collapsible rail + mobile sheet + menu parts)
 export {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupAction, SidebarGroupContent,
