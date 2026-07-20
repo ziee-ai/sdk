@@ -372,29 +372,36 @@ function createLocalProxy<S extends object>(
   })
 }
 
-export function defineLocalStore<State extends object, Actions extends object>(
-  config: StoreConfig<State, Actions>,
-): LocalStoreDef<FullStoreState<State, Actions>> {
+export function defineLocalStore<
+  State extends object,
+  Actions extends object = {},
+  LA extends LazyActionsConfig<State> = {},
+>(
+  config: StoreConfig<State, Actions, LA>,
+): LocalStoreDef<FullStoreState<State, Actions & LazyDispatchers<LA>>> {
   // A distinct EventBus group per live instance so instances don't clobber each
   // other's listeners (defineStore's global variant can key by the store name;
-  // locals can't).
+  // locals can't). The runtime `makeBuilder` already spreads the lazy-action
+  // dispatchers into state; the LA generic just surfaces them in the TYPE (so a
+  // per-pane store — e.g. Chat — exposes its lazy actions to consumers).
+  type Full = FullStoreState<State, Actions & LazyDispatchers<LA>>
   let counter = 0
   return {
     use: (initial) => {
       const ref = useRef<{
-        api: StoreApi<FullStoreState<State, Actions>>
-        proxy: LocalStoreInstance<FullStoreState<State, Actions>>
+        api: StoreApi<Full>
+        proxy: LocalStoreInstance<Full>
       } | null>(null)
 
       if (ref.current === null) {
         const group = `local:${counter++}`
-        const merged: StoreConfig<State, Actions> = initial
+        const merged = initial
           ? { ...config, state: { ...config.state, ...initial } as State }
           : config
-        const builder = makeBuilder(group, merged)
-        const api = createStore<FullStoreState<State, Actions>>()(
-          applyMiddleware(builder, merged) as any,
-        ) as StoreApi<FullStoreState<State, Actions>>
+        const builder = makeBuilder(group, merged as StoreConfig<State, any>)
+        const api = createStore<Full>()(
+          applyMiddleware(builder as any, merged as StoreConfig<State, any>) as any,
+        ) as StoreApi<Full>
         ref.current = { api, proxy: createLocalProxy(api) }
       }
 
