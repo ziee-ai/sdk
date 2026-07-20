@@ -157,7 +157,11 @@ export interface StoreConfig<
 /** Internal lifecycle keys the Stores proxy already understands. */
 interface Lifecycle {
   __init__: { __store__: () => void }
-  __destroy__: () => void
+  // May be async: the callers fire-and-forget it (React cleanup ignores the
+  // return; the global ref-count teardown `.catch()`es a returned Promise), so a
+  // store whose teardown awaits a lazy action (e.g. Chat saving pane state before
+  // destroy) is supported.
+  __destroy__: () => void | Promise<void>
 }
 
 export type FullStoreState<State, Actions> = State & Actions & Lifecycle
@@ -409,7 +413,11 @@ export function defineLocalStore<
       // init on mount, teardown on unmount — lifecycle rides the component.
       useEffect(() => {
         api.getState().__init__.__store__()
-        return () => api.getState().__destroy__()
+        // `__destroy__` may be async (a store whose teardown awaits a lazy
+        // action); the React cleanup fires-and-forgets it (must return void).
+        return () => {
+          void api.getState().__destroy__()
+        }
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [])
       return proxy
