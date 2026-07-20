@@ -82,6 +82,13 @@ pub fn finish_and_emit(
     fs::write(&permissions_path, &permissions_ts)?;
     println!("✓ Permissions enum written to: {}", permissions_path.display());
 
+    // Emit the split-out `apiEndpoints.ts` (the ApiEndpoints map + getEndpointKey).
+    // Kept out of types.ts so ApiClient calls inline and the map tree-shakes.
+    let endpoints_ts = emit_ts::generate_api_endpoints_ts_from_json(&json)?;
+    let endpoints_path = types_ts_path.with_file_name("apiEndpoints.ts");
+    fs::write(&endpoints_path, &endpoints_ts)?;
+    println!("✓ API endpoints written to: {}", endpoints_path.display());
+
     println!("\n✓ OpenAPI generation complete!");
     println!("  - OpenAPI spec: {}", openapi_json_path.display());
     println!("  - TypeScript types: {}", types_ts_path.display());
