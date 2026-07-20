@@ -118,6 +118,59 @@ export type LazyDispatcher<L> = L extends () => Promise<{
 
 export type LazyDispatchers<M> = { [K in keyof M]: LazyDispatcher<M[K]> }
 
+// ============================================================================
+// Folder-convention auto-registration.
+//
+// `import.meta.glob('./actions/*.ts')` yields `{ './actions/foo.ts': loader }`.
+// A store passes THAT as `config.actions` — store-kit derives the action name
+// from each file's basename (no hand-written map). `_`-prefixed files are
+// INTERNAL helpers (shared factories imported by actions) and are NOT registered
+// as dispatched actions. Types come from a generated `actions.gen.ts` type map
+// (see `gen:store-actions`), supplied as the `AM` generic.
+// ============================================================================
+
+/** The record `import.meta.glob('./actions/*.ts')` produces (path → lazy loader).
+ *  Vite types the loaders as `() => Promise<unknown>`, so the value side is loose;
+ *  the concrete action types come from the `AM` generic (generated actions.gen.ts). */
+export type ActionGlob = Record<string, () => Promise<any>>
+
+/** Dispatcher type derived from ONE action factory (as `typeof import('./x')['default']`). */
+export type FactoryDispatcher<F> = F extends (
+  set: any,
+  get: any,
+) => (...args: infer A) => infer R
+  ? ((...args: A) => R extends Promise<any> ? R : Promise<Awaited<R>>) & {
+      preload: () => Promise<void>
+    }
+  : never
+
+/** The generated `actions.gen.ts` type map (name → factory type) → dispatchers. */
+export type DispatchersFromTypeMap<M> = { [K in keyof M]: FactoryDispatcher<M[K]> }
+
+/** True when `actions` is a glob record (object) rather than the eager factory (function). */
+function isActionGlob(a: unknown): a is ActionGlob {
+  return !!a && typeof a === 'object'
+}
+
+/** Glob record → basename→loader map (the internal lazyActions form). Drops
+ *  `_`-prefixed internal-helper files. */
+function globToLazyActions(glob: ActionGlob): Record<string, LazyActionLoader<any>> {
+  const out: Record<string, LazyActionLoader<any>> = {}
+  for (const path of Object.keys(glob)) {
+    const base = path.slice(path.lastIndexOf('/') + 1).replace(/\.[tj]sx?$/, '')
+    if (!base.startsWith('_')) out[base] = glob[path] as LazyActionLoader<any>
+  }
+  return out
+}
+
+/** If `config.actions` is a glob, move it to `lazyActions` (basename keys). */
+function normalizeGlobConfig<C extends { actions?: unknown; lazyActions?: unknown }>(
+  config: C,
+): C {
+  if (typeof config.actions === 'function' || !isActionGlob(config.actions)) return config
+  return { ...config, actions: undefined, lazyActions: globToLazyActions(config.actions) }
+}
+
 export interface StoreConfig<
   State extends object,
   Actions extends object,
@@ -266,10 +319,28 @@ function applyMiddleware<State extends object, Actions extends object>(
   return subscribeWithSelector(withPersist as any)
 }
 
+/** The folder-glob store config: `actions` is `import.meta.glob('./actions/*.ts')`;
+ *  `AM` is the generated `actions.gen.ts` type map (name → factory type). */
+export interface GlobStoreConfig<State extends object, AM> {
+  actions: ActionGlob
+  immer?: boolean
+  persist?: PersistOptions<State, any>
+  state: State
+  init?: (
+    ctx: StoreInitCtx<State> & { actions: DispatchersFromTypeMap<AM> },
+  ) => void
+}
+
 /**
  * Global singleton store. Register it on a module via
  * `createModule({ stores: [MyStore] })` — the name is written ONCE here, and
  * consumers read it through `Stores.<name>` exactly as before.
+ *
+ * Two forms:
+ *  1. Explicit `actions`/`lazyActions` (legacy).
+ *  2. Folder-glob auto-registration: `actions: import.meta.glob('./actions/*.ts')`
+ *     — store-kit registers each file by basename; types come from the `AM`
+ *     generic (the generated `actions.gen.ts` map).
  */
 export function defineStore<
   State extends object,
@@ -278,12 +349,17 @@ export function defineStore<
 >(
   name: string,
   config: StoreConfig<State, Actions, LA>,
-): StoreHandle<FullStoreState<State, Actions & LazyDispatchers<LA>>> {
-  type Full = FullStoreState<State, Actions & LazyDispatchers<LA>>
-  const builder = makeBuilder(name, config as StoreConfig<State, any>)
-  const store = create<Full>()(
-    applyMiddleware(builder as any, config as StoreConfig<State, any>) as any,
-  ) as BoundStore<Full>
+): StoreHandle<FullStoreState<State, Actions & LazyDispatchers<LA>>>
+export function defineStore<State extends object, AM extends Record<string, any>>(
+  name: string,
+  config: GlobStoreConfig<State, AM>,
+): StoreHandle<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineStore(name: string, config: any): any {
+  const normalized = normalizeGlobConfig(config) as StoreConfig<any, any>
+  const builder = makeBuilder(name, normalized)
+  const store = create<any>()(
+    applyMiddleware(builder as any, normalized) as any,
+  ) as BoundStore<any>
   return { name, store }
 }
 
@@ -382,16 +458,24 @@ export function defineLocalStore<
   LA extends LazyActionsConfig<State> = {},
 >(
   config: StoreConfig<State, Actions, LA>,
-): LocalStoreDef<FullStoreState<State, Actions & LazyDispatchers<LA>>> {
+): LocalStoreDef<FullStoreState<State, Actions & LazyDispatchers<LA>>>
+export function defineLocalStore<
+  State extends object,
+  AM extends Record<string, any>,
+>(
+  config: GlobStoreConfig<State, AM>,
+): LocalStoreDef<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineLocalStore(configArg: any): any {
   // A distinct EventBus group per live instance so instances don't clobber each
   // other's listeners (defineStore's global variant can key by the store name;
   // locals can't). The runtime `makeBuilder` already spreads the lazy-action
-  // dispatchers into state; the LA generic just surfaces them in the TYPE (so a
-  // per-pane store — e.g. Chat — exposes its lazy actions to consumers).
-  type Full = FullStoreState<State, Actions & LazyDispatchers<LA>>
+  // dispatchers into state; the LA/AM generic just surfaces them in the TYPE (so
+  // a per-pane store — e.g. Chat — exposes its lazy actions to consumers).
+  const config = normalizeGlobConfig(configArg) as StoreConfig<any, any>
+  type Full = any
   let counter = 0
   return {
-    use: (initial) => {
+    use: (initial: any) => {
       const ref = useRef<{
         api: StoreApi<Full>
         proxy: LocalStoreInstance<Full>
@@ -400,11 +484,11 @@ export function defineLocalStore<
       if (ref.current === null) {
         const group = `local:${counter++}`
         const merged = initial
-          ? { ...config, state: { ...config.state, ...initial } as State }
+          ? { ...config, state: { ...config.state, ...initial } }
           : config
-        const builder = makeBuilder(group, merged as StoreConfig<State, any>)
+        const builder = makeBuilder(group, merged as StoreConfig<any, any>)
         const api = createStore<Full>()(
-          applyMiddleware(builder as any, merged as StoreConfig<State, any>) as any,
+          applyMiddleware(builder as any, merged as StoreConfig<any, any>) as any,
         ) as StoreApi<Full>
         ref.current = { api, proxy: createLocalProxy(api) }
       }
