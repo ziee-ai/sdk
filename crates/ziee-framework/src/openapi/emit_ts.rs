@@ -1141,15 +1141,14 @@ fn generate_typescript_content(
 
     let schema_definitions = format!("{}\n\n", generate_all_schemas(schemas));
 
-    // NOTE: `PermissionDescriptions` is emitted as a SEPARATE module
-    // (`permissionDescriptions.ts`) — see `generate_permission_descriptions_ts`.
-    // It is only consumed by the (lazy) permission-picker UI, so keeping it out
-    // of this eagerly-imported `types.ts` lets it land in that lazy chunk instead
-    // of the entry chunk.
-    let permissions_section = format!(
-        "// =============================================================================\n// PERMISSIONS\n// =============================================================================\n\n{}\n\n",
-        generate_permissions_enum(permissions),
-    );
+    // NOTE: the `Permissions` enum and `PermissionDescriptions` map are emitted
+    // as SEPARATE modules (`permissions.ts` / `permissionDescriptions.ts`) — see
+    // `generate_permissions_ts` / `generate_permission_descriptions_ts`. Keeping
+    // them out of this eagerly-imported `types.ts` lets their value uses inline
+    // (permissions) and the objects land in lazy chunks, so the entry chunk stays
+    // flat as the permission set grows. `permissions` param unused here now.
+    let _ = permissions;
+    let permissions_section = String::new();
 
     let endpoints_section = format!(
         "// =============================================================================\n// API ENDPOINTS\n// =============================================================================\n\n// API endpoint definitions\nexport const ApiEndpoints = {{\n{}\n}} as const\n\n",
@@ -1256,6 +1255,28 @@ pub fn generate_permission_descriptions_ts_from_json(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let spec: J = serde_json::from_str(openapi_json)?;
     Ok(generate_permission_descriptions_ts(&spec))
+}
+
+/// Generate the standalone `permissions.ts` module (the `Permissions` enum),
+/// split out of `types.ts`. Value uses (`Permissions.X`) are inlined to string
+/// literals by the app's build transform, so in a fully-inlined build this
+/// module is pulled only by the (lazy) permission picker that enumerates it —
+/// keeping the enum object out of the eager entry chunk. Scales flat as the
+/// permission set grows.
+pub fn generate_permissions_ts(spec: &J) -> String {
+    let permissions = extract_permissions_from_spec(spec);
+    format!(
+        "// AUTO-GENERATED — do not edit. Regenerate with `just openapi-regen`.\n// The `Permissions` enum, split out of `types.ts` so it isn't pinned to the\n// eager entry chunk (value uses are inlined at build; only the lazy picker\n// enumerates the object).\n\n{}\n",
+        generate_permissions_enum(&permissions)
+    )
+}
+
+/// Parse an `openapi.json` string and emit `permissions.ts` content.
+pub fn generate_permissions_ts_from_json(
+    openapi_json: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let spec: J = serde_json::from_str(openapi_json)?;
+    Ok(generate_permissions_ts(&spec))
 }
 
 

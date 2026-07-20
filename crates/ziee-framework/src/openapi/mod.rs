@@ -74,6 +74,14 @@ pub fn finish_and_emit(
         descriptions_path.display()
     );
 
+    // Emit the split-out `permissions.ts` (the Permissions enum). Kept out of
+    // types.ts so value uses inline at build and the enum object rides the lazy
+    // permission-picker chunk instead of the entry chunk.
+    let permissions_ts = emit_ts::generate_permissions_ts_from_json(&json)?;
+    let permissions_path = types_ts_path.with_file_name("permissions.ts");
+    fs::write(&permissions_path, &permissions_ts)?;
+    println!("✓ Permissions enum written to: {}", permissions_path.display());
+
     println!("\n✓ OpenAPI generation complete!");
     println!("  - OpenAPI spec: {}", openapi_json_path.display());
     println!("  - TypeScript types: {}", types_ts_path.display());
