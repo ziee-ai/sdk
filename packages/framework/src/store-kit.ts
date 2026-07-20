@@ -68,7 +68,65 @@ export interface StoreInitCtx<State> {
   onCleanup: (fn: () => void) => void
 }
 
-export interface StoreConfig<State extends object, Actions extends object> {
+// ============================================================================
+// Lazy actions — per-action code splitting.
+//
+// Most of a store's WEIGHT is its actions (API calls + logic). `lazyActions`
+// lets each action live in its OWN file/chunk, downloaded on first call (or
+// `preload()`) instead of riding the store's eager chunk. The store's state is
+// eager + always present (so `Stores.X.field` never `undefined`), only the
+// action CODE is deferred. All lazy actions are async (they may need to `await`
+// their own chunk); trivial synchronous setters stay in `actions`.
+//
+//   // Users.ts
+//   defineStore('Users', {
+//     state: { list: [] },
+//     lazyActions: {
+//       loadUsers:  () => import('./actions/loadUsers'),
+//       deleteUser: () => import('./actions/deleteUser'),
+//     },
+//   })
+//   // actions/loadUsers.ts  →  export default (set, get) => async () => { … }
+//
+//   Users.loadUsers()            // loads only loadUsers' chunk, then runs
+//   Users.deleteUser.preload()   // warm the chunk on hover/intent
+// ============================================================================
+
+/** A lazily-loaded async action module: its default export is a factory
+ *  `(set, get) => (...args) => Promise<Ret>`. */
+export type LazyActionFactory<State, Args extends any[], Ret> = (
+  set: StoreSet<State>,
+  get: () => State,
+) => (...args: Args) => Promise<Ret>
+
+/** A thunk that dynamic-imports one action module (→ its own chunk). */
+export type LazyActionLoader<State> = () => Promise<{
+  default: LazyActionFactory<State, any[], any>
+}>
+
+export type LazyActionsConfig<State> = Record<string, LazyActionLoader<State>>
+
+/** The callable a lazy action becomes on the store: same signature as the
+ *  underlying action, plus `.preload()` to warm its chunk without invoking it. */
+export type LazyDispatcher<L> = L extends () => Promise<{
+  default: (set: any, get: any) => (...args: infer A) => infer R
+}>
+  ? ((...args: A) => R extends Promise<any> ? R : Promise<Awaited<R>>) & {
+      preload: () => Promise<void>
+    }
+  : never
+
+export type LazyDispatchers<M> = { [K in keyof M]: LazyDispatcher<M[K]> }
+
+export interface StoreConfig<
+  State extends object,
+  Actions extends object,
+  LA extends LazyActionsConfig<State> = {},
+> {
+  /** Per-action lazy loaders — each value dynamic-imports one action module.
+   *  The dispatchers are merged into the store's actions (typed from the import),
+   *  so `Stores.X.<name>(...)` calls stay fully typed while the code is deferred. */
+  lazyActions?: LA
   /** Draft-mutation setters (`set(d => { d.x = 1 })`). Default false → plain
    *  Zustand shallow-merge (`set(s => ({ x: 1 }))`), so merge-style stores like
    *  Chat migrate with NO change to their setters. */
@@ -91,7 +149,9 @@ export interface StoreConfig<State extends object, Actions extends object> {
   /** Runs once on first access (global) / on mount (local). Listener + cross-store
    *  wiring goes here via `on` / `watch`; all of it auto-unsubscribes on destroy.
    *  Gets the resolved `actions` so it can call them (typed). */
-  init?: (ctx: StoreInitCtx<State> & { actions: Actions }) => void
+  init?: (
+    ctx: StoreInitCtx<State> & { actions: Actions & LazyDispatchers<LA> },
+  ) => void
 }
 
 /** Internal lifecycle keys the Stores proxy already understands. */
@@ -127,11 +187,29 @@ function makeBuilder<State extends object, Actions extends object>(
 ) {
   return (set: any, get: any): FullStoreState<State, Actions> => {
     const actions = config.actions ? config.actions(set, get) : ({} as Actions)
+    // Per-action lazy dispatchers: each loads its own chunk on first call
+    // (cached thereafter) and exposes `.preload()` to warm it early.
+    const lazyDispatchers: Record<string, any> = {}
+    if (config.lazyActions) {
+      for (const key of Object.keys(config.lazyActions)) {
+        const loader = (config.lazyActions as LazyActionsConfig<State>)[key]
+        let implPromise: Promise<(...args: any[]) => any> | null = null
+        const resolveImpl = () =>
+          (implPromise ??= loader().then(m => m.default(set, get)))
+        const dispatch = (...args: any[]) =>
+          resolveImpl().then(impl => impl(...args))
+        // preload: warm the chunk + build the impl, but do not invoke it.
+        dispatch.preload = () => resolveImpl().then(() => undefined)
+        lazyDispatchers[key] = dispatch
+      }
+    }
     const cleanups: Unsubscribe[] = []
     const ctx: StoreInitCtx<State> & { actions: Actions } = {
       set,
       get,
-      actions,
+      // init sees eager actions AND the lazy dispatchers (so `init` can kick off
+      // a lazy loader on first access — it loads that action's chunk on demand).
+      actions: { ...actions, ...lazyDispatchers } as Actions,
       on: (event, handler) => {
         const busOn = useEventBusStore.getState().on as (
           e: string,
@@ -152,6 +230,7 @@ function makeBuilder<State extends object, Actions extends object>(
     return {
       ...(config.state as State),
       ...actions,
+      ...lazyDispatchers,
       __init__: { __store__: () => config.init?.(ctx) },
       __destroy__: () => {
         cleanups.splice(0).forEach(off => {
@@ -188,14 +267,19 @@ function applyMiddleware<State extends object, Actions extends object>(
  * `createModule({ stores: [MyStore] })` — the name is written ONCE here, and
  * consumers read it through `Stores.<name>` exactly as before.
  */
-export function defineStore<State extends object, Actions extends object>(
+export function defineStore<
+  State extends object,
+  Actions extends object = {},
+  LA extends LazyActionsConfig<State> = {},
+>(
   name: string,
-  config: StoreConfig<State, Actions>,
-): StoreHandle<FullStoreState<State, Actions>> {
-  const builder = makeBuilder(name, config)
-  const store = create<FullStoreState<State, Actions>>()(
-    applyMiddleware(builder, config) as any,
-  ) as BoundStore<FullStoreState<State, Actions>>
+  config: StoreConfig<State, Actions, LA>,
+): StoreHandle<FullStoreState<State, Actions & LazyDispatchers<LA>>> {
+  type Full = FullStoreState<State, Actions & LazyDispatchers<LA>>
+  const builder = makeBuilder(name, config as StoreConfig<State, any>)
+  const store = create<Full>()(
+    applyMiddleware(builder as any, config as StoreConfig<State, any>) as any,
+  ) as BoundStore<Full>
   return { name, store }
 }
 
@@ -325,3 +409,6 @@ export function defineLocalStore<State extends object, Actions extends object>(
     },
   }
 }
+
+// Whole-store-lazy registration (defined in ./stores; re-exported for co-location with defineStore).
+export { registerLazyStore } from './stores'

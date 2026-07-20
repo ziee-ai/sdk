@@ -18,6 +18,12 @@ interface ModuleSystemState {
   components: ComponentRegistration[]
   addComponents: (components: ComponentRegistration[]) => void
   registerModule: (module: AppModule) => void
+  /** Register a store proxy directly, by name (idempotent — keeps the first).
+   *  Used by whole-store-lazy stores that self-register as a side effect of
+   *  their (lazy) chunk loading, instead of being declared in a module's
+   *  `stores:` array. Keeps `Stores.<name>` (the compat shim) resolving to the
+   *  SAME proxy instance a direct `import { X }` returns. */
+  registerStore: (name: string, proxy: any) => void
   initializeModules: () => void
 }
 
@@ -31,6 +37,16 @@ export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
     set(state => ({
       components: [...state.components, ...components],
     }))
+  },
+
+  registerStore: (name: string, proxy: any) => {
+    set(state => {
+      // Idempotent: a store's chunk may be imported by several consumers, but
+      // ES-module singletons mean this runs once; guard anyway so a stray
+      // double-register never clobbers the live (ref-counted) proxy instance.
+      if (state.stores[name]) return state
+      return { stores: { ...state.stores, [name]: proxy } }
+    })
   },
 
   registerModule: (module: AppModule) => {

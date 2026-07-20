@@ -329,5 +329,29 @@ export const Stores = new Proxy({} as RegisteredStores, {
   },
 })
 
+/**
+ * WHOLE-STORE-LAZY registration. A store file calls this at module scope:
+ *
+ *   export const Users = registerLazyStore(defineStore('Users', { … }))
+ *
+ * It builds the lifecycle proxy ONCE (via `createStoreProxy`) and self-registers
+ * it, then RETURNS that proxy as the importable handle. So:
+ *   - `import { Users } from './Users.store'` → the reactive/lifecycle proxy
+ *     (the store's code rides THIS chunk, loaded only where imported → lazy).
+ *   - `Stores.Users` (compat shim) → the SAME proxy instance (single ref-count).
+ *
+ * The proxy is the sole owner of init-on-first-access + ref-counted destroy, so
+ * whether you reach it via the import or the shim, the lifecycle is identical.
+ * `defineStore`'s existing `{ name, store }` return is unchanged — this wraps it,
+ * so the 89 un-migrated modules that use `stores: [...]` are untouched.
+ */
+export function registerLazyStore<
+  H extends { name: string; store: UseBoundStore<StoreApi<any>> },
+>(handle: H): StoreProxy<ExtractZustandState<H['store']>> {
+  const proxy = createStoreProxy(handle.store)
+  useModuleSystemStore.getState().registerStore(handle.name, proxy as any)
+  return proxy as StoreProxy<ExtractZustandState<H['store']>>
+}
+
 // Type helper for accessing store state
 export type StoresType = RegisteredStores
