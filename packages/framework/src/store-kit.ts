@@ -171,6 +171,32 @@ function normalizeGlobConfig<C extends { actions?: unknown; lazyActions?: unknow
   return { ...config, actions: undefined, lazyActions: globToLazyActions(config.actions) }
 }
 
+/** Browser-idle scheduler: run `cb` in a spare frame gap, off the render/critical
+ *  path. `{ timeout }` guarantees it still fires under a busy main thread (e.g. a
+ *  long SSE token stream keeps eating idle time). No-op off-browser (SSR/tests). */
+export function warmIdle(cb: () => void): void {
+  if (typeof window === 'undefined') return
+  if (typeof requestIdleCallback !== 'undefined') requestIdleCallback(cb, { timeout: 2000 })
+  else setTimeout(cb, 200)
+}
+
+/** BAKED-IN PREFETCH: on init, warm every lazy-action chunk on idle so the store's
+ *  interactions are instant — with NO per-store `.preload()` wiring. Actions already
+ *  invoked in `init` (hot) are a cached no-op; the rest fetch in the background. */
+function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
+  const keys = Object.keys(lazyDispatchers)
+  if (!keys.length) return
+  warmIdle(() => {
+    for (const k of keys) {
+      try {
+        lazyDispatchers[k].preload?.()
+      } catch {
+        /* best-effort */
+      }
+    }
+  })
+}
+
 export interface StoreConfig<
   State extends object,
   Actions extends object,
@@ -288,7 +314,14 @@ function makeBuilder<State extends object, Actions extends object>(
       ...(config.state as State),
       ...actions,
       ...lazyDispatchers,
-      __init__: { __store__: () => config.init?.(ctx) },
+      __init__: {
+        __store__: () => {
+          config.init?.(ctx)
+          // Auto-warm this store's lazy-action chunks on idle — every store's
+          // interactions become instant with ZERO per-store preload boilerplate.
+          autoWarmLazyActions(lazyDispatchers)
+        },
+      },
       __destroy__: () => {
         cleanups.splice(0).forEach(off => {
           try {
