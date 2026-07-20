@@ -48,10 +48,12 @@ function walk(dir, pred, acc = []) {
   return acc
 }
 
-/** A file is an ACTION file when its immediate parent dir is `actions` and some
- *  ancestor segment is `stores` (so unrelated `actions/` dirs aren't swept in). */
+/** A file is a dispatched ACTION file when its immediate parent dir is `actions`
+ *  and some ancestor segment is `stores`. A leading `_` marks an INTERNAL helper
+ *  (shared by actions via a static factory import, not a store-dispatched action),
+ *  so it's exempt — it loads whenever a dependent action's chunk loads. */
 function isActionFile(full, name) {
-  if (!/\.ts$/.test(name) || IS_TEST(name)) return false
+  if (!/\.ts$/.test(name) || IS_TEST(name) || name.startsWith('_')) return false
   const parts = full.split(path.sep)
   const parent = parts[parts.length - 2]
   return parent === 'actions' && parts.includes('stores')
