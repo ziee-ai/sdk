@@ -1141,10 +1141,14 @@ fn generate_typescript_content(
 
     let schema_definitions = format!("{}\n\n", generate_all_schemas(schemas));
 
+    // NOTE: `PermissionDescriptions` is emitted as a SEPARATE module
+    // (`permissionDescriptions.ts`) — see `generate_permission_descriptions_ts`.
+    // It is only consumed by the (lazy) permission-picker UI, so keeping it out
+    // of this eagerly-imported `types.ts` lets it land in that lazy chunk instead
+    // of the entry chunk.
     let permissions_section = format!(
-        "// =============================================================================\n// PERMISSIONS\n// =============================================================================\n\n{}\n\n{}\n\n",
+        "// =============================================================================\n// PERMISSIONS\n// =============================================================================\n\n{}\n\n",
         generate_permissions_enum(permissions),
-        generate_permission_descriptions(permissions)
     );
 
     let endpoints_section = format!(
@@ -1233,6 +1237,25 @@ pub fn generate_types_ts_from_json(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let spec: J = serde_json::from_str(openapi_json)?;
     Ok(generate_types_ts(&spec))
+}
+
+/// Generate the standalone `permissionDescriptions.ts` module content. Split out
+/// of `types.ts` so this human-readable label map (consumed only by the lazy
+/// permission-picker UI) rides that lazy chunk instead of the eager entry chunk.
+pub fn generate_permission_descriptions_ts(spec: &J) -> String {
+    let permissions = extract_permissions_from_spec(spec);
+    format!(
+        "// AUTO-GENERATED — do not edit. Regenerate with `just openapi-regen`.\n// Human-readable permission labels, split out of `types.ts` so they load only\n// where used (the permission picker) instead of on every page.\n\n{}\n",
+        generate_permission_descriptions(&permissions)
+    )
+}
+
+/// Parse an `openapi.json` string and emit `permissionDescriptions.ts` content.
+pub fn generate_permission_descriptions_ts_from_json(
+    openapi_json: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let spec: J = serde_json::from_str(openapi_json)?;
+    Ok(generate_permission_descriptions_ts(&spec))
 }
 
 

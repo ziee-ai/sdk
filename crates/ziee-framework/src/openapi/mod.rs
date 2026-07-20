@@ -63,6 +63,17 @@ pub fn finish_and_emit(
     fs::write(types_ts_path, &types_ts)?;
     println!("✓ TypeScript types written to: {}", types_ts_path.display());
 
+    // Emit the split-out `permissionDescriptions.ts` sibling (see emit_ts). Kept
+    // out of `types.ts` so the label map loads only in the lazy permission
+    // picker, not the eager entry chunk.
+    let descriptions_ts = emit_ts::generate_permission_descriptions_ts_from_json(&json)?;
+    let descriptions_path = types_ts_path.with_file_name("permissionDescriptions.ts");
+    fs::write(&descriptions_path, &descriptions_ts)?;
+    println!(
+        "✓ Permission descriptions written to: {}",
+        descriptions_path.display()
+    );
+
     println!("\n✓ OpenAPI generation complete!");
     println!("  - OpenAPI spec: {}", openapi_json_path.display());
     println!("  - TypeScript types: {}", types_ts_path.display());
