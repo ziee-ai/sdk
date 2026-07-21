@@ -147,9 +147,59 @@ export type FactoryDispatcher<F> = F extends (
 /** The generated `actions.gen.ts` type map (name → factory type) → dispatchers. */
 export type DispatchersFromTypeMap<M> = { [K in keyof M]: FactoryDispatcher<M[K]> }
 
+/** EAGER glob form: `import.meta.glob('./actions/*.ts', { eager: true })` — its
+ *  values are already-loaded module namespaces (`{ default: factory }`), not the
+ *  lazy loader thunks (`() => import()`). Used by stores with SYNCHRONOUS
+ *  selectors (a `getFoo(): string` read in render), which can't be deferred
+ *  behind a dynamic import. Same folder structure, sync actions.
+ *
+ *  Typed as `Record<string, unknown>` because that is exactly what Vite infers
+ *  for an un-parameterized eager glob (the lazy glob is `Record<string, () =>
+ *  Promise<...>>`), so this is the type that DISTINGUISHES the eager overload
+ *  from the lazy one at the call site. The action SIGNATURES come from the `AM`
+ *  generic (`actions.gen.ts`), not from these values, so no precision is lost. */
+export type EagerActionGlob = Record<string, unknown>
+
+/** Eager (synchronous) factory → its resolved action, signature preserved
+ *  VERBATIM (NO Promise-wrapping, NO `.preload`) — the opposite of
+ *  `FactoryDispatcher`, so a `getFoo(): string` stays `() => string`. */
+export type EagerFactoryDispatcher<F> = F extends (
+  set: any,
+  get: any,
+) => infer A
+  ? A
+  : never
+export type EagerDispatchersFromTypeMap<M> = {
+  [K in keyof M]: EagerFactoryDispatcher<M[K]>
+}
+
 /** True when `actions` is a glob record (object) rather than the eager factory (function). */
 function isActionGlob(a: unknown): a is ActionGlob {
   return !!a && typeof a === 'object'
+}
+
+/** An eager glob's values are loaded module objects (`{default}`), not the lazy
+ *  loader thunks. Empty glob → treated as lazy (a no-op either way). */
+function isEagerGlob(glob: ActionGlob): boolean {
+  for (const path of Object.keys(glob)) return typeof glob[path] !== 'function'
+  return false
+}
+
+/** Eager glob → a plain `actions` factory (basename→factory(set,get)), built
+ *  SYNCHRONOUSLY. Drops `_`-prefixed internal-helper files (as the lazy form does). */
+function globToEagerActions(
+  glob: ActionGlob,
+): (set: any, get: any) => Record<string, any> {
+  const factories: Record<string, (set: any, get: any) => any> = {}
+  for (const path of Object.keys(glob)) {
+    const base = path.slice(path.lastIndexOf('/') + 1).replace(/\.[tj]sx?$/, '')
+    if (!base.startsWith('_')) factories[base] = (glob[path] as any).default
+  }
+  return (set: any, get: any) => {
+    const out: Record<string, any> = {}
+    for (const name of Object.keys(factories)) out[name] = factories[name](set, get)
+    return out
+  }
 }
 
 /** Glob record → basename→loader map (the internal lazyActions form). Drops
@@ -163,11 +213,15 @@ function globToLazyActions(glob: ActionGlob): Record<string, LazyActionLoader<an
   return out
 }
 
-/** If `config.actions` is a glob, move it to `lazyActions` (basename keys). */
+/** If `config.actions` is a glob, normalize it: an EAGER glob → a synchronous
+ *  `actions` factory (sync selectors preserved); a LAZY glob → `lazyActions`
+ *  (basename keys, deferred per-action chunks). */
 function normalizeGlobConfig<C extends { actions?: unknown; lazyActions?: unknown }>(
   config: C,
 ): C {
   if (typeof config.actions === 'function' || !isActionGlob(config.actions)) return config
+  if (isEagerGlob(config.actions))
+    return { ...config, actions: globToEagerActions(config.actions) }
   return { ...config, actions: undefined, lazyActions: globToLazyActions(config.actions) }
 }
 
@@ -364,6 +418,20 @@ export interface GlobStoreConfig<State extends object, AM> {
   ) => void
 }
 
+/** The EAGER folder-glob config: `actions: import.meta.glob('./actions/*.ts',
+ *  { eager: true })` — same folder structure as `GlobStoreConfig`, but actions
+ *  load synchronously so a store with a synchronous selector keeps its sync
+ *  signature. `AM` is still the generated `actions.gen.ts` type map. */
+export interface EagerGlobStoreConfig<State extends object, AM> {
+  actions: EagerActionGlob
+  immer?: boolean
+  persist?: PersistOptions<State, any>
+  state: State
+  init?: (
+    ctx: StoreInitCtx<State> & { actions: EagerDispatchersFromTypeMap<AM> },
+  ) => void
+}
+
 /**
  * Global singleton store. Register it on a module via
  * `createModule({ stores: [MyStore] })` — the name is written ONCE here, and
@@ -427,6 +495,12 @@ export function defineExtensionStore<
 >(
   config: GlobStoreConfig<State, AM>,
 ): () => StoreProxy<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineExtensionStore<
+  State extends object,
+  AM extends Record<string, any>,
+>(
+  config: EagerGlobStoreConfig<State, AM>,
+): () => StoreProxy<FullStoreState<State, EagerDispatchersFromTypeMap<AM>>>
 export function defineExtensionStore(configArg: any): any {
   // Accept the folder-glob form (`actions: import.meta.glob('./actions/*.ts')`)
   // identically to defineStore/defineLocalStore — normalize it to lazyActions
