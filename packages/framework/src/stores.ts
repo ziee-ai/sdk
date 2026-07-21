@@ -2,6 +2,7 @@ import type { StoreApi, UseBoundStore } from 'zustand'
 import { useShallow } from 'zustand/react/shallow'
 import { useEffect } from 'react'
 import { useModuleSystemStore } from './module-system'
+import { useEventBusStore } from './events'
 
 // ============================================================================
 // Store Proxy - Creates typed store accessors with IntelliSense
@@ -355,3 +356,8 @@ export function registerLazyStore<
 
 // Type helper for accessing store state
 export type StoresType = RegisteredStores
+
+/** Direct handles for the framework-infra stores (were `Stores.EventBus` /
+ *  `Stores.ModuleSystem`). Import these instead of going through the global. */
+export const EventBus = createStoreProxy(useEventBusStore)
+export const ModuleSystem = createStoreProxy(useModuleSystemStore)
