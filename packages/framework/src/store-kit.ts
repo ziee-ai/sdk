@@ -12,6 +12,7 @@ import type { Mutate, StoreApi, UseBoundStore } from 'zustand'
 import { useEventBusStore } from './events'
 import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
 import { createStoreProxy, type StoreProxy } from './stores'
+import { onNetworkIdle } from './net-idle'
 
 // ============================================================================
 // store-kit — thin authoring layer over the existing Zustand + Stores.X proxy.
@@ -256,15 +257,22 @@ function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
   if (!STORE_PREFETCH_ENABLED) return
   const keys = Object.keys(lazyDispatchers)
   if (!keys.length) return
-  warmIdle(() => {
-    for (const k of keys) {
-      try {
-        lazyDispatchers[k].preload?.()
-      } catch {
-        /* best-effort */
+  // Wait for the page's CRITICAL api-client calls to finish (network-idle after
+  // load) BEFORE warming, so the prefetch never competes with them for the
+  // browser's connections — THEN schedule the actual preloads on a main-thread
+  // idle gap. (Fixes: on /login the drawer/onboarding chunks were prefetched
+  // while the auth/providers call was still pending.)
+  onNetworkIdle(() =>
+    warmIdle(() => {
+      for (const k of keys) {
+        try {
+          lazyDispatchers[k].preload?.()
+        } catch {
+          /* best-effort */
+        }
       }
-    }
-  })
+    }),
+  )
 }
 
 export interface StoreConfig<

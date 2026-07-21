@@ -1,6 +1,7 @@
 import type { SSECallback } from './sse-types'
 import { createSSEHandler } from './sse-types'
 import { getSyncConnectionId } from '../sync/connection'
+import { netRequestEnd, netRequestStart } from '../net-idle'
 
 // ─────────────────────── Base-URL resolver (injected) ───────────────────────
 //
@@ -183,6 +184,11 @@ export const callAsync = async <TResponse = unknown>(
       sseFunction = createSSEHandler(sseCallbacks as any)
     }
   }
+
+  // Track in-flight NON-SSE requests so the background action-chunk prefetch can
+  // wait for the page's critical loads to finish (SSE streams are long-lived).
+  const counted = !sseFunction
+  if (counted) netRequestStart()
 
   try {
     // Check if params is FormData for file uploads
@@ -687,5 +693,7 @@ export const callAsync = async <TResponse = unknown>(
       console.error(`Error calling endpoint ${endpointUrl}:`, error)
     }
     throw error // Re-throw to allow caller to handle it
+  } finally {
+    if (counted) netRequestEnd()
   }
 }
