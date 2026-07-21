@@ -22,14 +22,20 @@ const ROOTS = parseRoots()
 const CHECK = process.argv.includes('--check')
 const SKIP = ['node_modules', 'dist', 'build', '.git']
 
-/** Recursively find dirs named `actions` whose parent is the store folder. */
+/** Recursively find store folders — a dir that contains an `actions/` subdir plus
+ *  an `index.ts` or `state.ts` (the store markers). Not tied to a `stores/`
+ *  ancestor, so a store placed directly in its module is still enforced. */
 function findActionDirs(dir, acc = []) {
   if (!fs.existsSync(dir)) return acc
   for (const e of fs.readdirSync(dir)) {
     const full = path.join(dir, e)
     if (!fs.statSync(full).isDirectory()) continue
     if (SKIP.includes(e)) continue
-    if (e === 'actions' && path.dirname(full).split(path.sep).includes('stores'))
+    if (
+      e === 'actions' &&
+      (fs.existsSync(path.join(path.dirname(full), 'index.ts')) ||
+        fs.existsSync(path.join(path.dirname(full), 'state.ts')))
+    )
       acc.push(path.dirname(full)) // the store folder
     else findActionDirs(full, acc)
   }
