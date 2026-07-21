@@ -4,7 +4,7 @@ import {
   type OverlayScrollbarsComponentProps,
   type OverlayScrollbarsComponentRef,
 } from 'overlayscrollbars-react'
-import { Stores } from '@ziee/framework/stores'
+import { appLayoutSeam } from '../app-store-seams'
 
 export interface DivScrollYProps
   extends Omit<OverlayScrollbarsComponentProps, 'options'> {
@@ -32,7 +32,7 @@ export const DivScrollY = forwardRef<
   // depend on the app's app-layout store type; runtime is identical to reading
   // `Stores.AppLayout` directly.
   const { nativeScroll } =
-    (Stores as unknown as { AppLayout?: { nativeScroll?: boolean } }).AppLayout ??
+    (appLayoutSeam.get() as { nativeScroll?: boolean } | undefined) ??
     {}
 
   if (nativeFlow && nativeScroll) {

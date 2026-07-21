@@ -1,4 +1,3 @@
-import { Stores } from '../stores'
 import type { StoreProxy } from '../stores'
 import type { PermissionUser } from './types'
 
@@ -6,15 +5,22 @@ import type { PermissionUser } from './types'
  * The identity slice the permission hooks read: the current user (for the
  * `is_admin` bypass) + their flattened active-group permission strings.
  *
- * SEAM: a consuming app registers a store named `Auth` (via the module system)
- * exposing at least `{ user, permissions }`. The permission primitives read it
- * through this typed view rather than importing the app's concrete Auth store —
- * so the framework stays app-agnostic while the runtime read is byte-identical
- * to reading `Stores.Auth` directly.
+ * SEAM (injection): a consuming app calls `setAuthView(Auth)` once with its
+ * `Auth` store proxy (exposing at least `{ user, permissions }`). The permission
+ * primitives read it through this typed view rather than importing the app's
+ * concrete Auth store OR going through a global `Stores.Auth` — so the framework
+ * stays app-agnostic with zero global-registry dependency.
  */
 export interface PermissionAuthView {
   user: PermissionUser | null | undefined
   permissions: string[] | null | undefined
+}
+
+let injectedAuthView: StoreProxy<PermissionAuthView> | null = null
+
+/** App entry point: register the `Auth` store proxy for the permission system. */
+export function setAuthView(view: StoreProxy<PermissionAuthView>): void {
+  injectedAuthView = view
 }
 
 /**
@@ -23,5 +29,10 @@ export interface PermissionAuthView {
  * (reactive); read `.$` for a non-reactive snapshot.
  */
 export function authStoreProxy(): StoreProxy<PermissionAuthView> {
-  return (Stores as unknown as { Auth: StoreProxy<PermissionAuthView> }).Auth
+  if (!injectedAuthView) {
+    throw new Error(
+      '[permissions] Auth view not registered — the app must call setAuthView(Auth) at startup',
+    )
+  }
+  return injectedAuthView
 }

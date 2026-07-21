@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Stores } from '@ziee/framework/stores'
+import { appLayoutSeam } from '../app-store-seams'
 import { cn } from '@ziee/kit/lib/utils'
 import { useHeaderLeftInset } from '../hooks/useHeaderLeftInset'
 
@@ -34,7 +34,7 @@ export const HeaderBarContainer = ({
   className = '',
   style = {},
 }: HeaderBarContainerProps) => {
-  const appLayout = (Stores as unknown as { AppLayout: HeaderBarSeam }).AppLayout
+  const appLayout = (appLayoutSeam.get() as HeaderBarSeam)
   const { nativeScroll } = appLayout
   const headerLeftInset = useHeaderLeftInset()
 

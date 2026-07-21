@@ -1,4 +1,4 @@
-import { Stores } from '@ziee/framework/stores'
+import { appLayoutSeam } from '../app-store-seams'
 
 /**
  * SEAM: reads `Stores.AppLayout.isSidebarCollapsed` through a typed view (never
@@ -21,7 +21,7 @@ interface InsetSeam {
  */
 export function useHeaderLeftInset(): number {
   const { isSidebarCollapsed } = (
-    Stores as unknown as { AppLayout: InsetSeam }
+    { AppLayout: appLayoutSeam.get() as InsetSeam }
   ).AppLayout
   return isSidebarCollapsed ? 48 : 12
 }

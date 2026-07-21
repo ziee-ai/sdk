@@ -1,7 +1,7 @@
 import { Text, Title } from '@ziee/kit'
 import { ReactNode, useId } from 'react'
 import { DivScrollY } from '../components/DivScrollY'
-import { Stores } from '@ziee/framework/stores'
+import { appLayoutSeam } from '../app-store-seams'
 
 interface SettingsPageContainerProps {
   title: string | ReactNode
@@ -28,7 +28,7 @@ export function SettingsPageContainer({
   // (the dev gallery) rather than crashing. Runtime matches reading
   // `Stores.AppLayout.nativeScroll` directly.
   const nativeScroll =
-    (Stores as unknown as { AppLayout?: { nativeScroll?: boolean } }).AppLayout
+    (appLayoutSeam.get() as { nativeScroll?: boolean } | undefined)
       ?.nativeScroll ?? false
 
   // Vertical spacing notes:

@@ -320,15 +320,12 @@ export interface RegisteredStores {
   // }
 }
 
-// Dynamic store proxy that gets populated by modules at runtime
-// But typed via RegisteredStores interface for IntelliSense
-export const Stores = new Proxy({} as RegisteredStores, {
-  get: (_, prop) => {
-    const moduleSystemState = useModuleSystemStore.getState()
-    const store = moduleSystemState.stores[prop as string]
-    return store
-  },
-})
+// NOTE: the global `Stores` proxy has been REMOVED. Every store is now consumed
+// via its direct handle (`import { X } from '.../X.store'`, the proxy returned
+// by `registerLazyStore` / `defineStore`) — so a page only pulls the stores it
+// actually uses (O(page-stores) boot instead of O(all-stores)). The module-system
+// registry below still tracks stores for lifecycle (init/destroy on module
+// load/unload + ref-counting); it simply no longer backs a global `.X` facade.
 
 /**
  * WHOLE-STORE-LAZY registration. A store file calls this at module scope:
@@ -357,7 +354,31 @@ export function registerLazyStore<
 // Type helper for accessing store state
 export type StoresType = RegisteredStores
 
-/** Direct handles for the framework-infra stores (were `Stores.EventBus` /
- *  `Stores.ModuleSystem`). Import these instead of going through the global. */
-export const EventBus = createStoreProxy(useEventBusStore)
-export const ModuleSystem = createStoreProxy(useModuleSystemStore)
+/**
+ * Direct handles for the framework-infra stores (were `Stores.EventBus` /
+ * `Stores.ModuleSystem`). Import these instead of going through a global.
+ *
+ * LAZY on purpose: `stores.ts` and `./module-system` (which provides
+ * `useModuleSystemStore` + imports `createStoreProxy` from here) form an import
+ * cycle. Whichever module the bundler evaluates first, the other's exports can
+ * still be in the temporal dead zone when this file's top-level runs — so an
+ * eager `createStoreProxy(useModuleSystemStore)` would capture `undefined` and
+ * every `ModuleSystem.<field>` read would throw `getState of undefined`. Building
+ * the inner proxy on FIRST ACCESS (by which point both modules are fully
+ * evaluated) resolves the cycle — this is the same laziness the removed global
+ * `Stores.X` proxy relied on.
+ */
+function lazyStoreProxy<T extends UseBoundStore<StoreApi<any>>>(
+  getStore: () => T,
+): Readonly<ExtractZustandState<T>> {
+  let inner: Readonly<ExtractZustandState<T>> | null = null
+  return new Proxy({} as Readonly<ExtractZustandState<T>>, {
+    get: (_t, prop) => {
+      if (inner == null) inner = createStoreProxy(getStore())
+      return (inner as Record<string | symbol, unknown>)[prop]
+    },
+  })
+}
+
+export const EventBus = lazyStoreProxy(() => useEventBusStore)
+export const ModuleSystem = lazyStoreProxy(() => useModuleSystemStore)

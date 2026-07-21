@@ -13,7 +13,8 @@ import { cn } from '@ziee/kit/lib/utils'
 import { Sheet, SheetContent, SheetTitle } from '@ziee/kit/shadcn/sheet'
 import { useMetaThemeColor } from '../theme/themeColor'
 import 'overlayscrollbars/overlayscrollbars.css'
-import { Stores } from '@ziee/framework/stores'
+import { ModuleSystem } from '@ziee/framework/stores'
+import { appLayoutSeam } from '../app-store-seams'
 import { LazyComponentRenderer } from '../components/LazyComponentRenderer'
 
 /**
@@ -61,8 +62,7 @@ export function AppLayout({
   LeftSidebar,
   SidebarToggleButton,
 }: AppLayoutProps) {
-  const appLayout = (Stores as unknown as { AppLayout: AppLayoutSeam })
-    .AppLayout
+  const appLayout = appLayoutSeam.get() as AppLayoutSeam
   // The app shell is bg-card, but the iOS status/nav bars sample the CANVAS —
   // the <body> background — which is --background app-wide. The shell covers the
   // body, so painting the body --card changes nothing visible; it only makes the
@@ -80,7 +80,7 @@ export function AppLayout({
   }, [])
   useMetaThemeColor('--card')
   const { isSidebarCollapsed, nativeScroll } = appLayout
-  const { slots } = Stores.ModuleSystem
+  const { slots } = ModuleSystem
   const appBanners = [...(slots.get('appBanners') || [])].sort(
     (a, b) => (a.order ?? 0) - (b.order ?? 0),
   )

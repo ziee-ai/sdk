@@ -34,3 +34,4 @@ export type {
   NotificationsStoreView,
   UnreadResult,
 } from './types'
+export { notificationsSeam, notificationsStore } from './storeView'

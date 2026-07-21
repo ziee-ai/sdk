@@ -1,6 +1,6 @@
 import { useEffect, useMemo } from 'react'
 import type { ComponentRegistration } from '@ziee/framework/module-system/types'
-import { Stores } from '@ziee/framework/stores'
+import { ModuleSystem } from '@ziee/framework/stores'
 import { initSync } from '@ziee/framework/sync'
 import { AppErrorBoundary } from '../error/AppErrorBoundary'
 import { ThemeProvider } from '../theme/ThemeProvider'
@@ -63,7 +63,7 @@ export interface AppShellProps {
  * settings, routes) via the module system, and supplies its own branding/nav.
  */
 export function AppShell({ authStore }: AppShellProps) {
-  const { components } = Stores.ModuleSystem
+  const { components } = ModuleSystem
 
   // Wire the realtime-sync SSE stream to the auth lifecycle.
   useEffect(() => {

@@ -1,5 +1,5 @@
 import { useEffect, isValidElement } from 'react'
-import { Stores } from '@ziee/framework/stores'
+import { routesSeam } from '@ziee/framework'
 import { authStoreProxy, hasPermissionNow } from '@ziee/framework/permissions'
 import type { PermissionExpr } from '@ziee/framework/permissions'
 
@@ -52,7 +52,7 @@ function pathMatchesCurrent(pattern: string, pathname: string): boolean {
  */
 export function usePrefetchModules() {
   const { routes } = (
-    Stores as unknown as { Routes: { routes: PrefetchRoute[] } }
+    { Routes: routesSeam.get() as { routes: PrefetchRoute[] } }
   ).Routes
 
   // Reactive read: re-run the effect once the user signs in (null → set), so
