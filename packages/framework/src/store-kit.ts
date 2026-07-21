@@ -11,7 +11,7 @@ import { useEffect, useRef } from 'react'
 import type { Mutate, StoreApi, UseBoundStore } from 'zustand'
 import { useEventBusStore } from './events'
 import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
-import { createStoreProxy } from './stores'
+import { createStoreProxy, type StoreProxy } from './stores'
 
 // ============================================================================
 // store-kit — thin authoring layer over the existing Zustand + Stores.X proxy.
@@ -420,14 +420,25 @@ export function defineStore(name: string, config: any): any {
 // ============================================================================
 export function defineExtensionStore<State extends object, Actions extends object>(
   config: StoreConfig<State, Actions>,
-) {
+): () => StoreProxy<FullStoreState<State, Actions>>
+export function defineExtensionStore<
+  State extends object,
+  AM extends Record<string, any>,
+>(
+  config: GlobStoreConfig<State, AM>,
+): () => StoreProxy<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineExtensionStore(configArg: any): any {
+  // Accept the folder-glob form (`actions: import.meta.glob('./actions/*.ts')`)
+  // identically to defineStore/defineLocalStore — normalize it to lazyActions
+  // before building so extension stores share the ONE authoring pattern.
+  const config = normalizeGlobConfig(configArg) as StoreConfig<any, any>
   let counter = 0
   return () => {
     const group = `chat-ext:${counter++}`
     const builder = makeBuilder(group, config)
-    const store = create<FullStoreState<State, Actions>>()(
+    const store = create<FullStoreState<any, any>>()(
       applyMiddleware(builder, config) as any,
-    ) as BoundStore<FullStoreState<State, Actions>>
+    ) as BoundStore<FullStoreState<any, any>>
     return createStoreProxy(store)
   }
 }
