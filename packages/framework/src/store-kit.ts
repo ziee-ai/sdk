@@ -234,10 +234,26 @@ export function warmIdle(cb: () => void): void {
   else setTimeout(cb, 200)
 }
 
+/**
+ * Compile-time prefetch toggle. The baked-in auto-warm (preload every store's
+ * lazy action chunks on init) is ON by default. Build with
+ * `VITE_STORE_PREFETCH=off` to strip it — Vite inlines `import.meta.env.VITE_*`
+ * to a literal, so `STORE_PREFETCH_ENABLED` const-folds to `false` and the warm
+ * loop is dead-code-eliminated. Lets you measure a COLD page render with ZERO
+ * action chunks prefetched (only the code the first paint actually needs).
+ * Read as a plain `import.meta.env.VITE_*` (no `?.`) — same pattern as the
+ * framework's existing `import.meta.env.DEV` reads — so Vite const-folds it to a
+ * literal and the warm loop below dead-code-eliminates when off.
+ */
+const STORE_PREFETCH_ENABLED =
+  import.meta.env.VITE_STORE_PREFETCH !== 'off'
+
 /** BAKED-IN PREFETCH: on init, warm every lazy-action chunk on idle so the store's
  *  interactions are instant — with NO per-store `.preload()` wiring. Actions already
- *  invoked in `init` (hot) are a cached no-op; the rest fetch in the background. */
+ *  invoked in `init` (hot) are a cached no-op; the rest fetch in the background.
+ *  Gated by the `VITE_STORE_PREFETCH=off` compile-time flag (see above). */
 function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
+  if (!STORE_PREFETCH_ENABLED) return
   const keys = Object.keys(lazyDispatchers)
   if (!keys.length) return
   warmIdle(() => {
