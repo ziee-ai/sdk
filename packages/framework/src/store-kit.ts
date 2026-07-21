@@ -455,6 +455,10 @@ export function defineStore<State extends object, AM extends Record<string, any>
   name: string,
   config: GlobStoreConfig<State, AM>,
 ): StoreHandle<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineStore<State extends object, AM extends Record<string, any>>(
+  name: string,
+  config: EagerGlobStoreConfig<State, AM>,
+): StoreHandle<FullStoreState<State, EagerDispatchersFromTypeMap<AM>>>
 export function defineStore(name: string, config: any): any {
   const normalized = normalizeGlobConfig(config) as StoreConfig<any, any>
   const builder = makeBuilder(name, normalized)
@@ -583,6 +587,12 @@ export function defineLocalStore<
 >(
   config: GlobStoreConfig<State, AM>,
 ): LocalStoreDef<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineLocalStore<
+  State extends object,
+  AM extends Record<string, any>,
+>(
+  config: EagerGlobStoreConfig<State, AM>,
+): LocalStoreDef<FullStoreState<State, EagerDispatchersFromTypeMap<AM>>>
 export function defineLocalStore(configArg: any): any {
   // A distinct EventBus group per live instance so instances don't clobber each
   // other's listeners (defineStore's global variant can key by the store name;
