@@ -34,8 +34,11 @@ const tabsListVariants = cva(
       variant: {
         default: "bg-muted",
         // Underline tabs: a full-width baseline (like the project-detail section
-        // nav) with the active tab's underline sitting on it. Left-aligned.
-        line: "gap-1 bg-transparent w-full justify-start border-b border-border rounded-none p-0",
+        // nav) with the active tab's underline sitting FLUSH on it. Left-aligned,
+        // and BOTTOM-aligned (`items-end` beats the base `items-center`) so the
+        // content-height triggers hug the baseline instead of centering — otherwise
+        // the active underline floats a few px above the divider.
+        line: "gap-1 items-end bg-transparent w-full justify-start border-b border-border rounded-none p-0",
       },
     },
     defaultVariants: {

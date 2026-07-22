@@ -550,8 +550,12 @@ export function AppLayout({
         {appBanners.map((b) => (
           <LazyComponentRenderer key={b.id} component={b.component} />
         ))}
-        {/* Content */}
-        <div className={cn('flex-1 min-w-0 relative', nativeScroll ? 'overflow-x-clip' : 'overflow-hidden')}>
+        {/* Content — min-h-0 (desktop clamp): a flex-1 child of the flex-col `main`
+            defaults to min-height:auto and REFUSES to shrink below its content, so a
+            tall page would grow past the viewport and scroll the WINDOW instead of its
+            own inner `DivScrollY`. min-h-0 lets it track the bounded `main` height, so
+            the page's `h-full` resolves to the viewport and inner overlay-scroll works. */}
+        <div className={cn('flex-1 min-w-0 relative', nativeScroll ? 'overflow-x-clip' : 'min-h-0 overflow-hidden')}>
           <section
             ref={mainContentRef}
             id="main-content"
