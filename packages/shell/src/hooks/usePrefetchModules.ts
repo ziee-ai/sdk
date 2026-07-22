@@ -62,6 +62,11 @@ export function usePrefetchModules() {
   const isAuthed = authStoreProxy().user != null
 
   useEffect(() => {
+    // Gate 0: the `VITE_STORE_PREFETCH=off` compile-time flag disables ALL
+    // prefetch (store-action warm AND this route-chunk prefetch), so a build can
+    // be measured with zero idle-prefetch warming. Vite inlines the env var, so
+    // this const-folds away in an `=off` build.
+    if (import.meta.env.VITE_STORE_PREFETCH === 'off') return
     // Gate 1: no signed-in user → prefetch nothing.
     if (!isAuthed) return
 
