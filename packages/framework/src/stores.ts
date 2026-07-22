@@ -139,8 +139,13 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
     scheduleDestroy: () => {
       const state = useStore.getState()
 
-      // Only schedule if store has __destroy__ method
-      if (!state.__destroy__ || typeof state.__destroy__ !== 'function') {
+      // Only schedule if the store still exists and has a __destroy__ method.
+      // `state` can be undefined for a per-instance (local) store whose Zustand
+      // store was already disposed before this ref-count-triggered teardown ran
+      // (rapid mount/unmount, e.g. split-chat panes). An unguarded
+      // `state.__destroy__` there throws → escapes to the router error boundary →
+      // blank page.
+      if (!state || !state.__destroy__ || typeof state.__destroy__ !== 'function') {
         return
       }
 
@@ -167,6 +172,15 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
 
     executeDestroy: () => {
       const state = useStore.getState()
+
+      // The store may have been disposed between scheduling and this timeout
+      // firing (a local store's Zustand instance torn down on unmount), leaving
+      // `getState()` undefined — nothing left to destroy.
+      if (!state || typeof (state as any).__destroy__ !== 'function') {
+        refTracker.destroyed = true
+        refTracker.destroyTimeoutId = null
+        return
+      }
 
       if (import.meta.env.DEV) {
         console.log('🗑️ Executing store destruction (delay expired)')
