@@ -326,6 +326,86 @@ async fn linking_does_not_verify_a_mismatched_email() {
     drop_db(&db).await;
 }
 
+/// The return value is the DELTA, not the resulting state: linking a SECOND
+/// verified identity to an already-verified user reports `false` (nothing to
+/// upgrade) while still creating the link. Without the `AND email_verified =
+/// false` clause this would report `true` and the handler would "correct" a
+/// field that was never stale.
+#[tokio::test]
+async fn linking_an_already_verified_user_reports_no_upgrade() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+    let pid = provider_id();
+
+    let uid = repo
+        .provision_external_user_atomic(
+            "mo",
+            Some("mo@corp.com"),
+            true,
+            "Mo",
+            pid,
+            "ext-mo-1",
+            None,
+        )
+        .await
+        .expect("provision verified external user");
+    assert!(email_verified_of(&pool, uid).await, "starts verified");
+
+    let flipped = repo
+        .link_verified_external_identity(uid, pid, "ext-mo-2", Some("mo@corp.com"), None)
+        .await
+        .expect("link a second identity");
+
+    assert!(!flipped, "already verified → no upgrade to report");
+    assert!(
+        email_verified_of(&pool, uid).await,
+        "and it stays verified"
+    );
+    assert_eq!(
+        repo.find_user_by_auth_link(pid, "ext-mo-2").await.unwrap(),
+        Some(uid),
+        "the link is still created"
+    );
+
+    drop_db(&db).await;
+}
+
+/// Atomicity: the link INSERT and the verification UPDATE are one transaction,
+/// so a failing link (duplicate `(provider_id, external_id)`) must leave the
+/// user's `email_verified` untouched rather than half-applying.
+#[tokio::test]
+async fn a_failed_link_rolls_back_the_verification() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+    let pid = provider_id();
+
+    // Take the (provider_id, external_id) slot with a DIFFERENT user.
+    let squatter = repo
+        .create_local_user_with_default_group("nina", "nina@corp.com", None, None)
+        .await
+        .unwrap();
+    repo.link_verified_external_identity(squatter.id, pid, "ext-taken", None, None)
+        .await
+        .expect("first link");
+
+    let victim = repo
+        .create_local_user_with_default_group("omar", "omar@corp.com", None, None)
+        .await
+        .unwrap();
+    // Same external id → unique violation on the INSERT, so the whole tx
+    // (including the UPDATE that would have verified omar) must roll back.
+    let err = repo
+        .link_verified_external_identity(victim.id, pid, "ext-taken", Some("omar@corp.com"), None)
+        .await;
+    assert!(err.is_err(), "duplicate external identity must fail");
+    assert!(
+        !email_verified_of(&pool, victim.id).await,
+        "a rolled-back link must not leave the user verified"
+    );
+
+    drop_db(&db).await;
+}
+
 #[tokio::test]
 async fn create_external_user_with_link_gets_default_group() {
     let (pool, db) = fresh_db().await;

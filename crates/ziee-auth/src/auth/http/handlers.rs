@@ -1816,7 +1816,7 @@ pub async fn link_account(
     // ownership. So the provider's proof carries over to the local row:
     // link the identity and mark the email verified, atomically. The
     // repository re-checks the address match at the write.
-    let email_now_verified = ctx.auth()
+    let verification_upgraded = ctx.auth()
         .link_verified_external_identity(
             user.id,
             pending.provider_id,
@@ -1841,11 +1841,15 @@ pub async fn link_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // `user` was read BEFORE the link write, so its `email_verified` is
-    // stale when the link just verified it. Reflect the flip we made
-    // rather than returning a snapshot that contradicts the DB — the
-    // client renders the verified tag straight from this response.
+    // stale when the link just verified it. Reflect the upgrade we made
+    // rather than returning a payload that contradicts the row we just
+    // wrote. (Today's web client happens to refetch /auth/me right after
+    // this, so it would self-correct — but a response that lies about
+    // state it just changed is a trap for the next consumer.)
+    // `verification_upgraded` is the DELTA, not the resulting state: an
+    // already-verified user upgrades nothing and keeps its own `true`.
     let mut user = user;
-    if email_now_verified {
+    if verification_upgraded {
         user.email_verified = true;
     }
 

@@ -142,13 +142,15 @@ impl AuthRepository {
     }
 
     /// Create a user auth link including the provider's email + raw
-    /// claims. Used by the social-login provisioning + First-Broker-Link
-    /// flows. Use this in preference to the bare `create_auth_link`
-    /// when you have the email/claims at hand.
+    /// claims, WITHOUT touching the target user's `email_verified`.
     ///
-    /// Prefer [`Self::link_verified_external_identity`] when the provider
-    /// ASSERTED the external email as verified — it additionally marks
-    /// the target user's email verified, atomically with the link.
+    /// Currently has no in-tree caller: the First-Broker-Link flow it
+    /// used to serve now uses [`Self::link_verified_external_identity`],
+    /// which additionally marks the matching email verified, atomically
+    /// with the link. Kept because it is `pub` on an SDK crate other
+    /// applications consume. Prefer the verifying variant for any
+    /// provider-asserted identity; reach for this one only to bind an
+    /// identity whose email the provider did NOT vouch for.
     pub async fn create_auth_link_with_data(
         &self,
         user_id: Uuid,
@@ -187,11 +189,14 @@ impl AuthRepository {
     /// The `lower(email) = lower($2)` guard re-states that invariant AT
     /// THE WRITE rather than trusting the caller — a mismatched (or
     /// absent) `external_email` links the identity but leaves
-    /// `email_verified` alone. `AND email_verified = false` keeps the
-    /// UPDATE a no-op for already-verified users (no pointless
-    /// `updated_at` churn from the `update_users_updated_at` trigger).
+    /// `email_verified` alone.
     ///
-    /// Returns whether the user's `email_verified` was flipped.
+    /// Returns the DELTA, not the resulting state: `true` only when this
+    /// call flipped the column. An already-verified user returns `false`
+    /// because `AND email_verified = false` makes the UPDATE a no-op
+    /// (which also avoids pointless `updated_at` churn from the
+    /// `update_users_updated_at` trigger). Callers wanting the resulting
+    /// state must OR it with what they already knew.
     pub async fn link_verified_external_identity(
         &self,
         user_id: Uuid,
@@ -223,7 +228,13 @@ impl AuthRepository {
             SET email_verified = true, updated_at = NOW()
             WHERE id = $1
               AND email_verified = false
-              AND lower(email) = lower($2)
+              -- Spelled out rather than leaning on `= NULL` evaluating to
+              -- NULL: "no external email ⇒ never verify" is a rule, not a
+              -- side effect of three-valued logic. (The ::text casts are
+              -- required — a bare `$2 IS NOT NULL` leaves the parameter
+              -- type uninferable.)
+              AND $2::text IS NOT NULL
+              AND lower(email) = lower($2::text)
             RETURNING id
             "#,
             user_id,
@@ -302,13 +313,21 @@ impl AuthRepository {
     /// email-collision check on retry refuses to provision).
     /// Returns the new user_id.
     ///
-    /// `email_verified` must describe THE `email` PASSED HERE — it is the
-    /// provider's assertion about that exact address, not a general
-    /// trust level for the identity. The caller computes it from the
-    /// provider claims (OIDC `email_verified`); it is threaded rather
-    /// than assumed so the row stays honest if the callers' upstream
-    /// guards ever change. A signup with no provider-verified email
-    /// must pass `false`.
+    /// `email_verified` is the caller's assertion about THE `email`
+    /// PASSED HERE — not a general trust level for the identity. It is
+    /// threaded rather than assumed so the row stays honest if a
+    /// caller's upstream guards ever change; a signup with no
+    /// provider-verified email must pass `false`.
+    ///
+    /// CAVEAT the caller owns: the OIDC `email_verified` claim is read
+    /// from a fixed key, while which claim becomes `email` is
+    /// admin-configurable per provider (`attribute_mapping.email`). An
+    /// operator who maps `email` to some OTHER claim (e.g. `upn`) makes
+    /// the verdict describe a different address than the one stored.
+    /// This predates the flag being persisted, and the same pairing
+    /// already drives the callback's drop-unverified-email guard — but
+    /// it is a real limit on what `true` here proves, so do not treat
+    /// this column as an authorization input without tightening that.
     pub async fn provision_external_user_atomic(
         &self,
         username: &str,
