@@ -370,11 +370,18 @@ async fn linking_an_already_verified_user_reports_no_upgrade() {
     drop_db(&db).await;
 }
 
-/// Atomicity: the link INSERT and the verification UPDATE are one transaction,
-/// so a failing link (duplicate `(provider_id, external_id)`) must leave the
-/// user's `email_verified` untouched rather than half-applying.
+/// A link that cannot be created must not verify anyone: a duplicate
+/// `(provider_id, external_id)` fails the INSERT, and the caller's email stays
+/// unverified.
+///
+/// Note what this does and does NOT prove. The INSERT runs first and its `?`
+/// returns early, so the UPDATE never executes on this path — the assertion
+/// would also hold for two separate non-transactional statements. It pins the
+/// ORDERING guarantee (no verification without a link), not the transaction.
+/// Proving rollback would need the UPDATE to fail after a successful INSERT,
+/// which no reachable input produces.
 #[tokio::test]
-async fn a_failed_link_rolls_back_the_verification() {
+async fn a_failed_link_verifies_nobody() {
     let (pool, db) = fresh_db().await;
     let repo = AuthRepository::new(pool.clone());
     let pid = provider_id();
@@ -392,15 +399,15 @@ async fn a_failed_link_rolls_back_the_verification() {
         .create_local_user_with_default_group("omar", "omar@corp.com", None, None)
         .await
         .unwrap();
-    // Same external id → unique violation on the INSERT, so the whole tx
-    // (including the UPDATE that would have verified omar) must roll back.
+    // Same external id → unique violation on the INSERT, which aborts before
+    // the verification UPDATE can run.
     let err = repo
         .link_verified_external_identity(victim.id, pid, "ext-taken", Some("omar@corp.com"), None)
         .await;
     assert!(err.is_err(), "duplicate external identity must fail");
     assert!(
         !email_verified_of(&pool, victim.id).await,
-        "a rolled-back link must not leave the user verified"
+        "a link that failed must not leave the user verified"
     );
 
     drop_db(&db).await;

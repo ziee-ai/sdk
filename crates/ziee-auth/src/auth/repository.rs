@@ -230,9 +230,9 @@ impl AuthRepository {
               AND email_verified = false
               -- Spelled out rather than leaning on `= NULL` evaluating to
               -- NULL: "no external email ⇒ never verify" is a rule, not a
-              -- side effect of three-valued logic. (The ::text casts are
-              -- required — a bare `$2 IS NOT NULL` leaves the parameter
-              -- type uninferable.)
+              -- side effect of three-valued logic. (Both occurrences are
+              -- cast for symmetry; the parameter's type comes from the
+              -- `lower()` call below either way.)
               AND $2::text IS NOT NULL
               AND lower(email) = lower($2::text)
             RETURNING id
