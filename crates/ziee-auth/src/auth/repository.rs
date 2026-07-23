@@ -145,6 +145,10 @@ impl AuthRepository {
     /// claims. Used by the social-login provisioning + First-Broker-Link
     /// flows. Use this in preference to the bare `create_auth_link`
     /// when you have the email/claims at hand.
+    ///
+    /// Prefer [`Self::link_verified_external_identity`] when the provider
+    /// ASSERTED the external email as verified — it additionally marks
+    /// the target user's email verified, atomically with the link.
     pub async fn create_auth_link_with_data(
         &self,
         user_id: Uuid,
@@ -169,6 +173,69 @@ impl AuthRepository {
         .map_err(AppError::database_error)?;
 
         Ok(())
+    }
+
+    /// Bind a PROVIDER-VERIFIED external identity to an existing user,
+    /// and mark that user's email verified — both in ONE transaction.
+    ///
+    /// This is the First-Broker-Login confirmation write. The provider
+    /// asserted `external_email` as verified, and the FBL flow only ever
+    /// reaches here because that address matched this user's email, so
+    /// the identity proof carries over to the local row: an account the
+    /// user has now demonstrably received mail at is verified.
+    ///
+    /// The `lower(email) = lower($2)` guard re-states that invariant AT
+    /// THE WRITE rather than trusting the caller — a mismatched (or
+    /// absent) `external_email` links the identity but leaves
+    /// `email_verified` alone. `AND email_verified = false` keeps the
+    /// UPDATE a no-op for already-verified users (no pointless
+    /// `updated_at` churn from the `update_users_updated_at` trigger).
+    ///
+    /// Returns whether the user's `email_verified` was flipped.
+    pub async fn link_verified_external_identity(
+        &self,
+        user_id: Uuid,
+        provider_id: Uuid,
+        external_id: &str,
+        external_email: Option<&str>,
+        external_data: Option<&serde_json::Value>,
+    ) -> Result<bool, AppError> {
+        let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO user_auth_links (user_id, provider_id, external_id, external_email, external_data, created_at, last_login_at)
+            VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+            "#,
+            user_id,
+            provider_id,
+            external_id,
+            external_email,
+            external_data,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::database_error)?;
+
+        let verified = sqlx::query!(
+            r#"
+            UPDATE users
+            SET email_verified = true, updated_at = NOW()
+            WHERE id = $1
+              AND email_verified = false
+              AND lower(email) = lower($2)
+            RETURNING id
+            "#,
+            user_id,
+            external_email,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(AppError::database_error)?
+        .is_some();
+
+        tx.commit().await.map_err(AppError::database_error)?;
+        Ok(verified)
     }
 
     /// Bump `last_login_at` on an existing user_auth_links row.
@@ -234,10 +301,19 @@ impl AuthRepository {
     /// can't local-login, no auth_link → can't social-login,
     /// email-collision check on retry refuses to provision).
     /// Returns the new user_id.
+    ///
+    /// `email_verified` must describe THE `email` PASSED HERE — it is the
+    /// provider's assertion about that exact address, not a general
+    /// trust level for the identity. The caller computes it from the
+    /// provider claims (OIDC `email_verified`); it is threaded rather
+    /// than assumed so the row stays honest if the callers' upstream
+    /// guards ever change. A signup with no provider-verified email
+    /// must pass `false`.
     pub async fn provision_external_user_atomic(
         &self,
         username: &str,
         email: Option<&str>,
+        email_verified: bool,
         display_name: &str,
         provider_id: Uuid,
         external_id: &str,
@@ -248,10 +324,10 @@ impl AuthRepository {
 
         sqlx::query!(
             r#"
-            INSERT INTO users (id, username, email, display_name, is_active, is_admin, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, true, false, NOW(), NOW())
+            INSERT INTO users (id, username, email, email_verified, display_name, is_active, is_admin, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, true, false, NOW(), NOW())
             "#,
-            new_user_id, username, email, display_name,
+            new_user_id, username, email, email_verified, display_name,
         )
         .execute(&mut *tx)
         .await
