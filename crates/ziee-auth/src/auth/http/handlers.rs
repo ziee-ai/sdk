@@ -1498,10 +1498,19 @@ async fn oauth_complete_inner(
     // unique-collision race on the auth_link) used to leave a
     // password-less orphan that locked the user out forever —
     // re-login would trip the email-collision branch and refuse.
+    // Persist the provider's verification verdict for THIS email. The
+    // guard above drops any email the provider didn't assert as
+    // verified, and the `OAUTH_EMAIL_REQUIRED` branch then refuses to
+    // provision without one — so this is `true` on every reachable path
+    // today. Threading the computed value rather than hardcoding `true`
+    // keeps the row honest if either guard is ever relaxed.
+    let email_verified = email_verified_from_auth_result(&auth_result);
+
     let new_user_id = ctx.auth()
         .provision_external_user_atomic(
             &username,
             Some(email.as_str()),
+            email_verified,
             &display_name,
             provider_id,
             &auth_result.external_id,
@@ -1801,8 +1810,14 @@ pub async fn link_account(
         ));
     }
 
-    ctx.auth()
-        .create_auth_link_with_data(
+    // The pending link only exists because the provider asserted this
+    // email verified AND it matched this user's address (the FBL branch
+    // in `oauth_callback`), and the password just proved account
+    // ownership. So the provider's proof carries over to the local row:
+    // link the identity and mark the email verified, atomically. The
+    // repository re-checks the address match at the write.
+    let verification_upgraded = ctx.auth()
+        .link_verified_external_identity(
             user.id,
             pending.provider_id,
             &pending.external_id,
@@ -1824,6 +1839,19 @@ pub async fn link_account(
     let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // `user` was read BEFORE the link write, so its `email_verified` is
+    // stale when the link just verified it. Reflect the upgrade we made
+    // rather than returning a payload that contradicts the row we just
+    // wrote. (Today's web client happens to refetch /auth/me right after
+    // this, so it would self-correct — but a response that lies about
+    // state it just changed is a trap for the next consumer.)
+    // `verification_upgraded` is the DELTA, not the resulting state: an
+    // already-verified user upgrades nothing and keeps its own `true`.
+    let mut user = user;
+    if verification_upgraded {
+        user.email_verified = true;
+    }
 
     Ok(token_response(&headers, StatusCode::OK, minted, |tokens| {
         AuthResponse { user, tokens }
