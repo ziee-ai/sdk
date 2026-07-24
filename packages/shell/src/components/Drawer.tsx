@@ -2,7 +2,7 @@ import * as React from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { Button, Title } from '@ziee/kit'
 import { cn } from '@ziee/kit/lib/utils'
-import { IoIosArrowBack } from 'react-icons/io'
+import { ChevronLeft } from 'lucide-react'
 import { ResizeHandle } from './ResizeHandle'
 import { DivScrollY } from './DivScrollY'
 import { useWindowMinSize } from '../hooks/useWindowMinSize'
@@ -277,7 +277,7 @@ export const Drawer: React.FC<DrawerProps> = ({
                   the same back-arrow icon, where the right side read wrong.) */}
               {closable && (
                 <Button variant="ghost" size="icon" tooltip="Close" aria-label="Close drawer" onClick={onClose} className="w-[30px]" data-testid="layout-drawer-close-button">
-                  <span className="text-xl"><IoIosArrowBack aria-hidden="true" /></span>
+                  <span className="text-xl"><ChevronLeft size="1em" aria-hidden="true" /></span>
                 </Button>
               )}
               {typeof title === 'string' ? (
