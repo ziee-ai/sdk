@@ -32,7 +32,7 @@ export const DivScrollY = forwardRef<
   // depend on the app's app-layout store type; runtime is identical to reading
   // `Stores.AppLayout` directly.
   const { nativeScroll } =
-    (appLayoutSeam.get() as { nativeScroll?: boolean } | undefined) ??
+    (appLayoutSeam.peek() as { nativeScroll?: boolean } | null) ??
     {}
 
   if (nativeFlow && nativeScroll) {

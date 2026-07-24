@@ -34,7 +34,14 @@ export const HeaderBarContainer = ({
   className = '',
   style = {},
 }: HeaderBarContainerProps) => {
-  const appLayout = (appLayoutSeam.get() as HeaderBarSeam)
+  // Optional read: the header can render store-LESS (an isolated gallery
+  // overlay, a layout-less route). `nativeScroll` is an opt-in mobile flag, so
+  // fall back to a plain (non-native-scroll) header + no-op hide rather than
+  // throwing.
+  const appLayout = (appLayoutSeam.peek() as HeaderBarSeam | null) ?? {
+    nativeScroll: false,
+    setHeaderHidden: () => {},
+  }
   const { nativeScroll } = appLayout
   const headerLeftInset = useHeaderLeftInset()
 

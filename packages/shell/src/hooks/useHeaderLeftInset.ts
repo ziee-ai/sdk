@@ -20,8 +20,10 @@ interface InsetSeam {
  * app-side `.desktop` override adds the macOS traffic-light clearance (118).
  */
 export function useHeaderLeftInset(): number {
-  const { isSidebarCollapsed } = (
-    { AppLayout: appLayoutSeam.get() as InsetSeam }
-  ).AppLayout
+  // Optional read: a header can render in a store-LESS context (an isolated
+  // gallery overlay, a layout-less route) where the AppLayout seam is absent.
+  // Fall back to the not-collapsed inset rather than throwing.
+  const isSidebarCollapsed =
+    (appLayoutSeam.peek() as InsetSeam | null)?.isSidebarCollapsed ?? false
   return isSidebarCollapsed ? 48 : 12
 }

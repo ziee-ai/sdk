@@ -28,7 +28,7 @@ export function SettingsPageContainer({
   // (the dev gallery) rather than crashing. Runtime matches reading
   // `Stores.AppLayout.nativeScroll` directly.
   const nativeScroll =
-    (appLayoutSeam.get() as { nativeScroll?: boolean } | undefined)
+    (appLayoutSeam.peek() as { nativeScroll?: boolean } | null)
       ?.nativeScroll ?? false
 
   // Vertical spacing notes:

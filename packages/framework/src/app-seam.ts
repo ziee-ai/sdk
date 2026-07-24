@@ -16,6 +16,7 @@
 export function createAppStoreSeam<T>(name: string): {
   set: (view: T) => void
   get: () => T
+  peek: () => T | null
 } {
   let injected: T | null = null
   return {
@@ -30,6 +31,13 @@ export function createAppStoreSeam<T>(name: string): {
       }
       return injected
     },
+    // Non-throwing read for consumers that legitimately render in a store-LESS
+    // context (an isolated overlay in the dev gallery, or a layout-less route)
+    // and degrade gracefully when the seam is absent. `get()` stays the loud
+    // boot-critical read (the router's Routes seam MUST be present); `peek()` is
+    // the opt-in "the store may not be here yet, and that's fine" read that the
+    // optional shell chrome (DivScrollY/SettingsPageContainer/HeaderBar) uses.
+    peek: (): T | null => injected,
   }
 }
 
