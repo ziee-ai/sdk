@@ -17,11 +17,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Compose `merged_dir` = the UNION of every `*/migrations/` dir found directly
-/// under each `module_root`. Wipes + recreates `merged_dir`, guards against
-/// basename collisions across modules (a duplicate migration filename would
-/// silently drop one), and copies each `.sql` in. Emits `cargo:rerun-if-changed`
-/// for every root, every source dir, and the merged dir so cargo re-runs the
-/// build when any migration changes.
+/// under each `module_root`. CONTENT-STABLE: creates `merged_dir` if missing,
+/// guards against basename collisions across modules (a duplicate migration
+/// filename would silently drop one), writes each `.sql` only when its bytes
+/// differ, and deletes only merged files no longer in the composed set — so a
+/// no-op build leaves the dir + file mtimes untouched. Emits
+/// `cargo:rerun-if-changed` for every root, every source dir, and the merged dir
+/// so cargo re-runs the build when any migration ACTUALLY changes (but not
+/// spuriously on every build).
 ///
 /// `merged_dir` is a generated artifact (gitignored). `build.rs` always runs
 /// before the crate compiles, so the dir is populated before the runtime
@@ -60,7 +63,16 @@ pub fn compose_merged_migrations_from(
     app_module_roots: &[PathBuf],
     sdk_crate_migration_dirs: &[PathBuf],
 ) {
-    let _ = std::fs::remove_dir_all(merged_dir);
+    // CONTENT-STABLE compose (no wipe-and-recreate). The merged dir is declared
+    // `cargo:rerun-if-changed` (below + in build.rs), and cargo watches a
+    // DIRECTORY by its OWN mtime. The old `remove_dir_all` + unconditional
+    // `std::fs::copy` gave the dir AND every file a fresh mtime on EVERY build,
+    // so build.rs re-dirtied its own watched input AFTER cargo captured the
+    // fingerprint → a spurious full recompile of the crate on every no-op build.
+    // Instead we create the dir if missing, write each file only when its bytes
+    // actually differ (unchanged files keep their mtime), and delete only files
+    // that are no longer in the composed set. A true no-op build touches nothing,
+    // so the dir mtime is stable and cargo stays Fresh.
     std::fs::create_dir_all(merged_dir).expect("build.rs: create migrations-merged failed");
 
     // Glob every `migrations` dir under each app module root. A root that has no
@@ -93,7 +105,8 @@ pub fn compose_merged_migrations_from(
     sources.sort();
 
     // Guard against basename collisions across modules (two modules must never
-    // ship the same migration filename — it would silently drop one).
+    // ship the same migration filename — it would silently drop one). `seen`
+    // doubles as the set of composed basenames for the delete-removed step.
     let mut seen: HashMap<String, PathBuf> = HashMap::new();
     for src in &sources {
         println!("cargo:rerun-if-changed={}", src.display());
@@ -119,12 +132,51 @@ pub fn compose_merged_migrations_from(
                     );
                 }
                 let dst = merged_dir.join(name);
-                std::fs::copy(&path, &dst).unwrap_or_else(|e| {
-                    panic!("build.rs: copy {} → merged failed: {}", path.display(), e)
+                // Write-on-diff: only touch the destination when its bytes differ
+                // (or it's missing). An unchanged migration is NOT rewritten, so
+                // its mtime is preserved and the merged dir stays Fresh.
+                let src_bytes = std::fs::read(&path).unwrap_or_else(|e| {
+                    panic!("build.rs: read migration {} failed: {}", path.display(), e)
+                });
+                let needs_write = match std::fs::read(&dst) {
+                    Ok(existing) => existing != src_bytes,
+                    Err(_) => true, // missing (or unreadable) → write
+                };
+                if needs_write {
+                    std::fs::write(&dst, &src_bytes).unwrap_or_else(|e| {
+                        panic!("build.rs: write {} → merged failed: {}", dst.display(), e)
+                    });
+                }
+            }
+        }
+    }
+
+    // Mirror a REMOVED source migration: delete any `.sql` in the merged dir that
+    // is no longer in the composed set. Done by name so unchanged files are never
+    // touched (deleting a file that IS in the set would churn the dir mtime).
+    // Non-`.sql` files are left alone (the compose only ever writes `.sql`).
+    if let Ok(entries) = std::fs::read_dir(merged_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("sql") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !seen.contains_key(&name) {
+                std::fs::remove_file(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "build.rs: remove stale merged migration {} failed: {}",
+                        path.display(),
+                        e
+                    )
                 });
             }
         }
     }
+
     println!("cargo:rerun-if-changed={}", merged_dir.display());
 }
 
@@ -185,12 +237,13 @@ mod tests {
     }
 
     #[test]
-    fn merged_dir_is_wiped_before_recompose() {
+    fn stale_merged_migration_is_removed_by_name() {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("modules");
         write_module_migration(&app_root, "foo", "00000000000001_foo_init.sql", "-- foo");
         let merged = tmp.path().join("merged");
-        // Seed a stale file that a prior compose would have left behind.
+        // Seed a stale file that a prior compose would have left behind (a source
+        // migration that was since removed).
         fs::create_dir_all(&merged).unwrap();
         fs::write(merged.join("99999999999999_stale.sql"), "-- stale").unwrap();
 
@@ -199,7 +252,75 @@ mod tests {
         assert_eq!(
             sorted_merged_names(&merged),
             vec!["00000000000001_foo_init.sql".to_string()],
-            "stale file must be removed by the wipe-and-recreate"
+            "a merged .sql no longer in the composed set must be deleted by name"
+        );
+    }
+
+    /// TEST-1: a no-op recompose (unchanged sources) must NOT rewrite any merged
+    /// file — the file mtimes are preserved. This is the mechanism that keeps
+    /// `migrations-merged`'s directory mtime stable so cargo stops spuriously
+    /// recompiling the crate on every build.
+    #[test]
+    fn recompose_over_unchanged_sources_preserves_file_mtimes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("modules");
+        write_module_migration(&app_root, "foo", "00000000000001_foo_init.sql", "-- foo");
+        write_module_migration(&app_root, "bar", "00000000000002_bar_init.sql", "-- bar");
+        let merged = tmp.path().join("merged");
+
+        compose_merged_migrations(&merged, &[app_root.clone()]);
+        let f1 = merged.join("00000000000001_foo_init.sql");
+        let f2 = merged.join("00000000000002_bar_init.sql");
+        let m1 = fs::metadata(&f1).unwrap().modified().unwrap();
+        let m2 = fs::metadata(&f2).unwrap().modified().unwrap();
+        // The DIRECTORY mtime is what cargo's `rerun-if-changed=<dir>` watch
+        // actually keys on (a dir mtime advances only on entry add/remove/rename).
+        let dir_m = fs::metadata(&merged).unwrap().modified().unwrap();
+
+        // Sleep so a *rewrite* / dir mutation would produce a strictly different
+        // mtime on any filesystem with >=1s granularity — then recompose unchanged.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        compose_merged_migrations(&merged, &[app_root]);
+
+        assert_eq!(
+            fs::metadata(&f1).unwrap().modified().unwrap(),
+            m1,
+            "unchanged migration must not be rewritten (mtime preserved)"
+        );
+        assert_eq!(
+            fs::metadata(&f2).unwrap().modified().unwrap(),
+            m2,
+            "unchanged migration must not be rewritten (mtime preserved)"
+        );
+        // The load-bearing invariant: the merged DIR mtime is unchanged across a
+        // no-op recompose (no entry added/removed) — this is precisely why cargo
+        // stops spuriously recompiling the consuming crate.
+        assert_eq!(
+            fs::metadata(&merged).unwrap().modified().unwrap(),
+            dir_m,
+            "no-op recompose must not touch the merged dir mtime (cargo watches it)"
+        );
+    }
+
+    /// TEST-3 (changed-content leg): a source whose BYTES changed IS rewritten,
+    /// and the merged copy reflects the new content verbatim.
+    #[test]
+    fn recompose_rewrites_only_changed_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("modules");
+        write_module_migration(&app_root, "foo", "00000000000001_foo_init.sql", "-- foo v1");
+        let merged = tmp.path().join("merged");
+        compose_merged_migrations(&merged, &[app_root.clone()]);
+        let dst = merged.join("00000000000001_foo_init.sql");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "-- foo v1");
+
+        // Change the source bytes and recompose.
+        write_module_migration(&app_root, "foo", "00000000000001_foo_init.sql", "-- foo v2");
+        compose_merged_migrations(&merged, &[app_root]);
+        assert_eq!(
+            fs::read_to_string(&dst).unwrap(),
+            "-- foo v2",
+            "changed source content must be written through to the merged copy"
         );
     }
 
