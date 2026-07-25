@@ -37,6 +37,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { enumerateSurfaces } from './lib/gallery-surfaces.mjs'
 import { resolveGalleryConfig } from './lib/gallery-config.mjs'
+import { resolveGalleryPort } from './lib/run-key.mjs'
 
 // Config-driven anchors (was `../src/dev/gallery` + `runtime-baseline.js` +
 // port 1420 hardcodes). Resolved from `gallery.config.json` in the app's cwd.
@@ -60,7 +61,19 @@ const arg = (n, d) =>
     .join('=')
 const flag = n => process.argv.includes(`--${n}`)
 
-const PORT = process.env.GALLERY_PORT || String(CFG.port)
+// gate-ui always passes GALLERY_PORT (the finalized, bind-verified port), so it
+// and its runtime-health child agree. Standalone, derive the same key-based port
+// (CFG.port is null → key-derived; never the old fixed 1420).
+const PORT =
+  process.env.GALLERY_PORT ||
+  String(
+    resolveGalleryPort({
+      env: undefined,
+      cfgPort: CFG.port ?? null,
+      which: CFG.portWhich || 'webGallery',
+      cwd: CFG.__cwd,
+    }),
+  )
 const BASE = arg('url', `http://localhost:${PORT}${CFG.galleryUrl}`)
 const OUT = arg('out', GALLERY_DIR)
 const STATES = arg('states', 'loaded,empty,error').split(',').filter(Boolean)

@@ -42,8 +42,15 @@ const DEFAULTS = {
    * `@ziee/kit/testIds.generated`); `null` = the historical in-app default
    * `<srcDir>/components/ui/testIds.generated.ts`. */
   testidOut: null,
-  /** Dev-server port for the gate + runtime passes. */
-  port: 1420,
+  /** Dev-server port for the gate + runtime passes. `null` = derive a
+   *  per-worktree, bind-checked port from the unified run key (audit §7 — no
+   *  fixed 1420). An app may still pin an explicit number, and GALLERY_PORT
+   *  always overrides. */
+  port: null,
+  /** Which PORT_FLOORS range the key-derived port searches from (run-key.mjs).
+   *  Web uses `webGallery`; the desktop workspace sets `desktopGallery` so the
+   *  two never collide. */
+  portWhich: 'webGallery',
   /** Standalone gallery URL. */
   galleryUrl: '/gallery.html',
   /** Prod-exclusion marker (must equal the marker `@ziee/gallery` emits). */
