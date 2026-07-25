@@ -210,9 +210,22 @@ function OverlayFrame({ entry }: { entry: OverlayEntry }) {
         label={`overlay-${entry.slug}`}
         fallback={galleryCrashFallback(`overlay-${entry.slug}`)}
       >
-        <Suspense fallback={<Loading />}>
-          <Component />
-        </Suspense>
+        {/*
+          Overlays render inside a MemoryRouter — the real app ALWAYS mounts a
+          drawer/dialog inside the app Router, so any overlay that calls
+          useNavigate / useLocation / <Link> (e.g. ProviderApiKeyModal,
+          WorkflowDetailDrawer's Edit affordance) throws
+          "useNavigate() may be used only in the context of a <Router>" without
+          one. Every OTHER frame here (PageFrame/DeepStateFrame/
+          SeededSurfaceFrame) already wraps in a MemoryRouter; OverlayFrame was
+          the lone exception. This makes overlays render as they do in the app
+          and removes the per-overlay `*Routed` fixtures workaround.
+        */}
+        <MemoryRouter>
+          <Suspense fallback={<Loading />}>
+            <Component />
+          </Suspense>
+        </MemoryRouter>
       </ErrorBoundary>
     </section>
   )
