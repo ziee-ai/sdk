@@ -167,8 +167,7 @@ export interface FileUploadProgressCallback {
 // STAYS `async`: an async function body turns a synchronous throw into a
 // REJECTION, which is the contract every caller relies on
 // (`ApiClient.X.y(...).catch(...)`). The pre-flight work below can genuinely
-// throw — `params instanceof FormData` in a runtime with no global `FormData`
-// (SSR/node), an app-injected token provider that throws, a `localStorage` read
+// throw — an app-injected token provider that throws, a `localStorage` read
 // refused in a sandboxed iframe — so it must run inside the async body.
 export const callAsync = async <TResponse = unknown>(
   endpointUrl: string,
@@ -176,6 +175,13 @@ export const callAsync = async <TResponse = unknown>(
   callbacks?: {
     SSE?: SSECallback<TResponse>
     fileUploadProgress?: FileUploadProgressCallback
+    /** Opt OUT of in-flight GET coalescing for this one call. For a read that
+     *  must genuinely reach the server every time (a one-shot nonce, a poll whose
+     *  point is the round-trip, a GET with a server-side side effect). Coalescing
+     *  is otherwise on for every plain GET, and this is the only escape hatch —
+     *  the transport is shared by three applications, so a caller with a reason
+     *  must be able to decline without editing it. */
+    noCoalesce?: boolean
   },
 ): Promise<TResponse> => {
   // ── In-flight GET coalescing (see ./inflight.ts) ──────────────────────────
@@ -185,17 +191,19 @@ export const callAsync = async <TResponse = unknown>(
   //                two subscribers sharing a response body would starve one;
   //   - FormData — an upload is a mutation and carries non-comparable payloads.
   const isGet = endpointUrl.startsWith('GET ')
-  const joinable = isGet && !callbacks?.SSE && !isFormData(params)
+  const joinable =
+    isGet && !callbacks?.SSE && !callbacks?.noCoalesce && !isFormData(params)
   if (!joinable) return performCall<TResponse>(endpointUrl, params, callbacks)
 
-  // The key is the RESOLVED ORIGIN + the endpoint template + its params (the
-  // path/query is a pure function of the latter two) + the caller's identity.
-  // The origin matters on desktop, where it is a dynamic Tauri port that can
-  // change across a server restart — without it, a caller after the change
-  // could join a response fetched against the OLD host.
+  // The key is the endpoint template + its params (the resolved path/query is a
+  // pure function of those) + the caller's identity. The resolved ORIGIN is NOT
+  // in the key, deliberately: both `getBaseURL` implementations memoize it in a
+  // module-scoped promise for the page's lifetime, so it cannot change mid-session
+  // and adding it would only cost every joinable GET an extra resolver await
+  // before the in-flight map is consulted.
   const key = inflightKey(
     'GET',
-    `${await getBaseUrl()}|${endpointUrl}|${stableParams(params)}`,
+    `${endpointUrl}|${stableParams(params)}`,
     getAuthToken(),
   )
   return coalesce(key, () => performCall<TResponse>(endpointUrl, params, callbacks))
@@ -258,13 +266,14 @@ const performCall = async <TResponse = unknown>(
   if (counted) netRequestStart()
 
   try {
-    // Check if params is FormData for file uploads
-    const isFormData = params instanceof FormData
+    // Check if params is FormData for file uploads. Uses the guarded predicate —
+    // a bare `instanceof` throws where `FormData` is not defined (SSR / node).
+    const isFormDataBody = isFormData(params)
 
     let headers: Record<string, string> = {}
 
     // Don't set Content-Type for FormData - let browser set it with boundary
-    if (!isFormData) {
+    if (!isFormDataBody) {
       headers['Content-Type'] = 'application/json'
     }
 
@@ -304,7 +313,7 @@ const performCall = async <TResponse = unknown>(
     )
 
     // For FormData, we need to handle path parameters differently
-    if (isFormData) {
+    if (isFormDataBody) {
       // Replace {capture} with actual values from FormData entries
       captureMatches.forEach(capture => {
         const value = (params as FormData).get(capture.trim())
@@ -351,7 +360,7 @@ const performCall = async <TResponse = unknown>(
     // in the 2026-05 security pass), which return 422.
     let body: any = undefined
     if (['POST', 'PUT', 'PATCH'].includes(method) && params !== undefined) {
-      if (isFormData) {
+      if (isFormDataBody) {
         body = params as FormData
       } else if (captureMatches.length > 0 && typeof params === 'object') {
         const bodyParams: Record<string, unknown> = {}
@@ -370,7 +379,7 @@ const performCall = async <TResponse = unknown>(
     let abortController: AbortController | undefined = undefined
 
     // Use XMLHttpRequest for FormData uploads with progress tracking
-    if (isFormData && fileUploadProgress && body) {
+    if (isFormDataBody && fileUploadProgress && body) {
       response = await new Promise<Response>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
 

@@ -81,7 +81,7 @@ export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
 
       if (existingIndex !== -1) {
         // In development, allow re-registration for HMR
-        if (import.meta.env.DEV) {
+        if (isDev()) {
           console.log(
             `🔄 Re-registering module for HMR: ${module.metadata.name}`,
           )
@@ -99,9 +99,15 @@ export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
               // destroying + replacing it would tear down the LIVE instance every
               // consumer holds and install a second, independently ref-counted
               // one — the same double-`init` / double-`sync:*`-listener hazard
-              // the new-module branch below guards against. Stores whose proxy
-              // this registry created are still replaced, so HMR keeps working
-              // for them.
+              // the new-module branch below guards against.
+              //
+              // BE CLEAR ABOUT THE SCOPE: `registerLazyStore` routes EVERY
+              // store-kit-authored store through `registerStore`, so in practice
+              // this disables HMR destroy+replace for nearly all stores. That is
+              // the intended trade — a hot-reloaded module keeps its live store
+              // instance (state included) instead of silently acquiring a second
+              // lifecycle. Only the residual legacy `stores: [...]`-only stores,
+              // whose proxy this registry created, are still replaced.
               if (selfOwnedStores.has(reg.name)) return
 
               // Destroy old store instance before replacing (HMR cleanup)

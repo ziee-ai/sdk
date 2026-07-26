@@ -57,8 +57,18 @@ interface Entry {
  * request is still awaited by whoever issued it, but a later caller opens a
  * fresh one.
  *
- * Sized well above the transport's own worst case (a GET retry ladder is
- * ~6 s wall-clock) so it never splits a legitimately slow-but-progressing read.
+ * Sizing is a JUDGEMENT, not a derivation: the transport's retry ladder sleeps
+ * ~6 s in total, but the six `fetch()` attempts themselves are UNTIMED (nothing
+ * in this transport sets a fetch or connect timeout), so a slow-connect ladder or
+ * a multi-MB Blob download can exceed this bound. When it does, the only cost is
+ * a MISSED join — the late caller issues its own request, which is exactly the
+ * pre-coalescing behaviour. That is the safe direction, which is why the bound is
+ * generous rather than tight.
+ *
+ * KNOWN, UNFIXED HERE: a caller arriving INSIDE the window of a hung request
+ * inherits that hung wait instead of getting its own attempt. The real fix is a
+ * fetch timeout on the transport, which this branch does not add (it would change
+ * behaviour for every request in three applications, well beyond this feature).
  */
 export const MAX_JOIN_AGE_MS = 15_000
 
@@ -99,9 +109,17 @@ function fingerprint(value: string): string {
 }
 
 /**
- * Build the coalescing key for a read. Includes the identity fingerprint so a
- * login / user switch mid-flight can never hand user B a response fetched as
- * user A.
+ * Build the coalescing key for a read, folding in a fingerprint of the caller's
+ * token so a login / user switch cannot let one identity join a read issued under
+ * another. The fingerprint is a 32-bit FNV-1a fold, so this is a strong practical
+ * separation rather than a cryptographic guarantee; the token itself is never put
+ * in a map key, which could surface in a log or an error message.
+ *
+ * NOTE the token is read here and read again in the request builder, so a
+ * rotation between the two means the key records the credential at KEY time, not
+ * necessarily the one the request carried. Harmless for a same-user rotation (the
+ * response is for the same principal either way) and a cross-user switch changes
+ * the fingerprint, which is the case that matters.
  */
 export function inflightKey(
   method: string,
@@ -123,11 +141,14 @@ export function inflightKey(
 export function coalesce<T>(key: string, start: () => Promise<T>): Promise<T> {
   const now = Date.now()
   const existing = inFlight.get(key)
-  if (
-    existing &&
-    existing.epoch === fetchEpoch &&
-    now - existing.startedAt < MAX_JOIN_AGE_MS
-  ) {
+  if (existing && !isJoinable(existing, now)) {
+    // Evict it here rather than only refusing to join. Cleanup normally happens
+    // in the request's own `.finally()`, which by definition never runs for a
+    // socket that hangs — so without this the Map would retain one permanent
+    // entry per distinct hung read for the page's lifetime.
+    inFlight.delete(key)
+  }
+  if (existing && isJoinable(existing, now)) {
     // ALIASING GUARD: the issuer keeps the response it parsed; a joiner gets its
     // OWN copy. Without this, N callers would share one parsed object/array
     // instance, and a store that normalizes its response in place (`.sort()`,
@@ -146,6 +167,11 @@ export function coalesce<T>(key: string, start: () => Promise<T>): Promise<T> {
   })
   inFlight.set(key, { promise, epoch, startedAt: now })
   return promise
+}
+
+/** Joinable = same freshness epoch AND young enough (see MAX_JOIN_AGE_MS). */
+function isJoinable(entry: Entry, now: number): boolean {
+  return entry.epoch === fetchEpoch && now - entry.startedAt < MAX_JOIN_AGE_MS
 }
 
 /** Deep-copy a joined response so joiners never alias the issuer's object.

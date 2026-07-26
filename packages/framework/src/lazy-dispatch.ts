@@ -42,15 +42,27 @@ export interface LazyActionDispatcher {
   preload: () => Promise<void>
 }
 
+/**
+ * How many times a failed resolve is retried before the rejection is memoized.
+ *
+ * Clearing the memo on failure is what stops a transient chunk 404 / network blip
+ * bricking an action for the session. But `loadImpl` also runs the store's action
+ * FACTORY, and a throw from there is a deterministic authoring bug — retrying it
+ * forever would turn one bug into an unbounded loop for a component that
+ * dispatches from a render or an effect. One retry covers the transient case; the
+ * second failure is treated as deterministic and memoized, so the action fails
+ * fast and loudly from then on.
+ */
+const MAX_RESOLVE_RETRIES = 1
+
 export function createLazyDispatcher(loadImpl: ImplLoader): LazyActionDispatcher {
   let implPromise: Promise<(...args: any[]) => any> | null = null
+  let failures = 0
   const resolveImpl = () => {
     if (implPromise) return implPromise
     implPromise = loadImpl().catch(err => {
-      // Do NOT memoize a FAILED chunk load: a transient 404/network blip must
-      // not brick the action for the rest of the session. Clearing the memo
-      // lets the next call retry.
-      implPromise = null
+      failures++
+      if (failures <= MAX_RESOLVE_RETRIES) implPromise = null
       throw err
     })
     return implPromise
