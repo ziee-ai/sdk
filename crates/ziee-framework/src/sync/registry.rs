@@ -383,19 +383,18 @@ fn prune_closed_for_user_locked<P: Principal>(
         .collect();
     let n = dead.len();
     for cid in dead {
-        // Repair, not just remove: `remove_conn` is keyed off `clients`, so it
-        // no-ops on an orphan. Drop the index entry directly first so the
-        // orphan can never keep counting against the cap.
-        if !inner.clients.contains_key(&cid) {
-            if let Some(set) = inner.by_user.get_mut(&user_id) {
-                set.remove(&cid);
-                if set.is_empty() {
-                    inner.by_user.remove(&user_id);
-                }
-            }
-            continue;
-        }
+        // `remove_conn` is keyed off `clients`: it no-ops entirely when the row
+        // is missing (an orphan), and when `clients[cid].user_id` disagrees with
+        // `user_id` it would clean the OTHER user's index. So drop THIS user's
+        // index entry unconditionally as well — that is what actually guarantees
+        // the id stops counting against `user_id`'s cap, for every desync shape.
         remove_conn(inner, cid);
+        if let Some(set) = inner.by_user.get_mut(&user_id) {
+            set.remove(&cid);
+            if set.is_empty() {
+                inner.by_user.remove(&user_id);
+            }
+        }
     }
     if n > 0 {
         tracing::debug!("sync registry: reclaimed {n} dead connection(s) for one user");
@@ -966,12 +965,37 @@ mod tests {
             1,
             "the orphaned index entry must be counted as reclaimed"
         );
+        {
+            let inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                inner.by_user.get(&uid).is_none(),
+                "the orphan must actually be REMOVED from by_user (an emptied \
+                 user entry is dropped), otherwise it counts against the cap \
+                 forever"
+            );
+        }
+
+        // The other branch: an orphan ALONGSIDE a live connection. The user's
+        // index entry must SHRINK (not vanish), the live connection must be
+        // untouched, and `clients` must be left alone.
+        let (live, _live_rx) = conn(uid, principal(false, vec![]));
+        let live_id = Uuid::new_v4();
+        reg.register(live_id, live).unwrap();
+        let orphan2 = Uuid::new_v4();
+        {
+            let mut inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.by_user.entry(uid).or_default().insert(orphan2);
+        }
+
+        assert_eq!(reg.prune_closed_for_user(uid), 1, "only the orphan is freed");
         let inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            inner.by_user.get(&uid).is_none(),
-            "the orphan must actually be REMOVED from by_user (an emptied user \
-             entry is dropped), otherwise it counts against the cap forever"
-        );
+        let set = inner
+            .by_user
+            .get(&uid)
+            .expect("the user entry survives because a LIVE connection remains");
+        assert_eq!(set.len(), 1, "the index shrank to just the live connection");
+        assert!(set.contains(&live_id));
+        assert_eq!(inner.clients.len(), 1, "`clients` is left untouched");
     }
 
     /// TEST-9 — a sweep NEVER reclaims a live connection. Asserted on both the
