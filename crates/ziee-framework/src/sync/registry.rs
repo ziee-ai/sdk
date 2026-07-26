@@ -383,6 +383,18 @@ fn prune_closed_for_user_locked<P: Principal>(
         .collect();
     let n = dead.len();
     for cid in dead {
+        // Repair, not just remove: `remove_conn` is keyed off `clients`, so it
+        // no-ops on an orphan. Drop the index entry directly first so the
+        // orphan can never keep counting against the cap.
+        if !inner.clients.contains_key(&cid) {
+            if let Some(set) = inner.by_user.get_mut(&user_id) {
+                set.remove(&cid);
+                if set.is_empty() {
+                    inner.by_user.remove(&user_id);
+                }
+            }
+            continue;
+        }
         remove_conn(inner, cid);
     }
     if n > 0 {
@@ -925,6 +937,41 @@ mod tests {
         // A global sweep then reclaims B's.
         assert_eq!(reg.prune_closed(), 1);
         assert_eq!(reg.connection_count(), 1);
+    }
+
+    /// TEST-21 — the user-scoped sweep REPAIRS an orphaned index entry (an id
+    /// in `by_user` with no row in `clients`) rather than skipping it.
+    ///
+    /// `user_count` is derived from `by_user`, so an orphan would count against
+    /// the per-user cap forever and neither sweep could clear it — this sweep
+    /// would filter it out, and the global sweep iterates `clients`, where it
+    /// does not exist. That is precisely the permanently-429'd account this
+    /// module exists to prevent. The desync is unreachable today (both indexes
+    /// move together under one lock), which is exactly why it needs a test: the
+    /// repair is defensive code with no natural trigger.
+    #[test]
+    fn prune_closed_for_user_repairs_an_orphaned_index_entry() {
+        let reg = empty_registry();
+        let uid = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+
+        // Forge the desync: an id in `by_user` with no `clients` row.
+        {
+            let mut inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.by_user.entry(uid).or_default().insert(orphan);
+        }
+
+        assert_eq!(
+            reg.prune_closed_for_user(uid),
+            1,
+            "the orphaned index entry must be counted as reclaimed"
+        );
+        let inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            inner.by_user.get(&uid).is_none(),
+            "the orphan must actually be REMOVED from by_user (an emptied user \
+             entry is dropped), otherwise it counts against the cap forever"
+        );
     }
 
     /// TEST-9 — a sweep NEVER reclaims a live connection. Asserted on both the
