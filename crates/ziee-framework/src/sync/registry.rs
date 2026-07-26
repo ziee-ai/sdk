@@ -85,10 +85,13 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
     /// A cap is only ever charged for connections that are still ALIVE: before
     /// each cap check the corresponding set is swept of connections whose
     /// stream is gone (`prune_closed_locked`). Without that sweep a user whose
-    /// slots leaked would be refused forever — the other reapers (`deliver`'s
-    /// and `deliver_session_to_users`' send-failure prunes, and `unregister`)
-    /// all require either an event to deliver or a stream that terminated
-    /// normally, so a quiescent deployment could reclaim nothing.
+    /// slots leaked would be refused forever. The primary release path is the
+    /// subscribe handler's connection guard (`unregister` on drop), which since
+    /// the guard was hoisted out of the stream generator covers EVERY
+    /// termination including a never-polled stream; this sweep is the backstop
+    /// for any future path that loses the guard. The remaining reapers
+    /// (`deliver`'s and `deliver_session_to_users`' send-failure prunes) need an
+    /// event to deliver, so they reclaim nothing on a quiescent deployment.
     ///
     /// The sweep is deliberately on-demand rather than a background reaper: a
     /// stale slot's user-visible effect is a cap refusal, and the caps are
@@ -141,21 +144,6 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
     /// there is nothing left to bound. An idle-but-live stream (the normal state
     /// of a sync connection on a quiet deployment) is never touched.
     ///
-    /// **Deliberately NOT reclaimed: a connection that is merely OLD.** An
-    /// earlier revision also reaped connections past their token's `exp`, to
-    /// cover a peer that vanished without the socket ever erroring. That is
-    /// wrong: in exactly that case the stream future is not being polled (which
-    /// is *why* it outlived its own deadline), so dropping the registry entry
-    /// frees the accounting slot while the stream future, its channel, its
-    /// tokio task and its socket all survive. The cap would then bound
-    /// bookkeeping rather than real resources, letting a client accumulate
-    /// server-side connections *past* the cap — trading a fail-closed bound for
-    /// unbounded growth. A backpressured-but-healthy stream (suspended at
-    /// `yield`, or inside the periodic re-check's DB await) is also past its
-    /// deadline and would be reaped. That case stays bounded the honest way:
-    /// axum's keep-alive writes eventually fail on a dead peer, hyper drops the
-    /// body, and the guard fires.
-    ///
     /// This is the BACKSTOP. The primary, deterministic release is the
     /// subscribe handler's connection guard, which is constructed at
     /// registration and moved into the stream so it is dropped even if the
@@ -180,7 +168,7 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
     /// `#[cfg(test)]` like its sibling: on the production path the sweep runs
     /// inside `register`, which already holds the lock and therefore calls
     /// `prune_closed_for_user_locked` directly. Shipping a lock-taking wrapper
-    /// with no production caller would be dead public API (§15).
+    /// with no production caller would be dead API (§15).
     #[cfg(test)]
     pub fn prune_closed_for_user(&self, user_id: Uuid) -> usize {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -321,8 +309,36 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
 }
 
 /// Sweep every connection whose stream is gone. Caller holds the lock.
-/// Collect-then-remove (mirroring `deliver`'s dead-connection handling) so the
-/// two-index invariant is maintained by the single `remove_conn` helper.
+///
+/// **Liveness signal — `sender.is_closed()`, and deliberately only that.** Each
+/// connection's `Receiver` is owned solely by its own SSE stream, so a closed
+/// sender means exactly "that stream no longer exists": there is nothing left to
+/// bound. An idle-but-live stream (the normal state of a connection on a quiet
+/// deployment) is never touched.
+///
+/// **Deliberately NOT reclaimed: a connection that is merely OLD.** An earlier
+/// revision also reaped connections past their token's `exp`, to cover a peer
+/// that vanished without the socket ever erroring. That is wrong: in exactly
+/// that case the stream future is not being polled (which is *why* it outlived
+/// its own deadline), so dropping the registry entry frees the accounting slot
+/// while the stream future, its channel, its tokio task and its socket all
+/// survive. The cap would then bound bookkeeping rather than real resources,
+/// letting a client accumulate server-side connections *past* the cap — trading
+/// a fail-closed bound for unbounded growth. A backpressured-but-healthy stream
+/// (suspended at `yield`, or inside the periodic re-check's DB await) is also
+/// past its deadline and would be reaped. That case stays bounded the honest
+/// way: axum's keep-alive writes eventually fail on a dead peer, hyper drops the
+/// body, and the connection guard fires.
+///
+/// **Load-bearing invariant**: the registry holds the SOLE surviving `Sender`
+/// clone (the handler's own `tx` drops when the handler returns, and `rx` lives
+/// inside the stream). That is what makes `remove_conn` TERMINATE the stream
+/// rather than orphan it — dropping the sender closes the channel, `rx.recv()`
+/// yields `None`, and the loop breaks. Do not introduce a second long-lived
+/// `Sender` clone.
+///
+/// Collect-then-remove so the two-index invariant is maintained by the single
+/// `remove_conn` helper.
 fn prune_closed_locked<P: Principal>(inner: &mut RegistryInner<P>) -> usize {
     let dead: Vec<ConnId> = inner
         .clients
@@ -341,6 +357,14 @@ fn prune_closed_locked<P: Principal>(inner: &mut RegistryInner<P>) -> usize {
 }
 
 /// Sweep only `user_id`'s dead connections. Caller holds the lock.
+///
+/// An id present in `by_user` but MISSING from `clients` is treated as dead too.
+/// `register` and `remove_conn` keep the two indexes in lockstep under one lock,
+/// so that desync should be unreachable — but `user_count` is derived from
+/// `by_user`, so an orphan would count against the per-user cap forever and
+/// NEITHER sweep could clear it (this one would filter it out, the global one
+/// iterates `clients`). That is the permanently-429'd account this module exists
+/// to prevent, so the sweep repairs it rather than skipping it.
 fn prune_closed_for_user_locked<P: Principal>(
     inner: &mut RegistryInner<P>,
     user_id: Uuid,
@@ -350,7 +374,11 @@ fn prune_closed_for_user_locked<P: Principal>(
     };
     let dead: Vec<ConnId> = set
         .iter()
-        .filter(|cid| inner.clients.get(*cid).is_some_and(|c| c.sender.is_closed()))
+        .filter(|cid| {
+            // Missing from `clients` => an orphaned index entry; see the doc
+            // comment. `is_none_or` makes the sweep repair it.
+            inner.clients.get(*cid).is_none_or(|c| c.sender.is_closed())
+        })
         .copied()
         .collect();
     let n = dead.len();
@@ -767,6 +795,11 @@ mod tests {
     }
 
     // ---- slot reclamation (sse-slot-leak) --------------------------------
+    //
+    // COVERAGE NOTE: the `prune_*` tests below drive the sweep helpers in
+    // isolation — they do NOT prove the sweep is wired into production. What
+    // proves the wiring is the cap tests (`*_cap_counts_live_connections_only`),
+    // which go through `register` and fail if its sweep calls are removed.
     //
     // The registry's ONLY pre-existing reaper was `deliver`'s send-failure
     // prune, which requires an event to deliver — so on a quiescent deployment
