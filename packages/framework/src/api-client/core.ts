@@ -164,7 +164,13 @@ export interface FileUploadProgressCallback {
 // framework transport only needs the URL as a string and the response as a
 // type parameter. `endpointUrl` stays a plain string here; the app's factory
 // supplies the exact `"NS.method"` → URL values.
-export const callAsync = <TResponse = unknown>(
+// STAYS `async`: an async function body turns a synchronous throw into a
+// REJECTION, which is the contract every caller relies on
+// (`ApiClient.X.y(...).catch(...)`). The pre-flight work below can genuinely
+// throw — `params instanceof FormData` in a runtime with no global `FormData`
+// (SSR/node), an app-injected token provider that throws, a `localStorage` read
+// refused in a sandboxed iframe — so it must run inside the async body.
+export const callAsync = async <TResponse = unknown>(
   endpointUrl: string,
   params: any,
   callbacks?: {
@@ -178,22 +184,36 @@ export const callAsync = <TResponse = unknown>(
   //   - SSE      — a long-lived stream has ONE consumer wired to ONE reader, so
   //                two subscribers sharing a response body would starve one;
   //   - FormData — an upload is a mutation and carries non-comparable payloads.
-  // The key is the endpoint template + its params (the resolved path/query is a
-  // pure function of those), folded with the caller's identity.
   const isGet = endpointUrl.startsWith('GET ')
-  const joinable =
-    isGet && !callbacks?.SSE && !(params instanceof FormData)
+  const joinable = isGet && !callbacks?.SSE && !isFormData(params)
   if (!joinable) return performCall<TResponse>(endpointUrl, params, callbacks)
 
-  const key = inflightKey('GET', `${endpointUrl}|${stableParams(params)}`, getAuthToken())
+  // The key is the RESOLVED ORIGIN + the endpoint template + its params (the
+  // path/query is a pure function of the latter two) + the caller's identity.
+  // The origin matters on desktop, where it is a dynamic Tauri port that can
+  // change across a server restart — without it, a caller after the change
+  // could join a response fetched against the OLD host.
+  const key = inflightKey(
+    'GET',
+    `${await getBaseUrl()}|${endpointUrl}|${stableParams(params)}`,
+    getAuthToken(),
+  )
   return coalesce(key, () => performCall<TResponse>(endpointUrl, params, callbacks))
 }
 
+/** `params instanceof FormData` throws where `FormData` is not defined (SSR /
+ *  node). Guard it so the check itself can never be the failure. */
+const isFormData = (params: any): boolean =>
+  typeof FormData !== 'undefined' && params instanceof FormData
+
 /**
- * Deterministic, order-independent serialization of a params object for the
- * coalescing key. Two callers that pass equivalent params must produce the same
- * key regardless of literal key order; `undefined` values are dropped because
- * the URL builder drops them too.
+ * Deterministic serialization of a params object for the coalescing key. TOP-
+ * LEVEL keys are sorted so literal ordering does not matter; a NESTED object
+ * keeps its literal key order, so two semantically-identical calls that build a
+ * nested param differently produce different keys and simply do not coalesce.
+ * That is the safe direction — a missed join costs one duplicate request, a
+ * false join would cost correctness — and every param shape the generated
+ * ApiClient produces is flat.
  */
 const stableParams = (params: any): string => {
   if (params === undefined || params === null) return ''

@@ -6,11 +6,21 @@ export default (set: NotificationsSet, get: NotificationsGet) => async () => {
   const { api, readPermission } = notificationDeps()
   if (!hasPermissionNow(readPermission)) return
   const s = get()
-  // In-flight guard — mirrors every sibling list action (e.g. chatHistory's
-  // `loadRecentConversations`). Without it, the store's several consumers (the
-  // bell widget, the toast listener, the inbox page) each triggered their own
-  // `GET /api/notifications` on the same boot.
-  if (s.loading) return
+  // NO in-flight guard here, deliberately. A bare `if (s.loading) return` looks
+  // like the sibling list actions' guard but is WRONG for this action: it reads
+  // `page` / `perPage` / `unreadOnly` from state, and `setPage` / `setUnreadOnly`
+  // mutate those and then call `load()`. A bare drop would discard the new
+  // page/filter (leaving the UI showing the new selection with the old items),
+  // and would equally discard the `sync:notification` / `sync:reconnect` reload
+  // wired in `../index.ts` — silently breaking notify-and-refetch, which is a
+  // worse defect than the duplicate request it saves.
+  //
+  // The duplicate that motivated a guard here (the bell widget, the toast
+  // listener and the inbox page each triggering an IDENTICAL
+  // `GET /api/notifications` on the same boot) is removed at the transport
+  // instead (`@ziee/framework/api-client/inflight`), which coalesces only
+  // requests that are literally identical AND concurrent — so a differing-intent
+  // reload still gets its own round-trip.
   set(draft => {
     draft.loading = true
     draft.error = null

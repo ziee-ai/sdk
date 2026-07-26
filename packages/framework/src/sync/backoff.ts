@@ -22,6 +22,15 @@ export const CAPACITY_JITTER_MS = 5_000
 /**
  * Delay before the next subscribe attempt.
  *
+ * A capacity refusal raises the FLOOR; it never lowers the delay. The loop's own
+ * `currentBackoffMs` keeps escalating in the background, so repeated 429s still
+ * ramp toward `MAX_BACKOFF_MS` exactly as repeated transient failures do —
+ * taking the MAX of the two is what makes "back off further" true in both
+ * directions. Returning the capacity floor alone would, once the transient
+ * ladder had escalated to 30 s, actually SHORTEN the wait to ~12 s and then
+ * never escalate again: retrying FASTER against an endpoint that just said "no
+ * room", the exact opposite of the intent.
+ *
  * @param status  HTTP status that refused the stream, or `null` for a transient
  *                failure (socket drop, DNS blip, an aborted body).
  * @param currentBackoffMs  the loop's escalating transient backoff.
@@ -31,11 +40,9 @@ export function reconnectDelayMs(
   currentBackoffMs: number,
   rand: () => number = Math.random,
 ): number {
-  if (status === 429) {
-    return Math.min(
-      CAPACITY_BACKOFF_MS + Math.floor(rand() * CAPACITY_JITTER_MS),
-      MAX_BACKOFF_MS,
-    )
-  }
-  return Math.min(currentBackoffMs, MAX_BACKOFF_MS)
+  const capacityFloor =
+    status === 429
+      ? CAPACITY_BACKOFF_MS + Math.floor(rand() * CAPACITY_JITTER_MS)
+      : 0
+  return Math.min(Math.max(currentBackoffMs, capacityFloor), MAX_BACKOFF_MS)
 }

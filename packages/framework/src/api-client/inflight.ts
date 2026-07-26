@@ -41,7 +41,26 @@ interface Entry {
   promise: Promise<unknown>
   /** The freshness epoch this request STARTED in. */
   epoch: number
+  /** When it was issued — see MAX_JOIN_AGE_MS. */
+  startedAt: number
 }
+
+/**
+ * A read older than this is no longer joinable, even in the same epoch.
+ *
+ * The transport sets no fetch timeout, so a socket that HANGS never settles and
+ * its entry would otherwise stay in the map forever — and on a quiet page (no
+ * mutations, no sync frames) the epoch never moves either, so every later
+ * identical read would join a dead promise and that endpoint would be
+ * permanently unreadable for the session. Before coalescing, each caller got its
+ * own attempt and a remount recovered. This bound restores that: the hung
+ * request is still awaited by whoever issued it, but a later caller opens a
+ * fresh one.
+ *
+ * Sized well above the transport's own worst case (a GET retry ladder is
+ * ~6 s wall-clock) so it never splits a legitimately slow-but-progressing read.
+ */
+export const MAX_JOIN_AGE_MS = 15_000
 
 const inFlight = new Map<string, Entry>()
 
@@ -102,9 +121,21 @@ export function inflightKey(
  * ONCE for the whole group rather than N times.
  */
 export function coalesce<T>(key: string, start: () => Promise<T>): Promise<T> {
+  const now = Date.now()
   const existing = inFlight.get(key)
-  if (existing && existing.epoch === fetchEpoch) {
-    return existing.promise as Promise<T>
+  if (
+    existing &&
+    existing.epoch === fetchEpoch &&
+    now - existing.startedAt < MAX_JOIN_AGE_MS
+  ) {
+    // ALIASING GUARD: the issuer keeps the response it parsed; a joiner gets its
+    // OWN copy. Without this, N callers would share one parsed object/array
+    // instance, and a store that normalizes its response in place (`.sort()`,
+    // `.push()`, an immer draft assigning the same reference) would silently
+    // corrupt what every other joiner sees — a class of bug that did not exist
+    // when each caller performed its own parse. `structuredClone` is only paid
+    // when a join actually happens, which is the rare case.
+    return (existing.promise as Promise<T>).then(isolate)
   }
 
   const epoch = fetchEpoch
@@ -113,14 +144,28 @@ export function coalesce<T>(key: string, start: () => Promise<T>): Promise<T> {
     // it, and dropping that one would leave its joiners orphaned in the map.
     if (inFlight.get(key)?.promise === promise) inFlight.delete(key)
   })
-  inFlight.set(key, { promise, epoch })
+  inFlight.set(key, { promise, epoch, startedAt: now })
   return promise
 }
 
-/** Test seam: drop all in-flight bookkeeping and reset the epoch. */
+/** Deep-copy a joined response so joiners never alias the issuer's object.
+ *  Non-cloneable payloads (a Blob is cloneable; a Response/stream is not) fall
+ *  back to the shared value rather than failing the request. */
+function isolate<T>(value: T): T {
+  if (value === null || typeof value !== 'object') return value
+  try {
+    return structuredClone(value)
+  } catch {
+    return value
+  }
+}
+
+/** Test seam: drop all in-flight bookkeeping. The epoch is BUMPED, never
+ *  rewound — it is documented as monotonic, and rewinding it would let a
+ *  previously-captured epoch (e.g. `meFreshness`'s) spuriously compare equal. */
 export function __resetInflightForTests(): void {
   inFlight.clear()
-  fetchEpoch = 0
+  fetchEpoch++
 }
 
 /** Test/diagnostic seam: how many reads are currently joinable. */
