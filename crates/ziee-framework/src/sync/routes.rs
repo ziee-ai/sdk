@@ -184,6 +184,17 @@ where
     let principal: S::Principal = (auth.user, auth.groups).into();
     let user_id = S::principal_user_id(&principal);
 
+    // The wall-clock instant at which this stream's own `exp` deadline lapses
+    // (None when the token carried no `exp` — the far-future fallback below).
+    // The registry uses it as a staleness backstop: a connection still present
+    // long past the instant its stream was guaranteed to end is definitionally
+    // broken, which is the only signal available for a peer that vanished
+    // without the socket ever erroring.
+    let expires_at = exp_unix.map(|exp| {
+        std::time::Instant::now()
+            + Duration::from_secs((exp - chrono::Utc::now().timestamp()).max(0) as u64)
+    });
+
     S::registry()
         .register(
             conn_id,
@@ -191,9 +202,24 @@ where
                 user_id,
                 principal,
                 sender: tx.clone(),
+                expires_at,
             },
         )
         .map_err(|e| e.to_api_error())?;
+
+    // The slot is now OWNED by this guard — constructed here, eagerly, the
+    // instant registration succeeds (and only on success: on the 429 path
+    // nothing was inserted, so nothing may claim ownership). It is moved into
+    // the stream below.
+    //
+    // It CANNOT be declared inside the `stream!` body: that body is a generator
+    // that does not run until the stream's FIRST poll, so a client that goes
+    // away before the response body is ever polled would leave a registration
+    // whose guard was never constructed — the slot would be held for the life
+    // of the process. Captured by the `async move` generator instead, the guard
+    // lives in the future's state and is dropped when the future is dropped,
+    // polled or not.
+    let guard = ConnGuard::<S>(conn_id, PhantomData);
 
     // Handshake: hand the client its connection id for echo suppression.
     let _ = tx.try_send(Ok(S::connected_signal(conn_id)));
@@ -207,8 +233,10 @@ where
     let stream = async_stream::stream! {
         // Unregister on ANY stream termination — client disconnect, exp,
         // or deactivation. Drop runs even when the client vanishes
-        // mid-await (axum drops the stream future on disconnect).
-        let _guard = ConnGuard::<S>(conn_id, PhantomData);
+        // mid-await (axum drops the stream future on disconnect) AND when
+        // the stream is dropped before it is ever polled, because the guard
+        // was constructed at registration and is merely MOVED in here.
+        let _guard = guard;
 
         let mut recheck =
             tokio::time::interval_at(tokio::time::Instant::now() + recheck_interval(), recheck_interval());

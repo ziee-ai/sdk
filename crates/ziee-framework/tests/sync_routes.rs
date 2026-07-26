@@ -302,3 +302,224 @@ async fn past_exp_token_tears_the_stream_down_after_handshake() {
         "past-exp deadline tears the stream down after the handshake"
     );
 }
+
+// ---- slot reclamation (sse-slot-leak) -------------------------------------
+//
+// `register()` runs eagerly in the handler body, so a connection's slot is
+// claimed the moment the 200 is produced. Before the fix the `ConnGuard` that
+// releases it was a LOCAL of the `async_stream::stream!` generator body — code
+// that does not run until the stream's FIRST poll — so a client that went away
+// before the body was ever polled left a registration with no guard, holding
+// its slot for the life of the process. The registry's only other reaper is
+// `deliver`'s send-failure prune, which never runs on a quiescent deployment.
+// Measured before the fix: 5 subscribes dropped unpolled took
+// `connection_count` 0 -> 5; after the fix, 0 -> 0.
+//
+// Each test below gets its OWN surface + registry: `TestSurface`'s registry is a
+// process-wide `OnceLock` shared by every test in this binary, and cargo runs
+// tests concurrently, so a global `connection_count()` baseline would race with
+// siblings. An isolated registry makes the counts exact rather than "roughly".
+
+/// Declare an independent `SyncSurface` with its own private registry, so a
+/// test can assert EXACT connection counts without sibling interference.
+macro_rules! isolated_surface {
+    ($surface:ident, $reg:ident) => {
+        static $reg: OnceLock<SyncRegistry<TestPrincipal>> = OnceLock::new();
+        struct $surface;
+        #[async_trait::async_trait]
+        impl SyncSurface for $surface {
+            type Principal = TestPrincipal;
+            type Wire = TestWire;
+            type BaselinePerms = (ProfileRead,);
+            fn registry() -> &'static SyncRegistry<TestPrincipal> {
+                $reg.get_or_init(SyncRegistry::new)
+            }
+            fn principal_user_id(principal: &TestPrincipal) -> Uuid {
+                principal.user_id
+            }
+            fn connected_signal(conn_id: Uuid) -> Event {
+                Event::default().event("connected").data(conn_id.to_string())
+            }
+            async fn recheck(_user_id: Uuid, _tv: Option<i32>) -> RecheckOutcome<TestPrincipal> {
+                RecheckOutcome::Transient
+            }
+        }
+    };
+}
+
+isolated_surface!(AbandonSurface, ABANDON_REG);
+isolated_surface!(ExitPathSurface, EXIT_PATH_REG);
+isolated_surface!(CapSurface, CAP_REG);
+
+/// The same router as `app()`, mounted on an arbitrary surface.
+fn app_of<S: SyncSurface<Principal = TestPrincipal>>() -> Router {
+    let mut api = OpenApi::default();
+    sync_routes::<TestResolver, S>()
+        .finish_api(&mut api)
+        .layer(Extension(Arc::new(TestResolver)))
+}
+
+/// TEST-4 [acceptance INV-1] — "Unregister on ANY stream termination — client
+/// disconnect, exp, or deactivation. Drop runs even when the client vanishes
+/// mid-await." Driven at the invariant's weakest point: N > the per-user cap
+/// subscriptions abandoned BEFORE their body is ever polled must ALL be
+/// reclaimed. If the invariant is violated the count climbs by N (it did:
+/// 0 -> 5 for N=5 before the fix) and this fails.
+#[tokio::test]
+async fn abandoned_unpolled_streams_release_their_slots() {
+    const N: usize = 20; // deliberately > PER_USER_MAX_CONNECTIONS (12)
+    let reg = AbandonSurface::registry();
+    assert_eq!(reg.connection_count(), 0, "isolated registry starts empty");
+
+    let exp = chrono::Utc::now().timestamp() + 3600;
+    for i in 0..N {
+        let res = app_of::<AbandonSurface>()
+            .oneshot(request(Some("Bearer valid"), Some(exp)))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "subscribe #{i} must open — a leak would 429 partway through",
+        );
+        drop(res); // the client vanished; the body was NEVER polled
+    }
+
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "all {N} abandoned (never-polled) streams must release their slots",
+    );
+}
+
+/// TEST-11 [acceptance INV-2] — "cleanup on **every** exit path
+/// (success/error/timeout) — prefer a RAII guard." The SAME assertion is
+/// applied to all three ways a stream can end, so a fix covering only one path
+/// fails the other legs.
+#[tokio::test]
+async fn every_stream_exit_path_releases_its_slot() {
+    let reg = ExitPathSurface::registry();
+    assert_eq!(reg.connection_count(), 0, "isolated registry starts empty");
+    let future_exp = chrono::Utc::now().timestamp() + 3600;
+
+    // (a) dropped BEFORE the first body poll — the path the guard used to miss.
+    let res = app_of::<ExitPathSurface>()
+        .oneshot(request(Some("Bearer valid"), Some(future_exp)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(reg.connection_count(), 1, "(a) the slot is claimed at register");
+    drop(res);
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "(a) a stream dropped before its first poll must release its slot"
+    );
+
+    // (b) dropped AFTER the first body poll (the generator had started).
+    let res = app_of::<ExitPathSurface>()
+        .oneshot(request(Some("Bearer valid"), Some(future_exp)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut body = res.into_body();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+        .await
+        .expect("(b) handshake frame arrives");
+    assert_eq!(reg.connection_count(), 1, "(b) still registered while streaming");
+    drop(body);
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "(b) a stream dropped after its first poll must release its slot"
+    );
+
+    // (c) the stream ending ON ITS OWN at the (already lapsed) exp deadline —
+    //     no client disconnect at all; drained to completion.
+    let past_exp = chrono::Utc::now().timestamp() - 10;
+    let res = app_of::<ExitPathSurface>()
+        .oneshot(request(Some("Bearer valid"), Some(past_exp)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut body = res.into_body();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), body.frame()).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => panic!("(c) the exp-deadline teardown must happen promptly"),
+        }
+    }
+    drop(body);
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "(c) a stream that ends on its own at the exp deadline must release its slot"
+    );
+}
+
+/// The cap must stay REAL — the guard against "fix the leak by weakening the
+/// cap". Through the same real handler: 12 streams held ALIVE (bodies polled,
+/// kept in scope) still make the 13th subscribe 429; once they are abandoned,
+/// a full fresh set of 12 opens again.
+///
+/// All connections are forced onto ONE user id via a per-surface pinned id, so
+/// the per-user cap is what trips (`TestResolver` otherwise mints a random id
+/// per request).
+#[tokio::test]
+async fn the_cap_is_still_enforced_for_live_streams_and_reusable_after_release() {
+    use ziee_framework::sync::ClientConn;
+
+    let reg = CapSurface::registry();
+    assert_eq!(reg.connection_count(), 0, "isolated registry starts empty");
+    let uid = Uuid::new_v4();
+
+    let mk = |sender| ClientConn {
+        user_id: uid,
+        principal: TestPrincipal {
+            user_id: uid,
+            direct: vec![],
+        },
+        sender,
+        // No deadline → these connections are reclaimable only by the
+        // receiver-dropped signal, isolating the cap assertion from the
+        // deadline backstop.
+        expires_at: None,
+    };
+
+    // 12 LIVE connections for one user.
+    let mut alive = Vec::new();
+    for i in 0..12 {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        reg.register(Uuid::new_v4(), mk(tx))
+            .unwrap_or_else(|_| panic!("connection #{i} is under the cap"));
+        alive.push(rx);
+    }
+
+    // The 13th LIVE connection for the same user → refused, cap intact.
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let err = reg
+        .register(Uuid::new_v4(), mk(tx))
+        .expect_err("the per-user cap must still refuse a 13th LIVE connection");
+    assert_eq!(err.status_code(), 429, "the cap still surfaces 429");
+    assert_eq!(reg.connection_count(), 12, "a refusal frees nothing");
+
+    // Those streams go away → the whole set of slots comes back.
+    drop(alive);
+    let mut alive2 = Vec::new();
+    for i in 0..12 {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        reg.register(Uuid::new_v4(), mk(tx))
+            .unwrap_or_else(|_| panic!("reclaimed slot #{i} must be reusable"));
+        alive2.push(rx);
+    }
+    assert_eq!(
+        reg.connection_count(),
+        12,
+        "exactly the cap's worth of connections, all fresh — the 12 dead ones were reclaimed"
+    );
+
+    drop(alive2);
+    assert_eq!(reg.prune_closed(), 12, "the sweep reclaims the released set");
+    assert_eq!(reg.connection_count(), 0);
+}
