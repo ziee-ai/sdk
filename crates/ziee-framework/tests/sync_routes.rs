@@ -92,6 +92,9 @@ impl From<(TestUser, Vec<TestGroup>)> for TestPrincipal {
 /// deadline branch without a real JWT.
 struct TestResolver;
 
+/// The identity behind `Bearer valid-fixed` (see `authenticate`).
+const FIXED_USER_ID: Uuid = Uuid::from_u128(0x5EC0_1EAC_0000_0000_0000_0000_0000_0001);
+
 #[async_trait::async_trait]
 impl IdentityResolver for TestResolver {
     type User = TestUser;
@@ -109,6 +112,13 @@ impl IdentityResolver for TestResolver {
             )),
             Some("Bearer valid") => Ok(TestUser {
                 id: Uuid::new_v4(),
+                direct: vec!["profile::read".to_string()],
+            }),
+            // A FIXED identity, so repeated subscribes land on ONE user and the
+            // per-user cap is actually reachable (`Bearer valid` mints a fresh
+            // uuid per request, which can only ever trip the global cap).
+            Some("Bearer valid-fixed") => Ok(TestUser {
+                id: FIXED_USER_ID,
                 direct: vec!["profile::read".to_string()],
             }),
             Some(_) => Err((
@@ -374,13 +384,15 @@ async fn abandoned_unpolled_streams_release_their_slots() {
     let exp = chrono::Utc::now().timestamp() + 3600;
     for i in 0..N {
         let res = app_of::<AbandonSurface>()
-            .oneshot(request(Some("Bearer valid"), Some(exp)))
+            .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
             .await
             .unwrap();
+        // Pinned to ONE user, so this is a REAL assertion: with the leak
+        // present the 13th subscribe trips PER_USER_MAX_CONNECTIONS and 429s.
         assert_eq!(
             res.status(),
             StatusCode::OK,
-            "subscribe #{i} must open — a leak would 429 partway through",
+            "subscribe #{i} must open — a leaked slot would 429 partway through",
         );
         drop(res); // the client vanished; the body was NEVER polled
     }
@@ -438,7 +450,7 @@ async fn every_stream_exit_path_releases_its_slot() {
     //     no client disconnect at all; drained to completion.
     let past_exp = chrono::Utc::now().timestamp() - 10;
     let res = app_of::<ExitPathSurface>()
-        .oneshot(request(Some("Bearer valid"), Some(past_exp)))
+        .oneshot(request(Some("Bearer valid-fixed"), Some(past_exp)))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -459,67 +471,81 @@ async fn every_stream_exit_path_releases_its_slot() {
 }
 
 /// The cap must stay REAL — the guard against "fix the leak by weakening the
-/// cap". Through the same real handler: 12 streams held ALIVE (bodies polled,
-/// kept in scope) still make the 13th subscribe 429; once they are abandoned,
-/// a full fresh set of 12 opens again.
-///
-/// All connections are forced onto ONE user id via a per-surface pinned id, so
-/// the per-user cap is what trips (`TestResolver` otherwise mints a random id
-/// per request).
+/// cap". Driven through the REAL mounted handler on an isolated surface, with
+/// every subscribe pinned to ONE user (`Bearer valid-fixed`) so the PER-USER
+/// cap is what trips:
+///   * `PER_USER_MAX` streams held ALIVE (their bodies polled to the handshake
+///     and kept in scope) still make the next subscribe 429, and the refusal
+///     frees nothing;
+///   * once those streams are abandoned, a full fresh set opens again.
 #[tokio::test]
 async fn the_cap_is_still_enforced_for_live_streams_and_reusable_after_release() {
-    use ziee_framework::sync::ClientConn;
-
+    // Mirrors the framework's private `PER_USER_MAX_CONNECTIONS`.
+    const PER_USER_MAX: usize = 12;
     let reg = CapSurface::registry();
     assert_eq!(reg.connection_count(), 0, "isolated registry starts empty");
-    let uid = Uuid::new_v4();
+    let exp = chrono::Utc::now().timestamp() + 3600;
 
-    let mk = |sender| ClientConn {
-        user_id: uid,
-        principal: TestPrincipal {
-            user_id: uid,
-            direct: vec![],
-        },
-        sender,
-        // No deadline → these connections are reclaimable only by the
-        // receiver-dropped signal, isolating the cap assertion from the
-        // deadline backstop.
-        expires_at: None,
-    };
+    // Open PER_USER_MAX streams for ONE user and keep them live: poll each body
+    // to its `connected` handshake so none can be dismissed as "never opened",
+    // then hold the body in scope.
+    let mut held = Vec::new();
+    for i in 0..PER_USER_MAX {
+        let res = app_of::<CapSurface>()
+            .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "stream #{i} is under the cap");
+        let mut body = res.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+            .await
+            .expect("handshake arrives")
+            .expect("a frame")
+            .expect("frame ok");
+        assert!(
+            String::from_utf8_lossy(&frame.into_data().unwrap_or_default()).contains("connected"),
+            "stream #{i} really opened"
+        );
+        held.push(body);
+    }
+    assert_eq!(reg.connection_count(), PER_USER_MAX);
 
-    // 12 LIVE connections for one user.
-    let mut alive = Vec::new();
-    for i in 0..12 {
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        reg.register(Uuid::new_v4(), mk(tx))
-            .unwrap_or_else(|_| panic!("connection #{i} is under the cap"));
-        alive.push(rx);
+    // The (cap+1)th LIVE stream for that user is refused, and the refusal frees
+    // nothing — so a second attempt is refused too.
+    for attempt in 0..2 {
+        let over = app_of::<CapSurface>()
+            .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
+            .await
+            .unwrap();
+        assert_eq!(
+            over.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "attempt {attempt}: the (cap+1)th LIVE stream must 429 — reclamation \
+             must never become a cap raise"
+        );
+        assert_eq!(reg.connection_count(), PER_USER_MAX, "a refusal frees nothing");
     }
 
-    // The 13th LIVE connection for the same user → refused, cap intact.
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    let err = reg
-        .register(Uuid::new_v4(), mk(tx))
-        .expect_err("the per-user cap must still refuse a 13th LIVE connection");
-    assert_eq!(err.status_code(), 429, "the cap still surfaces 429");
-    assert_eq!(reg.connection_count(), 12, "a refusal frees nothing");
-
-    // Those streams go away → the whole set of slots comes back.
-    drop(alive);
-    let mut alive2 = Vec::new();
-    for i in 0..12 {
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        reg.register(Uuid::new_v4(), mk(tx))
-            .unwrap_or_else(|_| panic!("reclaimed slot #{i} must be reusable"));
-        alive2.push(rx);
-    }
+    // Those streams go away → the whole allowance comes back.
+    drop(held);
     assert_eq!(
         reg.connection_count(),
-        12,
-        "exactly the cap's worth of connections, all fresh — the 12 dead ones were reclaimed"
+        0,
+        "abandoning the live streams releases every slot"
     );
-
-    drop(alive2);
-    assert_eq!(reg.prune_closed(), 12, "the sweep reclaims the released set");
-    assert_eq!(reg.connection_count(), 0);
+    let mut held2 = Vec::new();
+    for i in 0..PER_USER_MAX {
+        let res = app_of::<CapSurface>()
+            .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "reclaimed slot #{i} must be reusable"
+        );
+        held2.push(res);
+    }
+    assert_eq!(reg.connection_count(), PER_USER_MAX);
+    drop(held2);
 }

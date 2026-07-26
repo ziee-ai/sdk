@@ -42,14 +42,6 @@ pub const SYNC_CHANNEL_CAPACITY: usize = 1024;
 
 type ConnId = Uuid;
 
-/// Grace period added to a connection's own `exp` deadline before a sweep
-/// treats it as stale. The stream's `select!` breaks AT the deadline and its
-/// guard then unregisters, so any connection still present well past its own
-/// deadline is definitionally broken — this slack only avoids racing a normal
-/// teardown. It is derived from the connection, not a tunable, so there is no
-/// arbitrary TTL to configure and no risk of reaping a healthy idle stream.
-const DEADLINE_SLACK: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// One live SSE connection's server-side state. `principal` is the permission
 /// snapshot captured at connect (refreshed by the handler's periodic re-check)
 /// and consulted when routing `Perm`-audience events.
@@ -57,31 +49,6 @@ pub struct ClientConn<P: Principal> {
     pub user_id: Uuid,
     pub principal: P,
     pub sender: Sender<Result<Event, axum::Error>>,
-    /// When this connection's stream is guaranteed to have ended: the access
-    /// token's `exp` deadline, which the subscribe handler already `select!`s
-    /// on. `None` = no bound known (the handler's far-future fallback), which
-    /// simply opts the connection out of deadline-based reclamation.
-    ///
-    /// This is the liveness backstop for a peer that vanished WITHOUT the
-    /// socket erroring — hyper only learns the client is gone when a write
-    /// fails, so an idle stream to a black-holed peer could otherwise hold its
-    /// slot far longer than its own token was ever valid for.
-    pub expires_at: Option<std::time::Instant>,
-}
-
-impl<P: Principal> ClientConn<P> {
-    /// Is this connection past its own `exp` deadline (plus slack)? Such a
-    /// connection's stream should already have torn itself down.
-    fn is_past_deadline(&self, now: std::time::Instant) -> bool {
-        self.expires_at
-            .is_some_and(|deadline| now.saturating_duration_since(deadline) > DEADLINE_SLACK)
-    }
-
-    /// Is this connection reclaimable — its stream gone (receiver dropped), or
-    /// still present long past the deadline at which it should have ended?
-    fn is_reclaimable(&self, now: std::time::Instant) -> bool {
-        self.sender.is_closed() || self.is_past_deadline(now)
-    }
 }
 
 struct RegistryInner<P: Principal> {
@@ -118,18 +85,35 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
     /// A cap is only ever charged for connections that are still ALIVE: before
     /// each cap check the corresponding set is swept of connections whose
     /// stream is gone (`prune_closed_locked`). Without that sweep a user whose
-    /// slots leaked would be refused forever — the registry's only other
-    /// reaper is `deliver`'s send-failure prune, which never runs on a
-    /// quiescent deployment because there is no event to deliver.
+    /// slots leaked would be refused forever — the other reapers (`deliver`'s
+    /// and `deliver_session_to_users`' send-failure prunes, and `unregister`)
+    /// all require either an event to deliver or a stream that terminated
+    /// normally, so a quiescent deployment could reclaim nothing.
     ///
-    /// The sweep is deliberately on-demand rather than a background reaper:
-    /// a stale slot's ONLY user-visible effect is a cap refusal, and the caps
-    /// are evaluated exclusively here (DEC-4).
+    /// The sweep is deliberately on-demand rather than a background reaper: a
+    /// stale slot's user-visible effect is a cap refusal, and the caps are
+    /// evaluated exclusively here (DEC-4).
+    ///
+    /// **Cap-check ORDER is part of the contract**: global first, then
+    /// per-user, so a saturated deployment reports `SYNC_GLOBAL_LIMIT` (a
+    /// capacity incident) rather than masking it as `SYNC_USER_LIMIT` (a
+    /// per-account problem) for a user who happens to also be at their own cap.
+    /// Each cap sweeps its own scope only when it would otherwise trip, so the
+    /// common path does no extra work at all.
     pub fn register(&self, conn_id: ConnId, conn: ClientConn<P>) -> Result<(), AppError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Per-user first: bounded by PER_USER_MAX_CONNECTIONS, so the common
-        // path stays O(cap) rather than O(global).
+        if inner.clients.len() >= GLOBAL_MAX_CONNECTIONS {
+            prune_closed_locked(&mut inner);
+        }
+        if inner.clients.len() >= GLOBAL_MAX_CONNECTIONS {
+            return Err(AppError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "SYNC_GLOBAL_LIMIT",
+                "Realtime sync is at capacity; retry shortly",
+            ));
+        }
+
         let mut user_count = inner.by_user.get(&conn.user_id).map_or(0, |s| s.len());
         if user_count >= PER_USER_MAX_CONNECTIONS {
             prune_closed_for_user_locked(&mut inner, conn.user_id);
@@ -143,51 +127,61 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
             ));
         }
 
-        // Global sweep only when the global cap would otherwise trip.
-        if inner.clients.len() >= GLOBAL_MAX_CONNECTIONS {
-            prune_closed_locked(&mut inner);
-        }
-        if inner.clients.len() >= GLOBAL_MAX_CONNECTIONS {
-            return Err(AppError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "SYNC_GLOBAL_LIMIT",
-                "Realtime sync is at capacity; retry shortly",
-            ));
-        }
-
         inner.by_user.entry(conn.user_id).or_default().insert(conn_id);
         inner.clients.insert(conn_id, conn);
         Ok(())
     }
 
-    /// Sweep every reclaimable connection, returning how many were freed. Two
-    /// independent liveness signals, neither of which can false-positive a
-    /// healthy stream:
+    /// Sweep every connection whose stream is gone, returning how many were
+    /// freed.
     ///
-    /// 1. **Receiver dropped** (`sender.is_closed()`) — each connection's
-    ///    `Receiver` is owned solely by its own SSE stream, so a closed sender
-    ///    is exactly "that stream no longer exists". No TTL to tune, and an
-    ///    idle-but-live stream (the normal case on a quiet deployment) is never
-    ///    touched.
-    /// 2. **Past its own `exp` deadline** — the stream `select!`s on the access
-    ///    token's expiry and breaks there, so a connection still registered
-    ///    well past that instant is definitionally broken. This covers the peer
-    ///    that vanished WITHOUT the socket erroring: hyper only discovers the
-    ///    client is gone when a write fails, so an idle stream to a black-holed
-    ///    peer would otherwise keep its slot indefinitely.
+    /// The liveness signal is `sender.is_closed()`, and it is the ONLY one used
+    /// deliberately. Each connection's `Receiver` is owned solely by its own SSE
+    /// stream, so a closed sender means exactly "that stream no longer exists" —
+    /// there is nothing left to bound. An idle-but-live stream (the normal state
+    /// of a sync connection on a quiet deployment) is never touched.
+    ///
+    /// **Deliberately NOT reclaimed: a connection that is merely OLD.** An
+    /// earlier revision also reaped connections past their token's `exp`, to
+    /// cover a peer that vanished without the socket ever erroring. That is
+    /// wrong: in exactly that case the stream future is not being polled (which
+    /// is *why* it outlived its own deadline), so dropping the registry entry
+    /// frees the accounting slot while the stream future, its channel, its
+    /// tokio task and its socket all survive. The cap would then bound
+    /// bookkeeping rather than real resources, letting a client accumulate
+    /// server-side connections *past* the cap — trading a fail-closed bound for
+    /// unbounded growth. A backpressured-but-healthy stream (suspended at
+    /// `yield`, or inside the periodic re-check's DB await) is also past its
+    /// deadline and would be reaped. That case stays bounded the honest way:
+    /// axum's keep-alive writes eventually fail on a dead peer, hyper drops the
+    /// body, and the guard fires.
     ///
     /// This is the BACKSTOP. The primary, deterministic release is the
     /// subscribe handler's connection guard, which is constructed at
     /// registration and moved into the stream so it is dropped even if the
     /// stream is never polled.
+    ///
+    /// **Load-bearing invariant**: the registry holds the SOLE surviving
+    /// `Sender` clone (the handler's own `tx` drops when the handler returns,
+    /// and `rx` lives inside the stream). That is what makes `remove_conn`
+    /// terminate the stream rather than orphan it — dropping the sender closes
+    /// the channel, `rx.recv()` yields `None` and the loop breaks. Do not
+    /// introduce a second long-lived `Sender` clone.
+    #[cfg(test)]
     pub fn prune_closed(&self) -> usize {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         prune_closed_locked(&mut inner)
     }
 
-    /// Sweep only `user_id`'s reclaimable connections (same two signals as
+    /// Sweep only `user_id`'s dead connections (same signal as
     /// [`Self::prune_closed`]), returning how many were freed. Other users'
     /// connections are never inspected or touched.
+    ///
+    /// `#[cfg(test)]` like its sibling: on the production path the sweep runs
+    /// inside `register`, which already holds the lock and therefore calls
+    /// `prune_closed_for_user_locked` directly. Shipping a lock-taking wrapper
+    /// with no production caller would be dead public API (§15).
+    #[cfg(test)]
     pub fn prune_closed_for_user(&self, user_id: Uuid) -> usize {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         prune_closed_for_user_locked(&mut inner, user_id)
@@ -326,15 +320,14 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
     }
 }
 
-/// Sweep every reclaimable connection. Caller holds the lock.
+/// Sweep every connection whose stream is gone. Caller holds the lock.
 /// Collect-then-remove (mirroring `deliver`'s dead-connection handling) so the
 /// two-index invariant is maintained by the single `remove_conn` helper.
 fn prune_closed_locked<P: Principal>(inner: &mut RegistryInner<P>) -> usize {
-    let now = std::time::Instant::now();
     let dead: Vec<ConnId> = inner
         .clients
         .iter()
-        .filter(|(_, c)| c.is_reclaimable(now))
+        .filter(|(_, c)| c.sender.is_closed())
         .map(|(id, _)| *id)
         .collect();
     let n = dead.len();
@@ -342,12 +335,12 @@ fn prune_closed_locked<P: Principal>(inner: &mut RegistryInner<P>) -> usize {
         remove_conn(inner, cid);
     }
     if n > 0 {
-        tracing::debug!("sync registry: reclaimed {n} dead/expired connection(s)");
+        tracing::debug!("sync registry: reclaimed {n} dead connection(s)");
     }
     n
 }
 
-/// Sweep only `user_id`'s reclaimable connections. Caller holds the lock.
+/// Sweep only `user_id`'s dead connections. Caller holds the lock.
 fn prune_closed_for_user_locked<P: Principal>(
     inner: &mut RegistryInner<P>,
     user_id: Uuid,
@@ -355,15 +348,9 @@ fn prune_closed_for_user_locked<P: Principal>(
     let Some(set) = inner.by_user.get(&user_id) else {
         return 0;
     };
-    let now = std::time::Instant::now();
     let dead: Vec<ConnId> = set
         .iter()
-        .filter(|cid| {
-            inner
-                .clients
-                .get(*cid)
-                .is_some_and(|c| c.is_reclaimable(now))
-        })
+        .filter(|cid| inner.clients.get(*cid).is_some_and(|c| c.sender.is_closed()))
         .copied()
         .collect();
     let n = dead.len();
@@ -371,7 +358,7 @@ fn prune_closed_for_user_locked<P: Principal>(
         remove_conn(inner, cid);
     }
     if n > 0 {
-        tracing::debug!("sync registry: reclaimed {n} dead/expired connection(s) for one user");
+        tracing::debug!("sync registry: reclaimed {n} dead connection(s) for one user");
     }
     n
 }
@@ -454,7 +441,6 @@ mod tests {
             user_id,
             principal: p,
             sender: tx,
-            expires_at: None,
         };
         (c, rx)
     }
@@ -533,7 +519,6 @@ mod tests {
             user_id,
             principal: p,
             sender: tx,
-            expires_at: None,
         };
         (c, rx)
     }
@@ -707,7 +692,6 @@ mod tests {
             user_id,
             principal: principal(false, vec![]),
             sender: tx,
-            expires_at: None,
         };
         (c, rx)
     }
@@ -908,78 +892,6 @@ mod tests {
         // A global sweep then reclaims B's.
         assert_eq!(reg.prune_closed(), 1);
         assert_eq!(reg.connection_count(), 1);
-    }
-
-    /// TEST-14 — the deadline backstop: a connection whose stream is STILL
-    /// ALIVE (its receiver held open — the peer vanished without the socket
-    /// ever erroring, so hyper never noticed) is nevertheless reclaimed once it
-    /// is past the `exp` deadline its own stream was bound to. A live
-    /// connection whose deadline is in the FUTURE, and one with no deadline at
-    /// all, are both left alone.
-    #[test]
-    fn prune_reclaims_a_connection_past_its_own_exp_deadline_even_if_alive() {
-        let reg = empty_registry();
-        let uid = Uuid::new_v4();
-        let now = std::time::Instant::now();
-
-        let (expired, _expired_rx) = conn_expiring(
-            uid,
-            Some(now - DEADLINE_SLACK - std::time::Duration::from_secs(30)),
-        );
-        let (future, _future_rx) =
-            conn_expiring(uid, Some(now + std::time::Duration::from_secs(3600)));
-        let (unbounded, _unbounded_rx) = conn(uid, principal(false, vec![]));
-        reg.register(Uuid::new_v4(), expired).unwrap();
-        reg.register(Uuid::new_v4(), future).unwrap();
-        reg.register(Uuid::new_v4(), unbounded).unwrap();
-        assert_eq!(reg.connection_count(), 3);
-
-        // Every receiver is still held, so `sender.is_closed()` is false for
-        // all three: ONLY the deadline signal can distinguish them.
-        assert_eq!(
-            reg.prune_closed(),
-            1,
-            "only the past-deadline connection is reclaimed"
-        );
-        assert_eq!(
-            reg.connection_count(),
-            2,
-            "the future-deadline and no-deadline connections both survive"
-        );
-    }
-
-    /// A connection barely past its deadline (inside the slack window) is NOT
-    /// reclaimed — the slack exists so a normal teardown is never raced.
-    #[test]
-    fn prune_respects_the_deadline_slack_window() {
-        let reg = empty_registry();
-        let uid = Uuid::new_v4();
-        let just_lapsed = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        let (c, _rx) = conn_expiring(uid, Some(just_lapsed));
-        reg.register(Uuid::new_v4(), c).unwrap();
-
-        assert_eq!(
-            reg.prune_closed(),
-            0,
-            "a connection whose deadline just lapsed is still inside the slack window"
-        );
-        assert_eq!(reg.connection_count(), 1);
-    }
-
-    /// A connection whose stream was bound to end at `expires_at` — exercises
-    /// the deadline staleness backstop.
-    fn conn_expiring(
-        user_id: Uuid,
-        expires_at: Option<std::time::Instant>,
-    ) -> (ClientConn<TestPrincipal>, Rx) {
-        let (tx, rx) = tokio::sync::mpsc::channel(SYNC_CHANNEL_CAPACITY);
-        let c = ClientConn {
-            user_id,
-            principal: principal(false, vec![]),
-            sender: tx,
-            expires_at,
-        };
-        (c, rx)
     }
 
     /// TEST-9 — a sweep NEVER reclaims a live connection. Asserted on both the

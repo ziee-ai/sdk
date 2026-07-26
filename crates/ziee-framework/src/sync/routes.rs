@@ -184,17 +184,6 @@ where
     let principal: S::Principal = (auth.user, auth.groups).into();
     let user_id = S::principal_user_id(&principal);
 
-    // The wall-clock instant at which this stream's own `exp` deadline lapses
-    // (None when the token carried no `exp` — the far-future fallback below).
-    // The registry uses it as a staleness backstop: a connection still present
-    // long past the instant its stream was guaranteed to end is definitionally
-    // broken, which is the only signal available for a peer that vanished
-    // without the socket ever erroring.
-    let expires_at = exp_unix.map(|exp| {
-        std::time::Instant::now()
-            + Duration::from_secs((exp - chrono::Utc::now().timestamp()).max(0) as u64)
-    });
-
     S::registry()
         .register(
             conn_id,
@@ -202,7 +191,6 @@ where
                 user_id,
                 principal,
                 sender: tx.clone(),
-                expires_at,
             },
         )
         .map_err(|e| e.to_api_error())?;
