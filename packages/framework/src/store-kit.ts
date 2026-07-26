@@ -13,6 +13,7 @@ import { useEventBusStore } from './events'
 import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
 import { createStoreProxy, type StoreProxy } from './stores'
 import { onNetworkIdle } from './net-idle'
+import { createLazyDispatcher } from './lazy-dispatch'
 
 // ============================================================================
 // store-kit — thin authoring layer over the existing Zustand + Stores.X proxy.
@@ -354,14 +355,12 @@ function makeBuilder<State extends object, Actions extends object>(
     if (config.lazyActions) {
       for (const key of Object.keys(config.lazyActions)) {
         const loader = (config.lazyActions as LazyActionsConfig<State>)[key]
-        let implPromise: Promise<(...args: any[]) => any> | null = null
-        const resolveImpl = () =>
-          (implPromise ??= loader().then(m => m.default(set, get)))
-        const dispatch = (...args: any[]) =>
-          resolveImpl().then(impl => impl(...args))
-        // preload: warm the chunk + build the impl, but do not invoke it.
-        dispatch.preload = () => resolveImpl().then(() => undefined)
-        lazyDispatchers[key] = dispatch
+        // The dispatcher (chunk memoization, `.preload()`, and the chunk-load
+        // de-dup window that keeps each action's OWN in-flight guard reachable)
+        // lives in ./lazy-dispatch.ts — see the rationale there.
+        lazyDispatchers[key] = createLazyDispatcher(() =>
+          loader().then(m => m.default(set, get)),
+        )
       }
     }
     const cleanups: Unsubscribe[] = []

@@ -2,6 +2,7 @@ import type { SSECallback } from './sse-types'
 import { createSSEHandler } from './sse-types'
 import { getSyncConnectionId } from '../sync/connection'
 import { netRequestEnd, netRequestStart } from '../net-idle'
+import { bumpFetchEpoch, coalesce, inflightKey } from './inflight'
 
 // ─────────────────────── Base-URL resolver (injected) ───────────────────────
 //
@@ -163,7 +164,53 @@ export interface FileUploadProgressCallback {
 // framework transport only needs the URL as a string and the response as a
 // type parameter. `endpointUrl` stays a plain string here; the app's factory
 // supplies the exact `"NS.method"` → URL values.
-export const callAsync = async <TResponse = unknown>(
+export const callAsync = <TResponse = unknown>(
+  endpointUrl: string,
+  params: any,
+  callbacks?: {
+    SSE?: SSECallback<TResponse>
+    fileUploadProgress?: FileUploadProgressCallback
+  },
+): Promise<TResponse> => {
+  // ── In-flight GET coalescing (see ./inflight.ts) ──────────────────────────
+  // Only plain reads are joinable. Excluded, deliberately:
+  //   - non-GET  — a mutation must never be silently collapsed into another's;
+  //   - SSE      — a long-lived stream has ONE consumer wired to ONE reader, so
+  //                two subscribers sharing a response body would starve one;
+  //   - FormData — an upload is a mutation and carries non-comparable payloads.
+  // The key is the endpoint template + its params (the resolved path/query is a
+  // pure function of those), folded with the caller's identity.
+  const isGet = endpointUrl.startsWith('GET ')
+  const joinable =
+    isGet && !callbacks?.SSE && !(params instanceof FormData)
+  if (!joinable) return performCall<TResponse>(endpointUrl, params, callbacks)
+
+  const key = inflightKey('GET', `${endpointUrl}|${stableParams(params)}`, getAuthToken())
+  return coalesce(key, () => performCall<TResponse>(endpointUrl, params, callbacks))
+}
+
+/**
+ * Deterministic, order-independent serialization of a params object for the
+ * coalescing key. Two callers that pass equivalent params must produce the same
+ * key regardless of literal key order; `undefined` values are dropped because
+ * the URL builder drops them too.
+ */
+const stableParams = (params: any): string => {
+  if (params === undefined || params === null) return ''
+  if (typeof params !== 'object') return String(params)
+  try {
+    const entries = Object.entries(params)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    return JSON.stringify(entries)
+  } catch {
+    // Non-serializable params (a cyclic object) — fall back to a key that never
+    // matches another call, so such a request is simply never coalesced.
+    return `nokey:${Math.random()}`
+  }
+}
+
+const performCall = async <TResponse = unknown>(
   endpointUrl: string,
   params: any,
   callbacks?: {
@@ -695,5 +742,11 @@ export const callAsync = async <TResponse = unknown>(
     throw error // Re-throw to allow caller to handle it
   } finally {
     if (counted) netRequestEnd()
+    // A completed MUTATION invalidates joinability of every read that was
+    // already on the wire — a refetch issued after this point must get its own
+    // round-trip rather than joining a possibly-pre-mutation request. Bumped on
+    // failure too: a request that errored client-side may still have been
+    // applied server-side, so assuming "nothing changed" would be unsafe.
+    if (!endpointUrl.startsWith('GET ')) bumpFetchEpoch()
   }
 }

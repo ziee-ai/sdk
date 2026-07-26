@@ -137,7 +137,17 @@ export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
       if (module.registerStores) {
         const storeRegistrations = module.registerStores()
         storeRegistrations.forEach(reg => {
-          newStores[reg.name] = createStoreProxy(reg.store)
+          // REUSE an already-registered proxy. A store authored with
+          // `registerLazyStore` self-registers its proxy at import time
+          // (`stores.ts`), and that proxy is documented as the SOLE owner of
+          // init-on-first-access + ref-counted destroy. Building a second one
+          // here for a store also listed in a module's `stores:` array would
+          // give it an independent `storeInitialized` flag and ref count — so
+          // its `init` (and every `sync:*` listener that registers) could run
+          // twice. Idempotent, matching `registerStore` above.
+          if (!newStores[reg.name]) {
+            newStores[reg.name] = createStoreProxy(reg.store)
+          }
         })
       }
 

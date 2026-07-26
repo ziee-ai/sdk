@@ -6,6 +6,11 @@ export default (set: NotificationsSet, get: NotificationsGet) => async () => {
   const { api, readPermission } = notificationDeps()
   if (!hasPermissionNow(readPermission)) return
   const s = get()
+  // In-flight guard — mirrors every sibling list action (e.g. chatHistory's
+  // `loadRecentConversations`). Without it, the store's several consumers (the
+  // bell widget, the toast listener, the inbox page) each triggered their own
+  // `GET /api/notifications` on the same boot.
+  if (s.loading) return
   set(draft => {
     draft.loading = true
     draft.error = null
