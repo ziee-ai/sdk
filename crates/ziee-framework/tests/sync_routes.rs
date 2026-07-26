@@ -387,13 +387,14 @@ async fn abandoned_unpolled_streams_release_their_slots() {
             .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
             .await
             .unwrap();
-        // Pinned to ONE user, so this is a REAL assertion: with the leak
-        // present the 13th subscribe trips PER_USER_MAX_CONNECTIONS and 429s.
-        assert_eq!(
-            res.status(),
-            StatusCode::OK,
-            "subscribe #{i} must open — a leaked slot would 429 partway through",
-        );
+        // Pinned to ONE user so the per-user cap is genuinely in play. NOTE this
+        // status check is NOT what discriminates a reverted guard: dropping an
+        // unpolled stream drops its captured `rx`, so the sender is closed and
+        // `register`'s cap-boundary sweep reclaims the leaked entries — the
+        // (cap+1)th subscribe would still return 200. The LOAD-BEARING assertion
+        // is the final `connection_count() == 0` below (it reads 8 for N=20 /
+        // cap=12 with the guard reverted). Do not delete it.
+        assert_eq!(res.status(), StatusCode::OK, "subscribe #{i} must open");
         drop(res); // the client vanished; the body was NEVER polled
     }
 

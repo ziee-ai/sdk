@@ -386,8 +386,14 @@ fn prune_closed_for_user_locked<P: Principal>(
         // `remove_conn` is keyed off `clients`: it no-ops entirely when the row
         // is missing (an orphan), and when `clients[cid].user_id` disagrees with
         // `user_id` it would clean the OTHER user's index. So drop THIS user's
-        // index entry unconditionally as well — that is what actually guarantees
-        // the id stops counting against `user_id`'s cap, for every desync shape.
+        // index entry unconditionally as well — that is what guarantees the id
+        // stops counting against `user_id`'s cap for every shape that REACHES
+        // this loop (normal-dead, orphan, cross-user-dead). One shape cannot
+        // reach it: an id in `by_user[user_id]` whose `clients` row is a LIVE
+        // connection of a DIFFERENT user is filtered out of `dead` by design
+        // (nothing live is ever swept), so it would keep counting. That desync
+        // is unreachable — `register` and `remove_conn` are the only writers and
+        // both move the two indexes together under one lock.
         remove_conn(inner, cid);
         if let Some(set) = inner.by_user.get_mut(&user_id) {
             set.remove(&cid);
