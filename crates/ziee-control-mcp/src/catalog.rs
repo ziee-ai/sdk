@@ -154,7 +154,18 @@ pub fn build_catalog(spec: &Value) -> ControlCatalog {
                 .unwrap_or("")
                 .to_string();
             let description = op_obj.get("description").and_then(|v| v.as_str());
-            let required_permission = description.and_then(parse_required_permission);
+            // The description is the PRIMARY source, but it is not a reliable
+            // one: `with_permission` writes the permission into the operation's
+            // description, and any handler `_docs` builder that then calls
+            // `.description("…")` REPLACES that whole string. On the shipped
+            // spec that silently loses the permission on 201 of the 408
+            // operations that declare one — including `Project.create`, which
+            // reported `required_permission: null` to the model. So fall back to
+            // the 403 example `with_permission` also attaches, which no
+            // `.description()` can clobber.
+            let required_permission = description
+                .and_then(parse_required_permission)
+                .or_else(|| permission_from_403_example(op_obj));
             let tags = op_obj
                 .get("tags")
                 .and_then(|v| v.as_array())
@@ -344,6 +355,38 @@ pub fn parse_required_permission(description: &str) -> Option<String> {
     } else {
         Some(perm.to_string())
     }
+}
+
+/// Recover the required permission from the documented 403 response.
+///
+/// `with_permission` attaches, alongside the description, a 403 example whose
+/// `details.required_permissions[]` carries `{name, value, description}` per
+/// permission. That example is structured data on a DIFFERENT part of the
+/// operation, so a hand-written `.description("…")` cannot overwrite it — which
+/// makes it the reliable source when the description has been replaced.
+///
+/// Takes the FIRST permission, which is exact parity with
+/// [`parse_required_permission`] (it likewise returns only the first
+/// backtick-delimited token). The 5 multi-permission operations are therefore
+/// gated on their first permission rather than all of them — strictly more
+/// correct than today, where the multi-permission heading
+/// (`**Required Permissions (ALL):**`) does not even match the parser's marker
+/// and they resolve to `None`.
+fn permission_from_403_example(op_obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let perm = op_obj
+        .get("responses")?
+        .get("403")?
+        .get("content")?
+        .get("application/json")?
+        .get("example")?
+        .get("details")?
+        .get("required_permissions")?
+        .as_array()?
+        .first()?
+        .get("value")?
+        .as_str()?
+        .trim();
+    if perm.is_empty() { None } else { Some(perm.to_string()) }
 }
 
 #[cfg(test)]
@@ -572,6 +615,120 @@ mod tests {
         assert_eq!(cat.len(), 0);
         assert!(cat.is_empty());
         assert!(cat.components().is_object());
+    }
+
+    /// The shape a route produces when `with_permission` is followed by a
+    /// hand-written `.description("…")`: the permission is GONE from the prose
+    /// but still present, structured, in the documented 403. Modeled on the real
+    /// `Project.create` entry in `src-app/ui/openapi/openapi.json`.
+    fn clobbered_description_spec() -> Value {
+        json!({
+            "paths": {
+                "/api/projects": {
+                    "post": {
+                        "operationId": "Project.create",
+                        "summary": "Create a project",
+                        // NOTE: no `**Required Permission:**` marker — the
+                        // handler's own description replaced it.
+                        "description": "Create a personal chat project.\n\nError codes:\n- `VALIDATION_ERROR` (400) — name empty.",
+                        "responses": {
+                            "403": {
+                                "description": "Forbidden - Missing required permission",
+                                "content": { "application/json": { "example": {
+                                    "error": "Missing required permission: projects::create",
+                                    "error_code": "INSUFFICIENT_PERMISSIONS",
+                                    "details": { "required_permissions": [
+                                        { "name": "ProjectsCreate", "value": "projects::create", "description": "Create chat projects" }
+                                    ]}
+                                }}}
+                            }
+                        }
+                    }
+                },
+                "/api/both": {
+                    "post": {
+                        "operationId": "Both.write",
+                        // Marker PRESENT — it must win over the 403 example.
+                        "description": "**Required Permission:** `from::description`",
+                        "responses": { "403": { "content": { "application/json": { "example": {
+                            "details": { "required_permissions": [ { "value": "from::example" } ] }
+                        }}}}}
+                    }
+                },
+                "/api/multi": {
+                    "post": {
+                        "operationId": "Multi.write",
+                        // The multi-permission heading does NOT match the
+                        // parser's `Required Permission:` marker, so this only
+                        // resolves via the 403 example.
+                        "description": "**Required Permissions (ALL):**\n- `a::read` - Read a\n- `b::write` - Write b\n",
+                        "responses": { "403": { "content": { "application/json": { "example": {
+                            "details": { "required_permissions": [
+                                { "value": "a::read" }, { "value": "b::write" }
+                            ]}
+                        }}}}}
+                    }
+                },
+                "/api/malformed": {
+                    "post": {
+                        "operationId": "Malformed.write",
+                        "description": "no marker",
+                        "responses": { "403": { "content": { "application/json": { "example": {
+                            "details": { "required_permissions": [ { "name": "NoValueKey" } ] }
+                        }}}}}
+                    }
+                },
+                "/api/blank": {
+                    "post": {
+                        "operationId": "Blank.write",
+                        "description": "no marker",
+                        "responses": { "403": { "content": { "application/json": { "example": {
+                            "details": { "required_permissions": [ { "value": "   " } ] }
+                        }}}}}
+                    }
+                }
+            }
+        })
+    }
+
+    /// TEST-13 — the defect: a route whose description was overwritten still
+    /// reports its real permission, recovered from the documented 403.
+    #[test]
+    fn permission_recovered_from_403_example_when_description_was_overwritten() {
+        let cat = build_catalog(&clobbered_description_spec());
+        assert_eq!(
+            cat.get("Project.create").unwrap().required_permission.as_deref(),
+            Some("projects::create"),
+            "Project.create reported null to the model because its permission \
+             lived only in a description a handler `.description()` replaced"
+        );
+    }
+
+    /// TEST-14 — the description marker keeps precedence (no regression for the
+    /// operations that still carry it), a multi-permission op resolves to its
+    /// first permission, and malformed/blank examples degrade to `None` rather
+    /// than panicking or emitting an empty permission.
+    #[test]
+    fn description_marker_wins_and_malformed_examples_degrade() {
+        let cat = build_catalog(&clobbered_description_spec());
+        assert_eq!(
+            cat.get("Both.write").unwrap().required_permission.as_deref(),
+            Some("from::description"),
+            "the description marker is the primary source"
+        );
+        assert_eq!(
+            cat.get("Multi.write").unwrap().required_permission.as_deref(),
+            Some("a::read"),
+            "a multi-permission op resolves to its FIRST permission (parity with \
+             the single-permission parser), not to None"
+        );
+        assert!(cat.get("Malformed.write").unwrap().required_permission.is_none());
+        assert!(cat.get("Blank.write").unwrap().required_permission.is_none());
+
+        // And an operation with NEITHER source is still None (the original
+        // fixture's health check has no description and no 403).
+        let base = build_catalog(&fixture_spec());
+        assert!(base.get("Health.check").unwrap().required_permission.is_none());
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": DESCRIBE_CAPABILITY,
-                "description": "Get the full input contract for one operation: its path parameters, query parameters, and request-body JSON Schema, plus its required permission. Call this before `invoke_capability` so you send correctly-shaped input. Returns a not-permitted error if the operation is known to require a permission the current user lacks.",
+                "description": "Get the full input contract for one operation: its path parameters, query parameters, and request-body JSON Schema (fully resolved — every field, including nested objects and array items, is spelled out), plus its required permission. Call this before `invoke_capability` so you send correctly-shaped input. Returns a not-permitted error if the operation is known to require a permission the current user lacks.\n\nIf the user has not given you the values a required field needs, do NOT ask for them in chat text. Call `ask_user` with one property per field you still need, carrying the field's `title`, its `description`, its `enum` values as `enum` + `enumNames` where the schema declares them, and a `default` whenever the schema or the conversation implies a sensible starting value — so the user confirms or adjusts a pre-filled form instead of typing answers to a prose questionnaire.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -42,7 +42,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": INVOKE_CAPABILITY,
-                "description": "Run one operation against this ziee instance, exactly as if the user performed it in the UI. State-changing operations (create/update/delete) always require the user's explicit approval before they run. Provide path_params for any {…} placeholders, optional query parameters, and a body matching the operation's request schema. Returns the operation's real response (or its structured error, which you can use to correct and retry).",
+                "description": "Run one operation against this ziee instance, exactly as if the user performed it in the UI. State-changing operations (create/update/delete) always require the user's explicit approval before they run. Provide path_params for any {…} placeholders, optional query parameters, and a body matching the operation's request schema. Returns the operation's real response (or its structured error, which you can use to correct and retry).\n\nNever guess a required value and never ask for one in chat text: collect missing input with `ask_user` (one property per field, pre-filled with a `default` where one is implied), then invoke with the answers.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -132,5 +132,42 @@ mod tests {
         assert!(props.get("path_params").is_some());
         assert!(props.get("query").is_some());
         assert!(props.get("body").is_some());
+    }
+
+    /// TEST-17 — the model was writing "1. What's the project name? …" into the
+    /// chat instead of using the built-in form tool. Both descriptors must carry
+    /// the ask-with-a-form rule, and `describe_capability` must name the schema
+    /// keys that make the form good — including `default`, which the wizard
+    /// honours but the `ask_user` descriptor never mentions, so without it here
+    /// "pre-filled" is unactionable. Guards against a silent revert.
+    #[test]
+    fn descriptions_instruct_ask_user_instead_of_prose() {
+        let v = tool_list();
+        let tools = v["tools"].as_array().unwrap();
+        let desc = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let describe = desc(DESCRIBE_CAPABILITY);
+        for needle in ["ask_user", "default", "enumNames", "chat text"] {
+            assert!(
+                describe.contains(needle),
+                "describe_capability must mention `{needle}`: {describe}"
+            );
+        }
+
+        let invoke = desc(INVOKE_CAPABILITY);
+        for needle in ["ask_user", "default"] {
+            assert!(
+                invoke.contains(needle),
+                "invoke_capability must mention `{needle}`: {invoke}"
+            );
+        }
     }
 }
