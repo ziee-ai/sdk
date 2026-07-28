@@ -74,6 +74,21 @@ const PORT =
       cwd: CFG.__cwd,
     }),
   )
+// A falsy/NaN PORT here builds `http://localhost:/…`, which every browser
+// normalizes to PORT 80 — so the run silently audits a dead origin and reports
+// thousands of `net::ERR_NETWORK_CHANGED` HIGHs that read as a UI regression.
+// That misdiagnosis has cost several investigations (gate:ui runs whose findings
+// were ~100% ERR_NETWORK_CHANGED against a PORTLESS `http://localhost/`).
+// Fail loudly rather than audit nothing.
+if (!/^\d+$/.test(String(PORT)) || Number(PORT) <= 0 || Number(PORT) > 65535) {
+  console.error(
+    `runtime-health: refusing to run — resolved gallery PORT is ${JSON.stringify(PORT)}, ` +
+      `which would build "http://localhost:${PORT}${CFG.galleryUrl}". Browsers read that as ` +
+      `port 80, so every request fails and the findings describe nothing. ` +
+      `Pass --url=http://localhost:<port>${CFG.galleryUrl} or set GALLERY_PORT.`,
+  )
+  process.exit(2)
+}
 const BASE = arg('url', `http://localhost:${PORT}${CFG.galleryUrl}`)
 const OUT = arg('out', GALLERY_DIR)
 const STATES = arg('states', 'loaded,empty,error').split(',').filter(Boolean)
