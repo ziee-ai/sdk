@@ -97,15 +97,55 @@ export function portBase(key, floor, span) {
   return (floor + off) & 0xffff
 }
 
-/** True when `port` can be bound on 0.0.0.0 right now (mirrors
- *  `port-manager.ts::isPortBindable`: bind 0.0.0.0 so a docker publish shows). */
-export function isPortBindable(port) {
+/** True when `port` can be bound on `host` right now. */
+function bindableOn(port, host) {
   return new Promise((res) => {
     const srv = createServer()
     srv.once('error', () => res(false))
     srv.once('listening', () => srv.close(() => res(true)))
-    srv.listen(port, '0.0.0.0')
+    try {
+      srv.listen(port, host)
+    } catch {
+      res(false)
+    }
   })
+}
+
+/**
+ * True when `port` is free across the WHOLE dual stack — 0.0.0.0 (so a docker
+ * publish shows) AND ::1 AND 127.0.0.1.
+ *
+ * Checking only 0.0.0.0 was a real cross-worktree defect. Vite with `host:false`
+ * binds *localhost*, which on a dual-stack box includes `::1`. A sibling
+ * worktree's server holding `::1:PORT` leaves the IPv4 wildcard free, so a
+ * 0.0.0.0-only probe reported "bindable", gate-ui booted its own server on the
+ * SAME port after announcing it would avoid it, and the browser — resolving
+ * `localhost` to ::1 first — pulled modules from the FOREIGN worktree over
+ * `@fs/…`. Symptom: thousands of `net::ERR_NETWORK_CHANGED` HIGHs, a portless
+ * `http://localhost/`, and failing surface sets that differ run to run. Three
+ * separate investigations chased that as a UI regression before the collision
+ * was traced here. The surrounding comment already warned that "a TCP probe can
+ * miss a vite server bound only to IPv6 localhost" — this makes the probe obey it.
+ *
+ * A host that does not exist on this machine (no IPv6) yields EADDRNOTAVAIL,
+ * which is NOT occupancy — those are skipped rather than treated as a conflict.
+ */
+export async function isPortBindable(port) {
+  for (const host of ['0.0.0.0', '::1', '127.0.0.1']) {
+    // eslint-disable-next-line no-await-in-loop
+    const ok = await bindableOn(port, host)
+    if (ok) continue
+    // Distinguish "address family unavailable" from "port occupied": retry the
+    // family's wildcard: if THAT is bindable, the stack exists and the port is
+    // genuinely taken; if not, this family is simply absent here.
+    if (host === '::1') {
+      // eslint-disable-next-line no-await-in-loop
+      const v6Exists = await bindableOn(0, '::1')
+      if (!v6Exists) continue // no usable IPv6 on this box — not a conflict
+    }
+    return false
+  }
+  return true
 }
 
 /**
