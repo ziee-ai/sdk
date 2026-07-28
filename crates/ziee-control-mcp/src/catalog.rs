@@ -15,6 +15,13 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 
+/// OpenAPI extension key `ziee_framework::permissions::with_permission` stamps
+/// with the operation's full required-permission list. Duplicated as a literal
+/// (rather than imported) so this crate stays independent of `ziee-framework`;
+/// the framework side owns the canonical `X_REQUIRED_PERMISSIONS` const and a
+/// test there pins the value.
+const X_REQUIRED_PERMISSIONS: &str = "x-required-permissions";
+
 /// One drivable REST operation, distilled from the OpenAPI document.
 #[derive(Debug, Clone)]
 pub struct Operation {
@@ -26,10 +33,24 @@ pub struct Operation {
     pub path_template: String,
     pub tags: Vec<String>,
     pub summary: String,
-    /// Parsed from the handler `_docs` description
-    /// (`**Required Permission:** \`users::create\``). `None` when the route
-    /// declares no permission (rare — e.g. health).
+    /// The FIRST required permission, retained for display and for callers that
+    /// want a single label. `None` when the route declares none (rare — e.g.
+    /// health). Prefer [`Operation::required_permissions`] for gating: an
+    /// operation may require SEVERAL permissions, and holding only the first is
+    /// not authorization.
     pub required_permission: Option<String>,
+    /// EVERY permission the route requires (ALL-of semantics, declaration
+    /// order). Empty when the route declares none.
+    ///
+    /// Resolution order, most to least reliable:
+    /// 1. the `x-required-permissions` OpenAPI extension stamped by
+    ///    `with_permission` — the only source no handler can overwrite;
+    /// 2. the 403 example's `details.required_permissions[].value`;
+    /// 3. the `**Required Permission:** \`x\`` marker in the description.
+    /// (2) and (3) are retained as fallbacks so a hand-rolled operation that
+    /// documents a permission without going through `with_permission` is still
+    /// gated.
+    pub required_permissions: Vec<String>,
     /// Names of `{...}` path parameters, in template order.
     pub path_params: Vec<String>,
     /// The request body's `application/json` schema (may contain `$ref`s into
@@ -154,18 +175,9 @@ pub fn build_catalog(spec: &Value) -> ControlCatalog {
                 .unwrap_or("")
                 .to_string();
             let description = op_obj.get("description").and_then(|v| v.as_str());
-            // The description is the PRIMARY source, but it is not a reliable
-            // one: `with_permission` writes the permission into the operation's
-            // description, and any handler `_docs` builder that then calls
-            // `.description("…")` REPLACES that whole string. On the shipped
-            // spec that silently loses the permission on 201 of the 408
-            // operations that declare one — including `Project.create`, which
-            // reported `required_permission: null` to the model. So fall back to
-            // the 403 example `with_permission` also attaches, which no
-            // `.description()` can clobber.
-            let required_permission = description
-                .and_then(parse_required_permission)
-                .or_else(|| permission_from_403_example(op_obj));
+            // Resolution is deliberately layered — see `required_permissions_of`.
+            let required_permissions = required_permissions_of(op_obj, description);
+            let required_permission = required_permissions.first().cloned();
             let tags = op_obj
                 .get("tags")
                 .and_then(|v| v.as_array())
@@ -194,6 +206,7 @@ pub fn build_catalog(spec: &Value) -> ControlCatalog {
                 tags,
                 summary,
                 required_permission,
+                required_permissions,
                 path_params: extract_path_params(path_template),
                 request_schema,
                 json_body,
@@ -357,36 +370,78 @@ pub fn parse_required_permission(description: &str) -> Option<String> {
     }
 }
 
-/// Recover the required permission from the documented 403 response.
+/// Every permission the route requires, resolved from the most reliable source
+/// available.
 ///
-/// `with_permission` attaches, alongside the description, a 403 example whose
-/// `details.required_permissions[]` carries `{name, value, description}` per
-/// permission. That example is structured data on a DIFFERENT part of the
-/// operation, so a hand-written `.description("…")` cannot overwrite it — which
-/// makes it the reliable source when the description has been replaced.
+/// Three sources exist and they are NOT equally trustworthy:
 ///
-/// Takes the FIRST permission, which is exact parity with
-/// [`parse_required_permission`] (it likewise returns only the first
-/// backtick-delimited token). The 5 multi-permission operations are therefore
-/// gated on their first permission rather than all of them — strictly more
-/// correct than today, where the multi-permission heading
-/// (`**Required Permissions (ALL):**`) does not even match the parser's marker
-/// and they resolve to `None`.
-fn permission_from_403_example(op_obj: &serde_json::Map<String, Value>) -> Option<String> {
-    let perm = op_obj
-        .get("responses")?
-        .get("403")?
-        .get("content")?
-        .get("application/json")?
-        .get("example")?
-        .get("details")?
-        .get("required_permissions")?
-        .as_array()?
-        .first()?
-        .get("value")?
-        .as_str()?
-        .trim();
-    if perm.is_empty() { None } else { Some(perm.to_string()) }
+/// 1. **`x-required-permissions`** (`ziee_framework::permissions::with_permission`
+///    stamps it) — an OpenAPI extension nothing else writes. The only source a
+///    handler cannot destroy, and the only one that carries ALL permissions of
+///    an ALL-of operation.
+/// 2. **The 403 example** — structured, but a handler that attaches its own
+///    `.response_with::<403, …>` REPLACES the whole response object and takes
+///    the example with it (18 gated operations on the shipped spec).
+/// 3. **The description marker** — prose, and any later `.description("…")`
+///    overwrites it (201 gated operations on the shipped spec). It also cannot
+///    express the multi-permission form: the `**Required Permissions (ALL):**`
+///    heading does not match the parser's marker at all.
+///
+/// (2) and (3) are kept as fallbacks so an operation that documents a permission
+/// WITHOUT going through `with_permission` is still gated. Returning the full
+/// set (rather than the first) is what lets `user_may_run` require ALL of them:
+/// holding one permission of an ALL-of pair is not authorization.
+fn required_permissions_of(
+    op_obj: &serde_json::Map<String, Value>,
+    description: Option<&str>,
+) -> Vec<String> {
+    if let Some(perms) = permissions_from_extension(op_obj) {
+        return perms;
+    }
+    let from_403 = permissions_from_403_example(op_obj);
+    if !from_403.is_empty() {
+        return from_403;
+    }
+    description
+        .and_then(parse_required_permission)
+        .into_iter()
+        .collect()
+}
+
+/// (1) The `x-required-permissions` extension.
+fn permissions_from_extension(op_obj: &serde_json::Map<String, Value>) -> Option<Vec<String>> {
+    let arr = op_obj.get(X_REQUIRED_PERMISSIONS)?.as_array()?;
+    let perms: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if perms.is_empty() { None } else { Some(perms) }
+}
+
+/// (2) The documented 403 example's `details.required_permissions[].value`.
+fn permissions_from_403_example(op_obj: &serde_json::Map<String, Value>) -> Vec<String> {
+    let Some(arr) = op_obj
+        .get("responses")
+        .and_then(|r| r.get("403"))
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.get("application/json"))
+        .and_then(|c| c.get("example"))
+        .and_then(|e| e.get("details"))
+        .and_then(|d| d.get("required_permissions"))
+        .and_then(|p| p.as_array())
+    else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|e| e.get("value"))
+        .filter_map(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]
@@ -645,10 +700,22 @@ mod tests {
                         }
                     }
                 },
+                "/api/all-three": {
+                    "post": {
+                        "operationId": "AllThree.write",
+                        // All three sources present and DISAGREEING — the
+                        // unclobberable extension must win.
+                        "x-required-permissions": ["from::extension", "second::perm"],
+                        "description": "**Required Permission:** `from::description`",
+                        "responses": { "403": { "content": { "application/json": { "example": {
+                            "details": { "required_permissions": [ { "value": "from::example" } ] }
+                        }}}}}
+                    }
+                },
                 "/api/both": {
                     "post": {
                         "operationId": "Both.write",
-                        // Marker PRESENT — it must win over the 403 example.
+                        // No extension: the 403 example outranks the prose.
                         "description": "**Required Permission:** `from::description`",
                         "responses": { "403": { "content": { "application/json": { "example": {
                             "details": { "required_permissions": [ { "value": "from::example" } ] }
@@ -704,30 +771,53 @@ mod tests {
         );
     }
 
-    /// TEST-14 — the description marker keeps precedence (no regression for the
-    /// operations that still carry it), a multi-permission op resolves to its
-    /// first permission, and malformed/blank examples degrade to `None` rather
-    /// than panicking or emitting an empty permission.
+    /// TEST-14 — precedence is by RELIABILITY, not by convenience: the
+    /// unclobberable `x-required-permissions` extension beats the 403 example,
+    /// which beats the prose marker (any later `.description(…)` overwrites the
+    /// prose, and any later `.response_with::<403,…>` overwrites the example).
+    /// A multi-permission operation resolves to ALL of its permissions, and a
+    /// malformed/blank source degrades to empty rather than panicking.
     #[test]
-    fn description_marker_wins_and_malformed_examples_degrade() {
+    fn permission_precedence_is_extension_then_403_then_description() {
         let cat = build_catalog(&clobbered_description_spec());
-        assert_eq!(
-            cat.get("Both.write").unwrap().required_permission.as_deref(),
-            Some("from::description"),
-            "the description marker is the primary source"
-        );
-        assert_eq!(
-            cat.get("Multi.write").unwrap().required_permission.as_deref(),
-            Some("a::read"),
-            "a multi-permission op resolves to its FIRST permission (parity with \
-             the single-permission parser), not to None"
-        );
-        assert!(cat.get("Malformed.write").unwrap().required_permission.is_none());
-        assert!(cat.get("Blank.write").unwrap().required_permission.is_none());
 
-        // And an operation with NEITHER source is still None (the original
-        // fixture's health check has no description and no 403).
+        let all_three = cat.get("AllThree.write").unwrap();
+        assert_eq!(
+            all_three.required_permissions,
+            vec!["from::extension".to_string(), "second::perm".to_string()],
+            "the unclobberable extension must win, and carry EVERY permission"
+        );
+        assert_eq!(
+            all_three.required_permission.as_deref(),
+            Some("from::extension"),
+            "the single-label projection is the first of the set"
+        );
+
+        assert_eq!(
+            cat.get("Both.write").unwrap().required_permissions,
+            vec!["from::example".to_string()],
+            "with no extension, the structured 403 example outranks the prose marker"
+        );
+
+        // ALL permissions of an ALL-of operation, not just the first — holding
+        // one of a pair is not authorization.
+        assert_eq!(
+            cat.get("Multi.write").unwrap().required_permissions,
+            vec!["a::read".to_string(), "b::write".to_string()]
+        );
+
+        assert!(cat.get("Malformed.write").unwrap().required_permissions.is_empty());
+        assert!(cat.get("Blank.write").unwrap().required_permissions.is_empty());
+
+        // The prose marker is still honoured when it is the ONLY source (a
+        // hand-rolled operation that never went through `with_permission`).
         let base = build_catalog(&fixture_spec());
+        assert_eq!(
+            base.get("User.create").unwrap().required_permissions,
+            vec!["users::create".to_string()]
+        );
+        // And an operation with NO source at all stays unpermissioned.
+        assert!(base.get("Health.check").unwrap().required_permissions.is_empty());
         assert!(base.get("Health.check").unwrap().required_permission.is_none());
     }
 

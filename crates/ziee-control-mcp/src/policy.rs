@@ -141,6 +141,7 @@ mod tests {
             tags: vec![],
             summary: String::new(),
             required_permission: None,
+            required_permissions: Vec::new(),
             path_params: vec![],
             request_schema: None,
             json_body,
