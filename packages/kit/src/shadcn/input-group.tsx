@@ -27,10 +27,27 @@ const inputGroupAddonVariants = cva(
   {
     variants: {
       align: {
+        // Inline addons TIGHTEN their own inline padding for a button/kbd child
+        // (whose own padding already supplies most of the optical gap) — they do
+        // NOT pull themselves outward with a negative margin.
+        //
+        // A negative inline margin on a flex child shrinks its OUTER size, so its
+        // border box ends |margin| PAST the group's content box: the old
+        // `has-[>button]:mr-[-0.3rem]` put every combobox addon 3.8px outside its
+        // own group, at every width, giving each group 5px of horizontal
+        // scrollable overflow. That forced a scrollbar on any `overflow-auto`
+        // ancestor and made ancestor-chain overflow probes unusable downstream
+        // (`.lifecycle/workflow-builder-ux/FIX_ROUND-2.md`). `-0.3rem`/`-0.15rem`
+        // were also off the 4px spacing scale, and `ml`/`mr`/`pl`/`pr` do not flip
+        // under RTL although `data-align` is expressed in logical terms.
+        //
+        // Grid-aligned logical padding instead: 8px bare, 4px beside a button,
+        // 6px beside a kbd — within 0.8px of the old optical result, inside the
+        // group, on-scale, and RTL-correct.
         "inline-start":
-          "order-first pl-2 has-[>button]:ml-[-0.3rem] has-[>kbd]:ml-[-0.15rem]",
+          "order-first ps-2 has-[>button]:ps-1 has-[>kbd]:ps-1.5",
         "inline-end":
-          "order-last pr-2 has-[>button]:mr-[-0.3rem] has-[>kbd]:mr-[-0.15rem]",
+          "order-last pe-2 has-[>button]:pe-1 has-[>kbd]:pe-1.5",
         "block-start":
           "order-first w-full justify-start px-2.5 pt-2 group-has-[>input]/input-group:pt-2 [.border-b]:pb-2",
         "block-end":
