@@ -267,9 +267,23 @@ function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
     warmIdle(() => {
       for (const k of keys) {
         try {
-          lazyDispatchers[k].preload?.()
-        } catch {
-          /* best-effort */
+          // `.catch` is REQUIRED, not belt-and-braces: `preload()` returns a
+          // promise, so the surrounding try/catch only ever caught a synchronous
+          // throw. A chunk that fails to load therefore produced an UNHANDLED
+          // REJECTION — i.e. an uncaught page-level error — for a warm-up nobody
+          // asked for and nothing awaits. (Observed directly: blocking one action
+          // chunk in an e2e produced page errors from this loop alone.)
+          //
+          // A failed warm-up is a genuine no-op: the chunk is simply not warm, and
+          // the on-demand dispatch retries it and surfaces a real error to the
+          // caller if it still fails. So swallow it at debug volume — the
+          // `vite:preloadError` listener has already logged the load failure once
+          // and marked the build stale.
+          lazyDispatchers[k].preload?.().catch((err: unknown) => {
+            console.debug(`[store-kit] prefetch of lazy action "${k}" failed (ignored)`, err)
+          })
+        } catch (err) {
+          console.debug(`[store-kit] prefetch of lazy action "${k}" threw (ignored)`, err)
         }
       }
     }),
@@ -358,8 +372,14 @@ function makeBuilder<State extends object, Actions extends object>(
         // The dispatcher (chunk memoization, `.preload()`, and the chunk-load
         // de-dup window that keeps each action's OWN in-flight guard reachable)
         // lives in ./lazy-dispatch.ts — see the rationale there.
-        lazyDispatchers[key] = createLazyDispatcher(() =>
-          loader().then(m => m.default(set, get)),
+        //
+        // The two stages are passed SEPARATELY on purpose: the dispatcher must
+        // distinguish a TRANSIENT chunk-download failure (retry, never memoize —
+        // a deploy while the tab is open invalidates every hashed chunk URL)
+        // from a DETERMINISTIC action-factory throw (memoize, fail fast).
+        lazyDispatchers[key] = createLazyDispatcher(
+          () => loader(),
+          m => m.default(set, get),
         )
       }
     }
