@@ -64,8 +64,29 @@ export function Card({ title, extra, footer, loading, size = 'default', hoverabl
   )
 }
 
-// Omit `style` (style-gated, like CardProps). A plain action row needs no test id
-// of its own — it is addressed by `[data-slot="card-actions"]`.
+/**
+ * Props for {@link CardActions}. Plain div props minus `style` (inline style is
+ * gated kit-wide).
+ *
+ * NOTE — this row is OPINIONATED about its direct children, which is unusual for
+ * a kit container, so it is stated here (the generated KIT_MANIFEST carries this
+ * text): every direct `button`/`a` child is normalized to `max-w-full`,
+ * `h-auto min-h-8 py-1`, and wrapping text (`whitespace-normal break-words
+ * text-center`). That is what stops a single over-wide action from protruding out
+ * of the row. Consequences to know before using it:
+ *
+ * - a `size="lg"` (36px) or `size="icon*"` (square) child is re-sized to the 32px
+ *   `size="default"` metric and is no longer square — put icon-only or `lg`
+ *   actions in a plain row, not here;
+ * - the rules reach DIRECT children only, so a nested wrapper's buttons are NOT
+ *   protected — make every action a direct child (use `me-auto` on a leading
+ *   action to split the row) rather than grouping them in a nested `div`;
+ * - non-control children are deliberately untouched, so a `Text`/status node in
+ *   the row keeps its own metrics;
+ * - `className` merges last, so `justify-*`/`items-*` can be overridden; the
+ *   child rules can be overridden only by re-declaring the same arbitrary variant
+ *   (e.g. `[&>button]:min-h-10`), NOT by a height utility on the row.
+ */
 export type CardActionsProps = Omit<React.ComponentProps<'div'>, 'style'>
 
 /**
@@ -101,23 +122,37 @@ export type CardActionsProps = Omit<React.ComponentProps<'div'>, 'style'>
  * the line and let its LABEL wrap instead — never truncated and never ellipsised,
  * because on a consent surface hidden text is the thing being defended against.
  *
- * Contract worth knowing: the child rules out-specify a child's own size utility
- * (`.row > *` beats `.min-h-9`), so children are normalized to a 32px minimum
- * height — i.e. `size="default"`. A row that needs taller controls sets the
- * height on the row via `className`.
+ * Mechanism worth knowing (it is NOT specificity): `.row > button` and the
+ * button's own `.h-8` both compute to specificity (0,1,0), so the override wins
+ * by Tailwind's EMISSION ORDER within `@layer utilities` — arbitrary-variant
+ * utilities are emitted after plain ones. It is therefore not a guarantee that
+ * survives an `!important` child or a hand-written stylesheet, and a row that
+ * needs different child metrics must re-declare the same variant
+ * (`[&>button]:min-h-10`), not set a height on the row. See {@link CardActionsProps}
+ * for the full child contract.
  */
 export function CardActions({ className, children, ...rest }: CardActionsProps) {
   return (
     <div
-      data-slot="card-actions"
       className={cn(
         'flex w-full flex-wrap justify-end gap-2',
         // An action wider than the line is capped to it and wraps its label,
         // rather than overflowing the inline-start edge where nothing can reach it.
-        '[&>*]:max-w-full [&>*]:h-auto [&>*]:min-h-8 [&>*]:py-1 [&>*]:whitespace-normal',
+        // Scoped to CONTROLS (`button`/`a`): applying these to every child leaked
+        // padding and a min-height onto plain layout/text nodes, which grew rows
+        // at EVERY width and broke this component's "inert when it fits" contract.
+        // `break-words` matters for a translated label whose longest token exceeds
+        // the line (`whitespace-normal` alone only breaks at spaces); `text-center`
+        // keeps a wrapped 2-line label centred rather than ragged, since the
+        // button centres as a flex box but does not centre its text.
+        '[&>:is(button,a)]:max-w-full [&>:is(button,a)]:h-auto [&>:is(button,a)]:min-h-8',
+        '[&>:is(button,a)]:py-1 [&>:is(button,a)]:whitespace-normal [&>:is(button,a)]:break-words [&>:is(button,a)]:text-center',
         className,
       )}
       {...rest}
+      // AFTER the spread on purpose: the slot marker is the only selector this
+      // row is addressed by, so a caller must not be able to clobber it.
+      data-slot="card-actions"
     >
       {children}
     </div>
