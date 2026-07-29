@@ -69,8 +69,11 @@ export function Card({ title, extra, footer, loading, size = 'default', hoverabl
  * gated kit-wide).
  *
  * NOTE — this row is OPINIONATED about its direct children, which is unusual for
- * a kit container, so it is stated here (the generated KIT_MANIFEST carries this
- * text): every direct `button`/`a` child is normalized to `max-w-full`,
+ * a kit container, so it is stated here. (It is NOT in `KIT_MANIFEST.md`: that
+ * generator emits per-PROP rows only, and this type declares no kit-authored
+ * props, so the manifest entry is just "_No always-required props._" — read this
+ * comment, not the manifest, before using it.) Every direct `button`/`a` child is
+ * normalized to `max-w-full`,
  * `h-auto min-h-8 py-1`, and wrapping text (`whitespace-normal break-words
  * text-center`). That is what stops a single over-wide action from protruding out
  * of the row. Consequences to know before using it:
@@ -122,12 +125,12 @@ export type CardActionsProps = Omit<React.ComponentProps<'div'>, 'style'>
  * the line and let its LABEL wrap instead — never truncated and never ellipsised,
  * because on a consent surface hidden text is the thing being defended against.
  *
- * Mechanism worth knowing (it is NOT specificity): `.row > button` and the
- * button's own `.h-8` both compute to specificity (0,1,0), so the override wins
- * by Tailwind's EMISSION ORDER within `@layer utilities` — arbitrary-variant
- * utilities are emitted after plain ones. It is therefore not a guarantee that
- * survives an `!important` child or a hand-written stylesheet, and a row that
- * needs different child metrics must re-declare the same variant
+ * Mechanism worth knowing: the child rules compile to `& > :is(button,a)`, whose
+ * specificity is the parent class (0,1,0) plus `:is(button,a)` (0,0,1) = (0,1,1)
+ * — so they beat the button's own `.h-8` (0,1,0) by SPECIFICITY. (An earlier,
+ * unscoped `[&>*]` form did NOT: `*` adds nothing, so that version tied at
+ * (0,1,0) and won only by Tailwind's emission order.) A row that needs different
+ * child metrics must therefore re-declare the same variant
  * (`[&>button]:min-h-10`), not set a height on the row. See {@link CardActionsProps}
  * for the full child contract.
  */
@@ -141,12 +144,19 @@ export function CardActions({ className, children, ...rest }: CardActionsProps) 
         // Scoped to CONTROLS (`button`/`a`): applying these to every child leaked
         // padding and a min-height onto plain layout/text nodes, which grew rows
         // at EVERY width and broke this component's "inert when it fits" contract.
-        // `break-words` matters for a translated label whose longest token exceeds
-        // the line (`whitespace-normal` alone only breaks at spaces); `text-center`
-        // keeps a wrapped 2-line label centred rather than ragged, since the
-        // button centres as a flex box but does not centre its text.
+        // `wrap-anywhere` (overflow-wrap: anywhere), NOT `break-words`: measured on
+        // a real button in this row, `overflow-wrap: break-word` leaves an
+        // unbroken 47-char token at clientWidth 236 / scrollWidth 312 with the
+        // height unchanged at 32px — the word never breaks, because break-word is
+        // excluded from min-content sizing, so the label spills straight back out
+        // of the card's `overflow-hidden` edge. `anywhere` IS included in
+        // min-content sizing: same token measures 236/236 and wraps to 50px tall.
+        // That distinction is the whole difference between this row keeping its
+        // promise and quietly reproducing the defect for a non-English label.
+        // `text-center` keeps a wrapped 2-line label centred rather than ragged,
+        // since the button centres as a flex box but does not centre its text.
         '[&>:is(button,a)]:max-w-full [&>:is(button,a)]:h-auto [&>:is(button,a)]:min-h-8',
-        '[&>:is(button,a)]:py-1 [&>:is(button,a)]:whitespace-normal [&>:is(button,a)]:break-words [&>:is(button,a)]:text-center',
+        '[&>:is(button,a)]:py-1 [&>:is(button,a)]:whitespace-normal [&>:is(button,a)]:wrap-anywhere [&>:is(button,a)]:text-center',
         className,
       )}
       {...rest}
