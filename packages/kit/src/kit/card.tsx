@@ -74,8 +74,9 @@ export function Card({ title, extra, footer, loading, size = 'default', hoverabl
  * props, so the manifest entry is just "_No always-required props._" — read this
  * comment, not the manifest, before using it.) Every direct `button`/`a` child is
  * normalized to `max-w-full`,
- * `h-auto min-h-8 py-1`, and wrapping text (`whitespace-normal break-words
- * text-center`). That is what stops a single over-wide action from protruding out
+ * `h-auto min-h-8 py-1`, and wrapping text (`whitespace-normal wrap-anywhere
+ * text-center` — `wrap-anywhere`, not `break-words`, because only the former
+ * participates in min-content sizing and so actually breaks an unbroken token). That is what stops a single over-wide action from protruding out
  * of the row. Consequences to know before using it:
  *
  * - a `size="lg"` (36px) or `size="icon*"` (square) child is re-sized to the 32px
