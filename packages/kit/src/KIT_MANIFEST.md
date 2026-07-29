@@ -14,7 +14,7 @@ Cross-cutting rules every agent must follow:
   the container's testid — give the CONTAINER a testid and the rows are covered.
 - Never import `antd`, never use raw `<button>/<input>/<select>/<textarea>` (Biome blocks both).
 
-67 components documented.
+68 components documented.
 
 ## Accordion _(discriminated union — see source for variant-specific props)_
 
@@ -227,6 +227,10 @@ _No always-required props._
 | `title` | `ReactNode` |  |
 
 </details>
+
+## CardActions
+
+_No always-required props._
 
 ## Checkbox _(discriminated union — see source for variant-specific props)_
 
