@@ -75,27 +75,43 @@ export function markStaleBuild(): void {
   staleBuild = true
 }
 
-/** Test-only reset — the mark is deliberately sticky in production. */
-export function __resetStaleBuildForTests(): void {
-  staleBuild = false
-}
-
-let installed = false
+type ListenerTarget = Pick<Window, 'addEventListener' | 'removeEventListener'>
 
 /**
- * Install the `vite:preloadError` listener. Idempotent: calling it twice (web
- * entry + a re-entrant bootstrap) registers exactly one listener.
+ * Targets that already carry a listener.
+ *
+ * PER-TARGET, not a module-scope boolean: this module is module state shared by
+ * every consumer in the process, so a single `installed` flag meant one caller
+ * that never uninstalled silently disabled installation for everything after it
+ * — including later tests in the same file — while handing back a no-op
+ * uninstall indistinguishable from a real one. A WeakSet also lets two genuinely
+ * different targets (a window and a test double) each get their listener.
+ */
+const installedTargets = new WeakSet<ListenerTarget>()
+
+/** Test-only reset — BOTH pieces of module state; the mark is deliberately
+ *  sticky in production, and the install set must not leak between specs. */
+export function __resetStaleBuildForTests(target?: ListenerTarget): void {
+  staleBuild = false
+  if (target) installedTargets.delete(target)
+}
+
+/**
+ * Install the `vite:preloadError` listener. Idempotent PER TARGET: calling it
+ * twice for the same target (web entry + a re-entrant bootstrap) registers
+ * exactly one listener.
  *
  * @param target the event target to listen on. Defaults to `window`; injected in
  *        tests. A no-op when there is no target (SSR / a node unit context).
  * @returns an uninstall function.
  */
 export function installChunkLoadRecovery(
-  target: Pick<Window, 'addEventListener' | 'removeEventListener'> | undefined =
-    typeof window === 'undefined' ? undefined : window,
+  target: ListenerTarget | undefined = typeof window === 'undefined'
+    ? undefined
+    : window,
 ): () => void {
-  if (!target || installed) return () => {}
-  installed = true
+  if (!target || installedTargets.has(target)) return () => {}
+  installedTargets.add(target)
 
   const onPreloadError = (event: Event) => {
     markStaleBuild()
@@ -115,6 +131,6 @@ export function installChunkLoadRecovery(
       'vite:preloadError',
       onPreloadError as EventListener,
     )
-    installed = false
+    installedTargets.delete(target)
   }
 }

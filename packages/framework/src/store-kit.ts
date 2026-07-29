@@ -14,6 +14,7 @@ import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
 import { createStoreProxy, type StoreProxy } from './stores'
 import { onNetworkIdle } from './net-idle'
 import { createLazyDispatcher } from './lazy-dispatch'
+import { isStaleBuild } from './chunk-recovery'
 
 // ============================================================================
 // store-kit — thin authoring layer over the existing Zustand + Stores.X proxy.
@@ -265,6 +266,14 @@ function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
   // while the auth/providers call was still pending.)
   onNetworkIdle(() =>
     warmIdle(() => {
+      // Bail if a code-split chunk has ALREADY failed in this page's lifetime.
+      // The page is then running against a build the server no longer fully
+      // serves, so warming the remaining chunks cannot succeed — and each
+      // attempt now carries a retry budget with backoff timers. Without this,
+      // one deploy-while-a-tab-is-open turns a prefetch nobody asked for into
+      // hundreds of doomed requests across every registered store. The
+      // on-demand dispatch is unaffected: it still tries, and reports.
+      if (isStaleBuild()) return
       for (const k of keys) {
         try {
           // `.catch` is REQUIRED, not belt-and-braces: `preload()` returns a
