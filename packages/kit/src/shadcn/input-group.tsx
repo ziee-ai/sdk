@@ -14,7 +14,7 @@ function InputGroup({ className, ...props }: React.ComponentProps<"div">) {
       data-slot="input-group"
       role="group"
       className={cn(
-        "group/input-group relative flex h-8 w-full min-w-0 items-center rounded-lg border border-input transition-colors outline-none in-data-[slot=combobox-content]:focus-within:border-inherit in-data-[slot=combobox-content]:focus-within:ring-0 has-disabled:bg-input/50 has-disabled:opacity-50 has-[[data-slot=input-group-control]:focus-visible]:border-ring has-[[data-slot=input-group-control]:focus-visible]:ring-3 has-[[data-slot=input-group-control]:focus-visible]:ring-ring/50 has-[[data-slot][aria-invalid=true]]:border-destructive has-[[data-slot][aria-invalid=true]]:ring-3 has-[[data-slot][aria-invalid=true]]:ring-destructive/20 has-[>[data-align=block-end]]:h-auto has-[>[data-align=block-end]]:flex-col has-[>[data-align=block-start]]:h-auto has-[>[data-align=block-start]]:flex-col has-[>textarea]:h-auto dark:bg-input/30 dark:has-disabled:bg-input/80 dark:has-[[data-slot][aria-invalid=true]]:ring-destructive/40 has-[>[data-align=block-end]]:[&>input]:pt-3 has-[>[data-align=block-start]]:[&>input]:pb-3 has-[>[data-align=inline-end]]:[&>input]:pr-1.5 has-[>[data-align=inline-start]]:[&>input]:pl-1.5",
+        "group/input-group relative flex h-8 w-full min-w-0 items-center rounded-lg border border-input transition-colors outline-none in-data-[slot=combobox-content]:focus-within:border-inherit in-data-[slot=combobox-content]:focus-within:ring-0 has-disabled:bg-input/50 has-disabled:opacity-50 has-[[data-slot=input-group-control]:focus-visible]:border-ring has-[[data-slot=input-group-control]:focus-visible]:ring-3 has-[[data-slot=input-group-control]:focus-visible]:ring-ring/50 has-[[data-slot][aria-invalid=true]]:border-destructive has-[[data-slot][aria-invalid=true]]:ring-3 has-[[data-slot][aria-invalid=true]]:ring-destructive/20 has-[>[data-align=block-end]]:h-auto has-[>[data-align=block-end]]:flex-col has-[>[data-align=block-start]]:h-auto has-[>[data-align=block-start]]:flex-col has-[>textarea]:h-auto dark:bg-input/30 dark:has-disabled:bg-input/80 dark:has-[[data-slot][aria-invalid=true]]:ring-destructive/40 has-[>[data-align=block-end]]:[&>input]:pt-3 has-[>[data-align=block-start]]:[&>input]:pb-3 has-[>[data-align=inline-end]]:[&>input]:pe-1.5 has-[>[data-align=inline-start]]:[&>input]:ps-1.5",
         className
       )}
       {...props}
@@ -31,19 +31,24 @@ const inputGroupAddonVariants = cva(
         // (whose own padding already supplies most of the optical gap) — they do
         // NOT pull themselves outward with a negative margin.
         //
-        // A negative inline margin on a flex child shrinks its OUTER size, so its
-        // border box ends |margin| PAST the group's content box: the old
-        // `has-[>button]:mr-[-0.3rem]` put every combobox addon 3.8px outside its
-        // own group, at every width, giving each group 5px of horizontal
-        // scrollable overflow. That forced a scrollbar on any `overflow-auto`
-        // ancestor and made ancestor-chain overflow probes unusable downstream
-        // (`.lifecycle/workflow-builder-ux/FIX_ROUND-2.md`). `-0.3rem`/`-0.15rem`
-        // were also off the 4px spacing scale, and `ml`/`mr`/`pl`/`pr` do not flip
-        // under RTL although `data-align` is expressed in logical terms.
+        // These used to carry a conditional negative inline margin (-0.3rem for a
+        // button child, -0.15rem for a kbd). A negative inline margin on a flex
+        // child shrinks its OUTER size, so its border box ends |margin| PAST the
+        // group's content box: every combobox addon rendered 3.8px outside its own
+        // group, which each group reported as 5px of horizontal scrollable
+        // overflow (clientWidth excludes the 1px borders). That forced a scrollbar
+        // on any overflow-auto ancestor and made ancestor-chain overflow probes
+        // unusable downstream. The values were also off the 4px spacing scale, and
+        // physical margin/padding does not flip under RTL although `data-align` is
+        // expressed in logical terms.
         //
         // Grid-aligned logical padding instead: 8px bare, 4px beside a button,
-        // 6px beside a kbd — within 0.8px of the old optical result, inside the
-        // group, on-scale, and RTL-correct.
+        // 6px beside a kbd. Measured: the child's inset from the group's inner
+        // edge moves 3.20px -> 4.00px (button) and 5.61px -> 6.00px (kbd), the
+        // overhang past the group goes to 0, and the input-to-child gap is
+        // unchanged at 6.00px in LTR. (Class names above are deliberately not
+        // repeated in prose here: Tailwind scans source text, so quoting a deleted
+        // utility would re-emit its CSS.)
         "inline-start":
           "order-first ps-2 has-[>button]:ps-1 has-[>kbd]:ps-1.5",
         "inline-end":
