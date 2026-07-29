@@ -267,13 +267,16 @@ function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
   onNetworkIdle(() =>
     warmIdle(() => {
       for (const k of keys) {
-        // Re-checked PER KEY, not once before the loop: every store's warm
-        // callback is scheduled off the same idle tick, so a check hoisted out of
-        // the loop is a no-op on the first pass — no chunk has failed yet when it
-        // runs. Inside the loop it takes effect the moment the first failure
-        // lands, which is what actually stops one deploy-while-a-tab-is-open from
-        // turning a prefetch nobody asked for into a flood of doomed requests
-        // with backoff timers. The on-demand dispatch is unaffected: it still
+        // Skip warming once chunk loading is known to be broken.
+        //
+        // HONEST SCOPE, because an earlier comment here overstated it: this loop
+        // body is SYNCHRONOUS (`preload()` is invoked, not awaited) and the mark
+        // can only be set asynchronously, so it cannot flip BETWEEN iterations —
+        // the store whose chunks are failing still fires all of its own keys.
+        // What this does prevent is every store scheduled on a LATER idle tick
+        // (route entry, lazy module registration) from repeating the exercise, so
+        // one deploy-while-a-tab-is-open costs one store's keys rather than every
+        // registered store's. The on-demand dispatch is unaffected: it still
         // tries, and reports. A successful import clears the mark, so a transient
         // blip does not disable prefetch for the session.
         if (isStaleBuild()) return
