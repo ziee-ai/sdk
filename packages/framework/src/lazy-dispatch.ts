@@ -75,7 +75,7 @@
 // their body — harmless, they set the same state — but issue ONE request.
 // ============================================================================
 
-import { markStaleBuild } from './chunk-recovery'
+import { clearStaleBuild, markStaleBuild } from './chunk-recovery'
 
 /** Stage 1: download the action's chunk. */
 export type ModuleLoader<M> = () => Promise<M>
@@ -170,6 +170,10 @@ export function createLazyDispatcher<M = any>(
             'lazy chunk import resolved with no module — the load failed and something suppressed the rejection (e.g. a vite:preloadError listener calling preventDefault)',
           )
         }
+        // A chunk just loaded: whatever failed earlier is no longer failing, so
+        // the stale mark (which gates both the user-facing "the app may have been
+        // updated" hint and store-kit's prefetch bail) must not outlive it.
+        clearStaleBuild()
         return mod
       } catch (err) {
         lastError = err

@@ -266,15 +266,17 @@ function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
   // while the auth/providers call was still pending.)
   onNetworkIdle(() =>
     warmIdle(() => {
-      // Bail if a code-split chunk has ALREADY failed in this page's lifetime.
-      // The page is then running against a build the server no longer fully
-      // serves, so warming the remaining chunks cannot succeed — and each
-      // attempt now carries a retry budget with backoff timers. Without this,
-      // one deploy-while-a-tab-is-open turns a prefetch nobody asked for into
-      // hundreds of doomed requests across every registered store. The
-      // on-demand dispatch is unaffected: it still tries, and reports.
-      if (isStaleBuild()) return
       for (const k of keys) {
+        // Re-checked PER KEY, not once before the loop: every store's warm
+        // callback is scheduled off the same idle tick, so a check hoisted out of
+        // the loop is a no-op on the first pass — no chunk has failed yet when it
+        // runs. Inside the loop it takes effect the moment the first failure
+        // lands, which is what actually stops one deploy-while-a-tab-is-open from
+        // turning a prefetch nobody asked for into a flood of doomed requests
+        // with backoff timers. The on-demand dispatch is unaffected: it still
+        // tries, and reports. A successful import clears the mark, so a transient
+        // blip does not disable prefetch for the session.
+        if (isStaleBuild()) return
         try {
           // `.catch` is REQUIRED, not belt-and-braces: `preload()` returns a
           // promise, so the surrounding try/catch only ever caught a synchronous

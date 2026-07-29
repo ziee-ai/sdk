@@ -54,12 +54,19 @@ interface PreloadErrorEvent extends Event {
 let staleBuild = false
 
 /**
- * True once a code-split chunk has failed to load in this page's lifetime.
+ * True while a code-split chunk load is known to be failing.
  *
  * Consumed by user-facing error messages to add "the app may have been updated —
- * reload to get the latest version", which is the actionable half of the
- * message. Never resets: once a chunk 404s, the page IS running against a build
- * the server no longer fully serves, and that does not un-happen.
+ * reload to get the latest version", which is the actionable half of the message.
+ *
+ * NOT permanently sticky. An earlier draft never reset it, which contradicted the
+ * dispatcher's own thesis (an import failure is TRANSIENT) and had a real cost: a
+ * 300 ms wifi blip during boot latched the flag for the whole session, which in
+ * turn disabled `store-kit`'s lazy-action prefetch for every store registered
+ * afterwards even though the network had recovered. A SUCCESSFUL import clears it
+ * (`clearStaleBuild`), so it means what it says: chunk loading is broken RIGHT
+ * NOW. In a genuine deploy nearly every chunk 404s, so it stays set; after a blip
+ * it clears as soon as anything loads.
  */
 export function isStaleBuild(): boolean {
   return staleBuild
@@ -89,8 +96,16 @@ type ListenerTarget = Pick<Window, 'addEventListener' | 'removeEventListener'>
  */
 const installedTargets = new WeakSet<ListenerTarget>()
 
-/** Test-only reset — BOTH pieces of module state; the mark is deliberately
- *  sticky in production, and the install set must not leak between specs. */
+/**
+ * Clear the stale-build mark — a code-split chunk has just loaded successfully,
+ * so chunk loading is demonstrably working again.
+ */
+export function clearStaleBuild(): void {
+  staleBuild = false
+}
+
+/** Test-only reset — BOTH pieces of module state; the install set must not leak
+ *  between specs. */
 export function __resetStaleBuildForTests(target?: ListenerTarget): void {
   staleBuild = false
   if (target) installedTargets.delete(target)
