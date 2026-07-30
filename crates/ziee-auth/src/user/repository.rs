@@ -297,7 +297,14 @@ impl UserRepository {
         )
         .fetch_one(&self.pool)
         .await
-        .map_err(AppError::database_error)
+        // A username/email collision that slips past the caller's pre-check
+        // (the pre-check is a TOCTOU window) is caught by the DB UNIQUE
+        // constraint and surfaced as a 409 — not a raw 500. Mirrors the
+        // mapping `update_profile` below has always had.
+        .map_err(|e| match e {
+            sqlx::Error::Database(db) if db.is_unique_violation() => AppError::conflict("Username"),
+            other => AppError::database_error(other),
+        })
     }
 
     /// Self-service profile update (username + display_name only).

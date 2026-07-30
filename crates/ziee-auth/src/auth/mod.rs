@@ -21,6 +21,7 @@ pub mod refresh_tokens;
 pub mod repository;
 pub mod session_settings;
 pub mod types;
+pub mod username;
 
 /// The mountable HTTP/aide routes bundle (decision N10). Gated behind the
 /// default-on `routes` feature so the auth ENGINE can be consumed without the

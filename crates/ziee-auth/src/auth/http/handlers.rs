@@ -94,15 +94,16 @@ pub async fn register(
     Extension(jwt_service): Extension<Arc<JwtService>>,
     Extension(ctx): Extension<AuthContext>,
     headers: HeaderMap,
-    Json(req): Json<RegisterRequest>,
+    Json(mut req): Json<RegisterRequest>,
 ) -> ApiResult<Response> {
-    // Validate input fields
-    if req.username.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            AppError::bad_request("INVALID_USERNAME", "Username cannot be empty"),
-        ));
-    }
+    // Validate input fields. The username goes through the shared
+    // `validate_username` bound/charset gate (length ≤ the varchar(100)
+    // column, no whitespace/control/bidi, alnum + `. _ - @ +` only) — without
+    // it an over-long name reached Postgres and surfaced as a generic 500,
+    // and a structurally-junk name was persisted outright.
+    let username = req.username.trim().to_string();
+    crate::auth::username::validate_username(&username).map_err(AppError::to_api_error)?;
+    req.username = username;
     if req.email.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -818,15 +819,14 @@ pub async fn update_profile<R: IdentityResolver<User = User, Group = Group>>(
 ) -> ApiResult<Json<User>> {
     let user_id = auth.user.id;
 
-    // Trim username; a blank one is rejected outright.
+    // Trim username, then run the shared bound/charset gate. Previously only
+    // the blank case was rejected, so this self-service route accepted a
+    // 500-character name (→ varchar(100) overflow → generic 500) and an
+    // injection-shaped name like `admin' OR '1'='1; DROP TABLE users;--`
+    // (→ persisted, locking the account out of login).
     let username = req.username.map(|u| u.trim().to_string());
-    if let Some(ref u) = username
-        && u.is_empty()
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            AppError::bad_request("INVALID_USERNAME", "Username cannot be empty"),
-        ));
+    if let Some(ref u) = username {
+        crate::auth::username::validate_username(u).map_err(AppError::to_api_error)?;
     }
 
     // display_name is tri-state: absent/null → keep; a value → set
