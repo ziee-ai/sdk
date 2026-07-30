@@ -2016,6 +2016,12 @@ pub async fn admin_create_provider<R: IdentityResolver<User = User, Group = Grou
             ),
         ));
     }
+    // Propagate the error's OWN status. `ApiResult` is
+    // `Result<(StatusCode, T), (StatusCode, AppError)>` and axum's
+    // `(StatusCode, impl IntoResponse)` impl lets the tuple's status WIN over the
+    // body's — so the old hardcoded INTERNAL_SERVER_ERROR turned every typed
+    // error from this repo call (now incl. the 409 name conflict) into a 500.
+    // The `From<AppError> for (StatusCode, AppError)` impl reads `err.status_code`.
     let row = provider_repo::create_provider(
         ctx.pool(),
         req.name.trim(),
@@ -2024,8 +2030,7 @@ pub async fn admin_create_provider<R: IdentityResolver<User = User, Group = Grou
         &req.config,
         ctx.secret_key(),
     )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .await?;
     let row_id = row.id;
     // If enabled=true, probe immediately; on failure the row stays
     // created but `enabled` is flipped back to false and
@@ -2099,6 +2104,9 @@ pub async fn admin_update_provider<R: IdentityResolver<User = User, Group = Grou
         None
     };
 
+    // Propagate the error's OWN status — see the note in `admin_create_provider`.
+    // A hardcoded INTERNAL_SERVER_ERROR here would mask the 409 the repository
+    // now returns for a rename onto a taken provider name.
     let row = provider_repo::update_provider(
         ctx.pool(),
         id,
@@ -2107,8 +2115,7 @@ pub async fn admin_update_provider<R: IdentityResolver<User = User, Group = Grou
         final_config.as_ref(),
         ctx.secret_key(),
     )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .await?;
 
     // Enforce: if enabled transitioned false → true, probe live; on
     // failure this returns Err(400) which the `?` propagates.
