@@ -1816,7 +1816,16 @@ pub async fn link_account(
     // ownership. So the provider's proof carries over to the local row:
     // link the identity and mark the email verified, atomically. The
     // repository re-checks the address match at the write.
-    let verification_upgraded = ctx.auth()
+    //
+    // The `?` below is load-bearing: `ApiResult` is
+    // `Result<(StatusCode, T), (StatusCode, AppError)>` and axum lets the
+    // TUPLE's status win over the body's, so the `map_err(|e|
+    // (INTERNAL_SERVER_ERROR, e))` this call used to carry would ship the
+    // repository's typed 409 (a foreign identity already linked elsewhere)
+    // under a 500 — passing a body assertion while the status stayed wrong.
+    // `?` routes through `From<AppError>`, which reads `err.status_code`.
+    let verification_upgraded = ctx
+        .auth()
         .link_verified_external_identity(
             user.id,
             pending.provider_id,
@@ -1824,8 +1833,7 @@ pub async fn link_account(
             pending.external_email.as_deref(),
             pending.external_data.as_ref(),
         )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .await?;
 
     // Consume the pending token now that the link is bound.
     let _ = ctx.auth().delete_pending_link(&req.link_token).await;

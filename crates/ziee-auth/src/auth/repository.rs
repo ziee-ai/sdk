@@ -207,10 +207,32 @@ impl AuthRepository {
     ) -> Result<bool, AppError> {
         let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
 
-        sqlx::query!(
+        // TOCTOU / double-submit safe (CODING_GUIDELINES §4). `link_account`
+        // PEEKS the pending-link token rather than consuming it (so a typo
+        // doesn't burn the OAuth dance) and only deletes it after this write,
+        // which leaves a window where N concurrent confirmations of the SAME
+        // token all reach this INSERT. A bare INSERT let exactly one win and
+        // gave every loser a `user_auth_links_provider_id_external_id_key`
+        // 23505 → `500 SYSTEM_DATABASE_ERROR`, even though each loser was a
+        // correctly-authenticated request asking for a link that now exists.
+        //
+        // `ON CONFLICT … DO UPDATE … WHERE user_auth_links.user_id =
+        // EXCLUDED.user_id` resolves both cases in one statement, and (unlike
+        // DO NOTHING followed by a SELECT) waits on a concurrent uncommitted
+        // inserter rather than racing it:
+        //   * the row already binds this identity to THIS user → the update
+        //     applies, a row comes back, and the confirmation is idempotent;
+        //   * the row binds it to a DIFFERENT user → the conflict-action WHERE
+        //     skips, NO row comes back, and that is a genuine 409 (an external
+        //     identity may not be re-pointed at a second account by linking).
+        let linked = sqlx::query_scalar!(
             r#"
             INSERT INTO user_auth_links (user_id, provider_id, external_id, external_email, external_data, created_at, last_login_at)
             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+            ON CONFLICT (provider_id, external_id) DO UPDATE
+                SET last_login_at = NOW()
+                WHERE user_auth_links.user_id = EXCLUDED.user_id
+            RETURNING id
             "#,
             user_id,
             provider_id,
@@ -218,9 +240,16 @@ impl AuthRepository {
             external_email,
             external_data,
         )
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(AppError::database_error)?;
+        if linked.is_none() {
+            return Err(AppError::new(
+                axum::http::StatusCode::CONFLICT,
+                "RESOURCE_CONFLICT",
+                "This external account is already linked to a different user",
+            ));
+        }
 
         let verified = sqlx::query!(
             r#"
