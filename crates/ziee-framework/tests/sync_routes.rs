@@ -92,6 +92,9 @@ impl From<(TestUser, Vec<TestGroup>)> for TestPrincipal {
 /// deadline branch without a real JWT.
 struct TestResolver;
 
+/// The identity behind `Bearer valid-fixed` (see `authenticate`).
+const FIXED_USER_ID: Uuid = Uuid::from_u128(0x5EC0_1EAC_0000_0000_0000_0000_0000_0001);
+
 #[async_trait::async_trait]
 impl IdentityResolver for TestResolver {
     type User = TestUser;
@@ -109,6 +112,13 @@ impl IdentityResolver for TestResolver {
             )),
             Some("Bearer valid") => Ok(TestUser {
                 id: Uuid::new_v4(),
+                direct: vec!["profile::read".to_string()],
+            }),
+            // A FIXED identity, so repeated subscribes land on ONE user and the
+            // per-user cap is actually reachable (`Bearer valid` mints a fresh
+            // uuid per request, which can only ever trip the global cap).
+            Some("Bearer valid-fixed") => Ok(TestUser {
+                id: FIXED_USER_ID,
                 direct: vec!["profile::read".to_string()],
             }),
             Some(_) => Err((
@@ -176,7 +186,7 @@ impl SyncSurface for TestSurface {
         Event::default().event("connected").data(conn_id.to_string())
     }
 
-    async fn recheck(_user_id: Uuid) -> RecheckOutcome<TestPrincipal> {
+    async fn recheck(_user_id: Uuid, _token_ver: Option<i32>) -> RecheckOutcome<TestPrincipal> {
         RecheckOutcome::Transient
     }
 }
@@ -301,4 +311,242 @@ async fn past_exp_token_tears_the_stream_down_after_handshake() {
         end.is_none(),
         "past-exp deadline tears the stream down after the handshake"
     );
+}
+
+// ---- slot reclamation (sse-slot-leak) -------------------------------------
+//
+// `register()` runs eagerly in the handler body, so a connection's slot is
+// claimed the moment the 200 is produced. Before the fix the `ConnGuard` that
+// releases it was a LOCAL of the `async_stream::stream!` generator body — code
+// that does not run until the stream's FIRST poll — so a client that went away
+// before the body was ever polled left a registration with no guard, holding
+// its slot for the life of the process. The registry's only other reaper is
+// `deliver`'s send-failure prune, which never runs on a quiescent deployment.
+// Measured before the fix: 5 subscribes dropped unpolled took
+// `connection_count` 0 -> 5; after the fix, 0 -> 0.
+//
+// Each test below gets its OWN surface + registry: `TestSurface`'s registry is a
+// process-wide `OnceLock` shared by every test in this binary, and cargo runs
+// tests concurrently, so a global `connection_count()` baseline would race with
+// siblings. An isolated registry makes the counts exact rather than "roughly".
+
+/// Declare an independent `SyncSurface` with its own private registry, so a
+/// test can assert EXACT connection counts without sibling interference.
+macro_rules! isolated_surface {
+    ($surface:ident, $reg:ident) => {
+        static $reg: OnceLock<SyncRegistry<TestPrincipal>> = OnceLock::new();
+        struct $surface;
+        #[async_trait::async_trait]
+        impl SyncSurface for $surface {
+            type Principal = TestPrincipal;
+            type Wire = TestWire;
+            type BaselinePerms = (ProfileRead,);
+            fn registry() -> &'static SyncRegistry<TestPrincipal> {
+                $reg.get_or_init(SyncRegistry::new)
+            }
+            fn principal_user_id(principal: &TestPrincipal) -> Uuid {
+                principal.user_id
+            }
+            fn connected_signal(conn_id: Uuid) -> Event {
+                Event::default().event("connected").data(conn_id.to_string())
+            }
+            async fn recheck(_user_id: Uuid, _tv: Option<i32>) -> RecheckOutcome<TestPrincipal> {
+                RecheckOutcome::Transient
+            }
+        }
+    };
+}
+
+isolated_surface!(AbandonSurface, ABANDON_REG);
+isolated_surface!(ExitPathSurface, EXIT_PATH_REG);
+isolated_surface!(CapSurface, CAP_REG);
+
+/// The same router as `app()`, mounted on an arbitrary surface.
+fn app_of<S: SyncSurface<Principal = TestPrincipal>>() -> Router {
+    let mut api = OpenApi::default();
+    sync_routes::<TestResolver, S>()
+        .finish_api(&mut api)
+        .layer(Extension(Arc::new(TestResolver)))
+}
+
+/// TEST-4 [acceptance INV-1] — "Unregister on ANY stream termination — client
+/// disconnect, exp, or deactivation. Drop runs even when the client vanishes
+/// mid-await." Driven at the invariant's weakest point: N > the per-user cap
+/// subscriptions abandoned BEFORE their body is ever polled must ALL be
+/// reclaimed. If the invariant is violated the count climbs by N (it did:
+/// 0 -> 5 for N=5 before the fix) and this fails.
+#[tokio::test]
+async fn abandoned_unpolled_streams_release_their_slots() {
+    const N: usize = 20; // deliberately > PER_USER_MAX_CONNECTIONS (12)
+    let reg = AbandonSurface::registry();
+    assert_eq!(reg.connection_count(), 0, "isolated registry starts empty");
+
+    let exp = chrono::Utc::now().timestamp() + 3600;
+    for i in 0..N {
+        let res = app_of::<AbandonSurface>()
+            .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
+            .await
+            .unwrap();
+        // Pinned to ONE user so the per-user cap is genuinely in play. NOTE this
+        // status check is NOT what discriminates a reverted guard: dropping an
+        // unpolled stream drops its captured `rx`, so the sender is closed and
+        // `register`'s cap-boundary sweep reclaims the leaked entries — the
+        // (cap+1)th subscribe would still return 200. The LOAD-BEARING assertion
+        // is the final `connection_count() == 0` below (it reads 8 for N=20 /
+        // cap=12 with the guard reverted). Do not delete it.
+        assert_eq!(res.status(), StatusCode::OK, "subscribe #{i} must open");
+        drop(res); // the client vanished; the body was NEVER polled
+    }
+
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "all {N} abandoned (never-polled) streams must release their slots",
+    );
+}
+
+/// TEST-11 [acceptance INV-2] — "cleanup on **every** exit path
+/// (success/error/timeout) — prefer a RAII guard." The SAME assertion is
+/// applied to all three ways a stream can end, so a fix covering only one path
+/// fails the other legs.
+#[tokio::test]
+async fn every_stream_exit_path_releases_its_slot() {
+    let reg = ExitPathSurface::registry();
+    assert_eq!(reg.connection_count(), 0, "isolated registry starts empty");
+    let future_exp = chrono::Utc::now().timestamp() + 3600;
+
+    // (a) dropped BEFORE the first body poll — the path the guard used to miss.
+    let res = app_of::<ExitPathSurface>()
+        .oneshot(request(Some("Bearer valid"), Some(future_exp)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(reg.connection_count(), 1, "(a) the slot is claimed at register");
+    drop(res);
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "(a) a stream dropped before its first poll must release its slot"
+    );
+
+    // (b) dropped AFTER the first body poll (the generator had started).
+    let res = app_of::<ExitPathSurface>()
+        .oneshot(request(Some("Bearer valid"), Some(future_exp)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut body = res.into_body();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+        .await
+        .expect("(b) handshake frame arrives");
+    assert_eq!(reg.connection_count(), 1, "(b) still registered while streaming");
+    drop(body);
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "(b) a stream dropped after its first poll must release its slot"
+    );
+
+    // (c) the stream ending ON ITS OWN at the (already lapsed) exp deadline —
+    //     no client disconnect at all; drained to completion.
+    let past_exp = chrono::Utc::now().timestamp() - 10;
+    let res = app_of::<ExitPathSurface>()
+        .oneshot(request(Some("Bearer valid-fixed"), Some(past_exp)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut body = res.into_body();
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), body.frame()).await {
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => panic!("(c) the exp-deadline teardown must happen promptly"),
+        }
+    }
+    drop(body);
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "(c) a stream that ends on its own at the exp deadline must release its slot"
+    );
+}
+
+/// The cap must stay REAL — the guard against "fix the leak by weakening the
+/// cap". Driven through the REAL mounted handler on an isolated surface, with
+/// every subscribe pinned to ONE user (`Bearer valid-fixed`) so the PER-USER
+/// cap is what trips:
+///   * `PER_USER_MAX` streams held ALIVE (their bodies polled to the handshake
+///     and kept in scope) still make the next subscribe 429, and the refusal
+///     frees nothing;
+///   * once those streams are abandoned, a full fresh set opens again.
+#[tokio::test]
+async fn the_cap_is_still_enforced_for_live_streams_and_reusable_after_release() {
+    // Mirrors the framework's private `PER_USER_MAX_CONNECTIONS`.
+    const PER_USER_MAX: usize = 12;
+    let reg = CapSurface::registry();
+    assert_eq!(reg.connection_count(), 0, "isolated registry starts empty");
+    let exp = chrono::Utc::now().timestamp() + 3600;
+
+    // Open PER_USER_MAX streams for ONE user and keep them live: poll each body
+    // to its `connected` handshake so none can be dismissed as "never opened",
+    // then hold the body in scope.
+    let mut held = Vec::new();
+    for i in 0..PER_USER_MAX {
+        let res = app_of::<CapSurface>()
+            .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "stream #{i} is under the cap");
+        let mut body = res.into_body();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+            .await
+            .expect("handshake arrives")
+            .expect("a frame")
+            .expect("frame ok");
+        assert!(
+            String::from_utf8_lossy(&frame.into_data().unwrap_or_default()).contains("connected"),
+            "stream #{i} really opened"
+        );
+        held.push(body);
+    }
+    assert_eq!(reg.connection_count(), PER_USER_MAX);
+
+    // The (cap+1)th LIVE stream for that user is refused, and the refusal frees
+    // nothing — so a second attempt is refused too.
+    for attempt in 0..2 {
+        let over = app_of::<CapSurface>()
+            .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
+            .await
+            .unwrap();
+        assert_eq!(
+            over.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "attempt {attempt}: the (cap+1)th LIVE stream must 429 — reclamation \
+             must never become a cap raise"
+        );
+        assert_eq!(reg.connection_count(), PER_USER_MAX, "a refusal frees nothing");
+    }
+
+    // Those streams go away → the whole allowance comes back.
+    drop(held);
+    assert_eq!(
+        reg.connection_count(),
+        0,
+        "abandoning the live streams releases every slot"
+    );
+    let mut held2 = Vec::new();
+    for i in 0..PER_USER_MAX {
+        let res = app_of::<CapSurface>()
+            .oneshot(request(Some("Bearer valid-fixed"), Some(exp)))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "reclaimed slot #{i} must be reusable"
+        );
+        held2.push(res);
+    }
+    assert_eq!(reg.connection_count(), PER_USER_MAX);
+    drop(held2);
 }

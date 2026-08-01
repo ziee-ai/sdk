@@ -112,26 +112,36 @@ pub trait SyncSurface: Send + Sync + 'static {
     fn connected_signal(conn_id: Uuid) -> Event;
 
     /// Re-resolve the connection's identity by user id: reload the active user +
-    /// groups, re-check the baseline permission, and produce a refreshed
-    /// principal — or a teardown/transient signal. Byte-equivalent to the
-    /// former inline re-check (`Repos.user.get_by_id` → is_active → admin-empty
-    /// groups → baseline `check_permission_union`).
-    async fn recheck(user_id: Uuid) -> RecheckOutcome<Self::Principal>;
+    /// groups, re-check the baseline permission AND the access-token revocation
+    /// epoch, and produce a refreshed principal — or a teardown/transient
+    /// signal. Byte-equivalent to the former inline re-check (`Repos.user.
+    /// get_by_id` → is_active → admin-empty groups → baseline
+    /// `check_permission_union`), plus the epoch gate.
+    ///
+    /// `token_ver` is the epoch snapshot the connection's access token carried at
+    /// subscribe time ([`IdentityResolver::access_token_ver`]); the impl compares
+    /// it against the live `users.token_version` and tears down on a mismatch, so
+    /// a logout ends an already-open stream instead of letting it live to the
+    /// token's `exp`. `None` → no epoch gate (a pre-epoch token / an app that
+    /// doesn't implement the seam).
+    async fn recheck(user_id: Uuid, token_ver: Option<i32>) -> RecheckOutcome<Self::Principal>;
 }
 
-/// Extractor yielding the access token's unix `exp` (or `None`) for bounding the
-/// SSE stream deadline. Pulls the app-installed [`IdentityResolver`] out of the
-/// request extensions and delegates to
-/// [`IdentityResolver::access_token_exp`]; a missing resolver → `None` (the
-/// stream falls back to the far-future deadline, never a hard rejection).
-struct AccessTokenExp<R>(Option<i64>, PhantomData<R>);
+/// Extractor yielding the access token's unix `exp` (bounding the SSE stream
+/// deadline) AND its revocation epoch `ver` (the periodic re-check's logout
+/// gate), or `None` for each absent value. Pulls the app-installed
+/// [`IdentityResolver`] out of the request extensions and delegates to
+/// [`IdentityResolver::access_token_exp`] / [`IdentityResolver::access_token_ver`];
+/// a missing resolver → `(None, None)` (the stream falls back to the far-future
+/// deadline with no epoch gate, never a hard rejection).
+struct AccessTokenBounds<R>(Option<i64>, Option<i32>, PhantomData<R>);
 
 /// Contributes nothing to the OpenAPI operation (it reads the `Authorization`
 /// header the auth extractor already documents), so its `OperationInput` is the
 /// empty default — keeping the generated `Sync.subscribe` operation byte-identical.
-impl<R> aide::OperationInput for AccessTokenExp<R> {}
+impl<R> aide::OperationInput for AccessTokenBounds<R> {}
 
-impl<R: IdentityResolver> FromRequestParts<()> for AccessTokenExp<R> {
+impl<R: IdentityResolver> FromRequestParts<()> for AccessTokenBounds<R> {
     type Rejection = std::convert::Infallible;
 
     fn from_request_parts(
@@ -139,12 +149,10 @@ impl<R: IdentityResolver> FromRequestParts<()> for AccessTokenExp<R> {
         _state: &(),
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
         async move {
-            let exp = parts
-                .extensions
-                .get::<Arc<R>>()
-                .cloned()
-                .and_then(|r| r.access_token_exp(parts));
-            Ok(Self(exp, PhantomData))
+            let resolver = parts.extensions.get::<Arc<R>>().cloned();
+            let exp = resolver.as_ref().and_then(|r| r.access_token_exp(parts));
+            let ver = resolver.as_ref().and_then(|r| r.access_token_ver(parts));
+            Ok(Self(exp, ver, PhantomData))
         }
     }
 }
@@ -153,7 +161,7 @@ impl<R: IdentityResolver> FromRequestParts<()> for AccessTokenExp<R> {
 /// app's resolver `R` and sync surface `S`.
 async fn subscribe_sync<R, S>(
     auth: RequirePermissions<R, S::BaselinePerms>,
-    exp: AccessTokenExp<R>,
+    bounds: AccessTokenBounds<R>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, axum::Error>>>>
 where
     R: IdentityResolver,
@@ -163,7 +171,11 @@ where
     // Bound the stream by the access token's expiry: when it lapses the
     // client reconnects with a fresh token, which re-runs the auth
     // extractor (re-checking is_active + permissions from scratch).
-    let exp_unix = exp.0;
+    let exp_unix = bounds.0;
+    // The token's revocation epoch, carried into the periodic re-check so a
+    // logout (which bumps the live epoch) ends this already-open stream instead
+    // of letting it live to `exp`.
+    let token_ver = bounds.1;
 
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) =
@@ -183,6 +195,20 @@ where
         )
         .map_err(|e| e.to_api_error())?;
 
+    // The slot is now OWNED by this guard — constructed here, eagerly, the
+    // instant registration succeeds (and only on success: on the 429 path
+    // nothing was inserted, so nothing may claim ownership). It is moved into
+    // the stream below.
+    //
+    // It CANNOT be declared inside the `stream!` body: that body is a generator
+    // that does not run until the stream's FIRST poll, so a client that goes
+    // away before the response body is ever polled would leave a registration
+    // whose guard was never constructed — the slot would be held for the life
+    // of the process. Captured by the `async move` generator instead, the guard
+    // lives in the future's state and is dropped when the future is dropped,
+    // polled or not.
+    let guard = ConnGuard::<S>(conn_id, PhantomData);
+
     // Handshake: hand the client its connection id for echo suppression.
     let _ = tx.try_send(Ok(S::connected_signal(conn_id)));
 
@@ -195,8 +221,10 @@ where
     let stream = async_stream::stream! {
         // Unregister on ANY stream termination — client disconnect, exp,
         // or deactivation. Drop runs even when the client vanishes
-        // mid-await (axum drops the stream future on disconnect).
-        let _guard = ConnGuard::<S>(conn_id, PhantomData);
+        // mid-await (axum drops the stream future on disconnect) AND when
+        // the stream is dropped before it is ever polled, because the guard
+        // was constructed at registration and is merely MOVED in here.
+        let _guard = guard;
 
         let mut recheck =
             tokio::time::interval_at(tokio::time::Instant::now() + recheck_interval(), recheck_interval());
@@ -214,12 +242,13 @@ where
                     }
                 }
                 _ = recheck.tick() => {
-                    // Re-resolve is_active + permissions. Tear the stream
-                    // down if the account was deactivated/removed OR lost the
-                    // baseline subscribe permission; otherwise refresh the
-                    // snapshot used to route Permission-audience events (so a
-                    // user who loses an admin perm stops receiving its events).
-                    match S::recheck(user_id).await {
+                    // Re-resolve is_active + permissions + the revocation epoch.
+                    // Tear the stream down if the account was deactivated/removed,
+                    // LOGGED OUT, or lost the baseline subscribe permission;
+                    // otherwise refresh the snapshot used to route
+                    // Permission-audience events (so a user who loses an admin
+                    // perm stops receiving its events).
+                    match S::recheck(user_id, token_ver).await {
                         RecheckOutcome::Refresh(principal) => {
                             S::registry().refresh(conn_id, principal);
                         }

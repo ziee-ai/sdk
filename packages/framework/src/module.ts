@@ -1,5 +1,6 @@
 import type {
   AppModule,
+  ModuleLoadContext,
   ModuleMetadata,
   StoreRegistration,
   SlotRegistration,
@@ -13,6 +14,14 @@ export interface CreateModuleOptions {
   components?: ComponentRegistration[]
   dependencies?: string[]
   slots?: SlotRegistration
+  /**
+   * Predicate deciding whether this module's body is downloaded + registered.
+   * Omit for CORE modules (always loaded at boot). The build plugin lifts this
+   * into the entry manifest, so it may only reference `ctx` + the `Permissions`
+   * enum (gate on permission with `ctx.can(Permissions.X)`, never a literal).
+   * See {@link ModuleLoadContext}.
+   */
+  shouldLoad?: (ctx: ModuleLoadContext) => boolean
   onModuleRegister?: (module: AppModule) => void
   initialize?: () => void | Promise<void>
   cleanup?: () => void | Promise<void>

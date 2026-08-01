@@ -63,6 +63,32 @@ pub fn finish_and_emit(
     fs::write(types_ts_path, &types_ts)?;
     println!("✓ TypeScript types written to: {}", types_ts_path.display());
 
+    // Emit the split-out `permissionDescriptions.ts` sibling (see emit_ts). Kept
+    // out of `types.ts` so the label map loads only in the lazy permission
+    // picker, not the eager entry chunk.
+    let descriptions_ts = emit_ts::generate_permission_descriptions_ts_from_json(&json)?;
+    let descriptions_path = types_ts_path.with_file_name("permissionDescriptions.ts");
+    fs::write(&descriptions_path, &descriptions_ts)?;
+    println!(
+        "✓ Permission descriptions written to: {}",
+        descriptions_path.display()
+    );
+
+    // Emit the split-out `permissions.ts` (the Permissions enum). Kept out of
+    // types.ts so value uses inline at build and the enum object rides the lazy
+    // permission-picker chunk instead of the entry chunk.
+    let permissions_ts = emit_ts::generate_permissions_ts_from_json(&json)?;
+    let permissions_path = types_ts_path.with_file_name("permissions.ts");
+    fs::write(&permissions_path, &permissions_ts)?;
+    println!("✓ Permissions enum written to: {}", permissions_path.display());
+
+    // Emit the split-out `apiEndpoints.ts` (the ApiEndpoints map + getEndpointKey).
+    // Kept out of types.ts so ApiClient calls inline and the map tree-shakes.
+    let endpoints_ts = emit_ts::generate_api_endpoints_ts_from_json(&json)?;
+    let endpoints_path = types_ts_path.with_file_name("apiEndpoints.ts");
+    fs::write(&endpoints_path, &endpoints_ts)?;
+    println!("✓ API endpoints written to: {}", endpoints_path.display());
+
     println!("\n✓ OpenAPI generation complete!");
     println!("  - OpenAPI spec: {}", openapi_json_path.display());
     println!("  - TypeScript types: {}", types_ts_path.display());

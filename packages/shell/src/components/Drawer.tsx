@@ -2,7 +2,7 @@ import * as React from 'react'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { Button, Title } from '@ziee/kit'
 import { cn } from '@ziee/kit/lib/utils'
-import { IoIosArrowBack } from 'react-icons/io'
+import { ChevronLeft } from 'lucide-react'
 import { ResizeHandle } from './ResizeHandle'
 import { DivScrollY } from './DivScrollY'
 import { useWindowMinSize } from '../hooks/useWindowMinSize'
@@ -163,6 +163,19 @@ export const Drawer: React.FC<DrawerProps> = ({
     maskClosableProp ?? (typeof mask === 'object' ? mask.closable !== false : mask !== false)
   const showOverlay = mask !== false
 
+  // Is this drawer a MODAL dialog? A drawer with a backdrop is: it covers the
+  // page, traps focus, and the content behind it is inert. `mask={false}` is
+  // documented as the non-modal variant (an inline side panel with no backdrop),
+  // so it must NOT claim modality.
+  //
+  // Radix's Dialog renders `role="dialog"` but deliberately emits NO
+  // `aria-modal` — it isolates the background with `aria-hidden` instead. That
+  // works for browse-mode screen readers, but `aria-modal="true"` is what the
+  // ARIA APG specifies for a modal dialog and what assistive tech (and audits)
+  // look for, so declare it explicitly here. `undefined` — not `false` — keeps
+  // the attribute off the non-modal variant entirely.
+  const isModal = showOverlay || undefined
+
   // px size on the resize axis; full-bleed on the smallest breakpoint.
   const axisPx = width ?? (windowMinSize.xs && horizontal ? '100%' : sizePx(size))
   const sizeStyle: React.CSSProperties = horizontal ? { width: axisPx } : { height: axisPx }
@@ -238,6 +251,9 @@ export const Drawer: React.FC<DrawerProps> = ({
         )}
         <DialogPrimitive.Content
           ref={contentRef}
+          // See `isModal` above: Radix supplies role="dialog" + data-state but
+          // never aria-modal, so a masked (modal) drawer declares it here.
+          aria-modal={isModal}
           // Stable marker for "an app Drawer is open" — used by the page's
           // swipe-to-open-sidebar guard. NOT the data-testid (a caller can
           // override that, which would silently break the guard).
@@ -277,7 +293,7 @@ export const Drawer: React.FC<DrawerProps> = ({
                   the same back-arrow icon, where the right side read wrong.) */}
               {closable && (
                 <Button variant="ghost" size="icon" tooltip="Close" aria-label="Close drawer" onClick={onClose} className="w-[30px]" data-testid="layout-drawer-close-button">
-                  <span className="text-xl"><IoIosArrowBack aria-hidden="true" /></span>
+                  <span className="text-xl"><ChevronLeft size="1em" aria-hidden="true" /></span>
                 </Button>
               )}
               {typeof title === 'string' ? (

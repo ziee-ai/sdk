@@ -10,10 +10,17 @@
  *
  * Testid convention: each surface → `gallery-page-<id>`.
  */
-import { type ReactNode, Suspense, useEffect } from 'react'
+import {
+  type ComponentType,
+  type ReactNode,
+  Suspense,
+  useEffect,
+  useState,
+} from 'react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { Text, Title } from '@ziee/kit'
 import { type RouteLike, getGalleryConfig } from './config'
+import type { PreloadableComponent } from './lazy'
 import {
   deepStateBySlug,
   overlayBySlug,
@@ -180,12 +187,77 @@ function PageFrame({
   )
 }
 
-/** Renders an overlay in its OPEN state: fires the store open action on mount. */
+/**
+ * PRELOAD-then-render gate — the fix for the concurrent runtime-health pass's
+ * dev-only "Internal React error: Expected static flag was missing" (+ the
+ * follow-on "Cannot update a component while rendering a different component").
+ *
+ * ROOT CAUSE: every surface frame rendered `<Suspense><Component/></Suspense>`
+ * where `Component` is a `React.lazy` AND fired a store action (overlay `open()`
+ * / seeded+deep `setup()`) from a mount effect. On the FIRST render the lazy
+ * component SUSPENDS on its `import()`; its reveal is therefore timed by the
+ * shared vite dev server's HTTP response order. Under concurrency (≥3-4 pages)
+ * that network response is delayed and JITTERY — decoupled from the page's own,
+ * on-schedule local effects (the store action + React's StrictMode double-invoke)
+ * — so the reveal lands mid-cycle and React 19.2's dev reconciler re-renders the
+ * just-revealed forwardRef as an UPDATE whose static hook-flags differ from the
+ * suspended mount, tripping the invariant. (A serial OR uniformly CPU-throttled
+ * single page keeps the fetch and the effects on ONE timeline so they never
+ * cross — which is exactly why the bug is invisible at concurrency=1 and why a
+ * CPU-throttle-only slow page does NOT reproduce it; only NETWORK contention
+ * decouples the two clocks.)
+ *
+ * THE FIX (keeps full concurrency): PRELOAD the surface's module BEFORE rendering
+ * it. `preload()` warms the ESM module cache, so the subsequent `<Component/>`
+ * lazy resolution comes from cache — a local microtask, NOT a contended network
+ * fetch — making the reveal timing uniform across pages regardless of load. The
+ * store action fires only AFTER `ready` (post-preload, post-commit), matching the
+ * real app's order (a drawer's code is always loaded before the user opens it).
+ * Pages already went through the app's own `LazyComponentRenderer` and never hit
+ * this, so only the overlay/deep/seeded frames need the gate. */
+function PreloadGate({
+  component,
+  onReady,
+  children,
+}: {
+  component: ComponentType | PreloadableComponent
+  onReady?: () => void | Promise<void>
+  children: ReactNode
+}) {
+  const { Loading } = getGalleryConfig()
+  const preload = (component as PreloadableComponent).preload
+  // Warm the module cache BEFORE rendering `children` (the lazy `<Component/>`),
+  // so its Suspense resolution comes from cache (a local microtask) rather than a
+  // concurrency-contended network fetch — decoupling the reveal from the shared
+  // dev server's HTTP-response order. `ready` also gates the seed/open action so
+  // it fires only after the component's code is present (the real-app order).
+  const [ready, setReady] = useState<boolean>(() => typeof preload !== 'function')
+  useEffect(() => {
+    if (typeof preload !== 'function') return
+    let alive = true
+    void Promise.resolve(preload())
+      .catch(() => {})
+      .finally(() => {
+        if (alive) setReady(true)
+      })
+    return () => {
+      alive = false
+    }
+    // Preload once per mount (component identity is stable per surface).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  useEffect(() => {
+    if (ready) void onReady?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready])
+  if (!ready) return <>{Loading ? <Loading /> : null}</>
+  return <>{children}</>
+}
+
+/** Renders an overlay in its OPEN state: preloads the lazy drawer, then fires the
+ *  store open action once it is loaded (see PreloadGate for the race rationale). */
 function OverlayFrame({ entry }: { entry: OverlayEntry }) {
   const { ErrorBoundary, Loading } = getGalleryConfig()
-  useEffect(() => {
-    entry.open?.()
-  }, [entry])
   // Overlays portal on mount; give the recipe a moment for the portal to paint.
   useRunInteraction(entry.interactions, 700)
   const Component = entry.component
@@ -210,9 +282,24 @@ function OverlayFrame({ entry }: { entry: OverlayEntry }) {
         label={`overlay-${entry.slug}`}
         fallback={galleryCrashFallback(`overlay-${entry.slug}`)}
       >
-        <Suspense fallback={<Loading />}>
-          <Component />
-        </Suspense>
+        {/*
+          Overlays render inside a MemoryRouter — the real app ALWAYS mounts a
+          drawer/dialog inside the app Router, so any overlay that calls
+          useNavigate / useLocation / <Link> (e.g. ProviderApiKeyModal,
+          WorkflowDetailDrawer's Edit affordance) throws
+          "useNavigate() may be used only in the context of a <Router>" without
+          one. Every OTHER frame here (PageFrame/DeepStateFrame/
+          SeededSurfaceFrame) already wraps in a MemoryRouter; OverlayFrame was
+          the lone exception. This makes overlays render as they do in the app
+          and removes the per-overlay `*Routed` fixtures workaround.
+        */}
+        <MemoryRouter>
+          <Suspense fallback={<Loading />}>
+            <PreloadGate component={Component} onReady={entry.open}>
+              <Component />
+            </PreloadGate>
+          </Suspense>
+        </MemoryRouter>
       </ErrorBoundary>
     </section>
   )
@@ -221,9 +308,6 @@ function OverlayFrame({ entry }: { entry: OverlayEntry }) {
 /** Renders one deep-state entry: the injected deep component + a mount-time seed. */
 function DeepStateFrame({ entry }: { entry: DeepStateEntry }): ReactNode {
   const { ErrorBoundary, Loading, deepState } = getGalleryConfig()
-  useEffect(() => {
-    void entry.setup?.()
-  }, [entry])
   // Deep surfaces need their seed + the lazy component to settle before an
   // interaction can find its target, so give the recipe a longer settle window.
   useRunInteraction(entry.interactions, 1200)
@@ -262,7 +346,9 @@ function DeepStateFrame({ entry }: { entry: DeepStateEntry }): ReactNode {
                 path={deepState.routePath}
                 element={
                   <Suspense fallback={<Loading />}>
-                    <Component />
+                    <PreloadGate component={Component} onReady={entry.setup}>
+                      <Component />
+                    </PreloadGate>
                   </Suspense>
                 }
               />
@@ -277,9 +363,6 @@ function DeepStateFrame({ entry }: { entry: DeepStateEntry }): ReactNode {
 /** Renders one seeded-surface entry: the real component + a mount-time store seed. */
 function SeededSurfaceFrame({ entry }: { entry: SeededSurfaceEntry }): ReactNode {
   const { ErrorBoundary, Loading } = getGalleryConfig()
-  useEffect(() => {
-    void entry.setup?.()
-  }, [entry])
   useRunInteraction(entry.interactions, 1200)
   const Component = entry.component
   return (
@@ -315,7 +398,9 @@ function SeededSurfaceFrame({ entry }: { entry: SeededSurfaceEntry }): ReactNode
                 path={entry.path}
                 element={
                   <Suspense fallback={<Loading />}>
-                    <Component />
+                    <PreloadGate component={Component} onReady={entry.setup}>
+                      <Component />
+                    </PreloadGate>
                   </Suspense>
                 }
               />

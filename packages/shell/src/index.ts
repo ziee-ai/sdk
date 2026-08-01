@@ -86,3 +86,4 @@ export {
   type Breakpoint,
   type MinSize,
 } from './hooks/useWindowMinSize'
+export { appLayoutSeam, configClientSeam } from './app-store-seams'

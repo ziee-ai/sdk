@@ -28,7 +28,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": DESCRIBE_CAPABILITY,
-                "description": "Get the full input contract for one operation: its path parameters, query parameters, and request-body JSON Schema, plus its required permission. Call this before `invoke_capability` so you send correctly-shaped input. Returns a not-permitted error if the operation is known to require a permission the current user lacks.",
+                "description": "Get the full input contract for one operation: its path parameters, query parameters, and request-body JSON Schema, plus its required permission. References are resolved so the schema is self-contained — read `schema_form` (`inline`, or `defs` when shared/recursive types live in a sibling `$defs`) and `schema_truncated` to know whether any type was omitted for size. Call this before `invoke_capability` so you send correctly-shaped input. Returns a not-permitted error if the operation is known to require a permission the current user lacks.\n\nIf a REQUIRED field's value is still unknown, collect it with `ask_user` (one property per field) rather than asking in chat text.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -42,7 +42,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": INVOKE_CAPABILITY,
-                "description": "Run one operation against this ziee instance, exactly as if the user performed it in the UI. State-changing operations (create/update/delete) always require the user's explicit approval before they run. Provide path_params for any {…} placeholders, optional query parameters, and a body matching the operation's request schema. Returns the operation's real response (or its structured error, which you can use to correct and retry).",
+                "description": "Run one operation against this ziee instance, exactly as if the user performed it in the UI. State-changing operations (create/update/delete) always require the user's explicit approval before they run. Provide path_params for any {…} placeholders, optional query parameters, and a body matching the operation's request schema. Returns the operation's real response (or its structured error, which you can use to correct and retry).\n\nNever guess a required value: collect it with `ask_user` first, then invoke with the answers.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -132,5 +132,54 @@ mod tests {
         assert!(props.get("path_params").is_some());
         assert!(props.get("query").is_some());
         assert!(props.get("body").is_some());
+    }
+
+    /// TEST-17 — the model was writing "1. What's the project name? …" into the
+    /// chat instead of using the built-in form tool. Both descriptors must carry
+    /// the ask-with-a-form rule, and `describe_capability` must name the schema
+    /// keys that make the form good — including `default`, which the wizard
+    /// honours but the `ask_user` descriptor never mentions, so without it here
+    /// "pre-filled" is unactionable. Guards against a silent revert.
+    #[test]
+    fn descriptions_instruct_ask_user_instead_of_prose() {
+        let v = tool_list();
+        let tools = v["tools"].as_array().unwrap();
+        let desc = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let describe = desc(DESCRIBE_CAPABILITY);
+        for needle in ["ask_user", "chat text"] {
+            assert!(
+                describe.contains(needle),
+                "describe_capability must mention `{needle}`: {describe}"
+            );
+        }
+        // The schema is self-contained but NOT unconditionally fully expanded —
+        // a cycle or the size budget moves types into `$defs`, and the hard cap
+        // can elide one. Promising "every field is spelled out" would teach the
+        // model to ignore the two fields that report exactly that.
+        for needle in ["schema_form", "schema_truncated"] {
+            assert!(
+                describe.contains(needle),
+                "describe_capability must point at `{needle}` rather than overclaim: {describe}"
+            );
+        }
+        assert!(
+            !describe.contains("fully resolved"),
+            "describe_capability must not claim unconditional full resolution: {describe}"
+        );
+
+        let invoke = desc(INVOKE_CAPABILITY);
+        assert!(
+            invoke.contains("ask_user"),
+            "invoke_capability must mention `ask_user`: {invoke}"
+        );
     }
 }

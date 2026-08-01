@@ -242,6 +242,7 @@ pub async fn create_provider(
         r#"
         INSERT INTO auth_providers (name, provider_type, enabled, config, client_secret_encrypted)
         VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (name) DO NOTHING
         RETURNING id, name, provider_type, enabled, config,
                   client_secret_encrypted,
                   created_at as "created_at: _",
@@ -256,9 +257,16 @@ pub async fn create_provider(
         stored_config,
         encrypted,
     )
-    .fetch_one(pool)
+    // `auth_providers_name_key` is UNIQUE on (name); reusing an existing
+    // provider name used to raise a 23505 that `database_error` flattened into
+    // a generic 500 SYSTEM_DATABASE_ERROR. ON CONFLICT DO NOTHING is preferred
+    // over a SELECT-then-INSERT pre-check because the guarded write is race-safe
+    // (CODING_GUIDELINES §4 — no TOCTOU); a swallowed row (`None`) is
+    // unambiguously the name conflict.
+    .fetch_optional(pool)
     .await
-    .map_err(AppError::database_error)?;
+    .map_err(AppError::database_error)?
+    .ok_or_else(|| AppError::conflict("Auth provider name"))?;
     Ok(assemble_provider(pool, row).await)
 }
 
@@ -315,7 +323,16 @@ pub async fn update_provider(
     )
     .fetch_one(pool)
     .await
-    .map_err(AppError::database_error)?;
+    // Renaming a provider onto a name another provider already holds violates
+    // `auth_providers_name_key`. UPDATE has no ON CONFLICT form, so map the
+    // unique violation to a 409 here (the idiom used by the user / knowledge_base
+    // / citations repositories) instead of a generic 500.
+    .map_err(|e| match e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            AppError::conflict("Auth provider name")
+        }
+        other => AppError::database_error(other),
+    })?;
     Ok(assemble_provider(pool, row).await)
 }
 

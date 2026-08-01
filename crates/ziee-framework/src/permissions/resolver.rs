@@ -64,4 +64,19 @@ pub trait IdentityResolver: Send + Sync + 'static {
     fn access_token_exp(&self, _parts: &Parts) -> Option<i64> {
         None
     }
+
+    /// The access token's revocation epoch (ziee's `ver` claim — a snapshot of
+    /// `users.token_version`), read from the request parts. Used by
+    /// [`crate::sync::sync_routes`] to end an ALREADY-OPEN SSE stream when the
+    /// user logs out: the subscribe gate checks the epoch once, but the stream
+    /// then lives until the token's `exp` (24h by default), so the periodic
+    /// re-check compares this snapshot against the live epoch and tears the
+    /// stream down on a mismatch. `None` (the default, and for a token minted
+    /// before the epoch shipped) → the re-check applies no epoch gate — exactly
+    /// the prior behavior. The resolver owns token verification, so exposing the
+    /// epoch here keeps the mountable sync handler generic over the app's JWT
+    /// scheme.
+    fn access_token_ver(&self, _parts: &Parts) -> Option<i32> {
+        None
+    }
 }

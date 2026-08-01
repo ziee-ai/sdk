@@ -1,6 +1,7 @@
 import type { ComponentType, ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom'
-import { Stores } from '../stores'
+import { ModuleSystem } from '../stores'
+import { routesSeam } from '../app-seam'
 import { LazyRouteRenderer } from './LazyRouteRenderer'
 import { getRouterConfig } from './config'
 import type { LayoutDefinition, RouteConfig } from './types'
@@ -41,7 +42,7 @@ function renderRouteElement(route: RouteConfig): ReactNode {
 }
 
 export function RouterComponent() {
-  const { routes } = Stores.Routes
+  const { routes } = routesSeam.get() as { routes: RouteConfig[] }
   const { loginPath, homePath } = getRouterConfig()
 
   const protectedRoutes = routes.filter((r: RouteConfig) => r.requiresAuth)
@@ -97,12 +98,12 @@ export function RouterComponent() {
 
   // Effect-only components that must mount inside the router (so they can use
   // useNavigate/useLocation). Each returns null and works in a useEffect.
-  const routerEffects = (Stores.ModuleSystem.slots.get('routerEffects') ||
+  const routerEffects = (ModuleSystem.slots.get('routerEffects') ||
     []) as Array<{ id: string; component: ComponentType }>
 
   // Guards contributed by the app's auth feature. The router owns the slot
   // type and composes them; it imports no guard.
-  const guards = (Stores.ModuleSystem.slots.get('routeGuards') || []) as Array<{
+  const guards = (ModuleSystem.slots.get('routeGuards') || []) as Array<{
     id: string
     component: ComponentType<{ children: ReactNode }>
   }>

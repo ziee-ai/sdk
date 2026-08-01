@@ -1,4 +1,4 @@
-import { Stores } from '@ziee/framework/stores'
+import { appLayoutSeam } from '../app-store-seams'
 
 /**
  * SEAM: reads `Stores.AppLayout.isSidebarCollapsed` through a typed view (never
@@ -20,8 +20,10 @@ interface InsetSeam {
  * app-side `.desktop` override adds the macOS traffic-light clearance (118).
  */
 export function useHeaderLeftInset(): number {
-  const { isSidebarCollapsed } = (
-    Stores as unknown as { AppLayout: InsetSeam }
-  ).AppLayout
+  // Optional read: a header can render in a store-LESS context (an isolated
+  // gallery overlay, a layout-less route) where the AppLayout seam is absent.
+  // Fall back to the not-collapsed inset rather than throwing.
+  const isSidebarCollapsed =
+    (appLayoutSeam.peek() as InsetSeam | null)?.isSidebarCollapsed ?? false
   return isSidebarCollapsed ? 48 : 12
 }

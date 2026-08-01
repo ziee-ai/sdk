@@ -94,15 +94,16 @@ pub async fn register(
     Extension(jwt_service): Extension<Arc<JwtService>>,
     Extension(ctx): Extension<AuthContext>,
     headers: HeaderMap,
-    Json(req): Json<RegisterRequest>,
+    Json(mut req): Json<RegisterRequest>,
 ) -> ApiResult<Response> {
-    // Validate input fields
-    if req.username.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            AppError::bad_request("INVALID_USERNAME", "Username cannot be empty"),
-        ));
-    }
+    // Validate input fields. The username goes through the shared
+    // `validate_username` bound/charset gate (length ≤ the varchar(100)
+    // column, no whitespace/control/bidi, alnum + `. _ - @ +` only) — without
+    // it an over-long name reached Postgres and surfaced as a generic 500,
+    // and a structurally-junk name was persisted outright.
+    let username = req.username.trim().to_string();
+    crate::auth::username::validate_username(&username).map_err(AppError::to_api_error)?;
+    req.username = username;
     if req.email.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -536,6 +537,28 @@ pub async fn refresh(
     // + visible, then falls into the grace path — no spurious 401. On a
     // mid-transaction DB failure nothing commits and the presented token
     // stays active, so the client's retry simply rotates again.
+    //
+    // Read the access-token revocation epoch BEFORE claiming the rotation, and
+    // never after. A logout racing this request must not be able to hand back a
+    // live session: if it commits first, the claim below finds the token
+    // revoked → 401; if it commits after, this read (READ COMMITTED) has
+    // already returned the PRE-bump value, so the token we mint carries the old
+    // `ver` and is dead on arrival. Reading after the claim would instead
+    // observe the NEW epoch and mint a token that survives the logout.
+    // A DB failure here is 500, NOT 401: the client treats a 401 from
+    // /auth/refresh as terminal (wipe + reload), so mapping a transient pool
+    // blip to 401 would log active users out mid-work. Only an absent user row
+    // is an auth failure. Mirrors the `get_by_id` mapping above.
+    let token_version = refresh_tokens::current_token_version(ctx.pool(), user.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                AppError::unauthorized("USER_NOT_FOUND", "User not found"),
+            )
+        })?;
+
     let (out_pair, out_refresh_expires_at) = if let Some(jti) = presented_jti {
         let candidate = jwt_service
             .generate_tokens_with_jti_expiry(
@@ -545,6 +568,7 @@ pub async fn refresh(
                 user.is_admin,
                 access_hours,
                 refresh_days,
+                token_version,
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -578,6 +602,7 @@ pub async fn refresh(
                             access_hours,
                             succ_jti,
                             succ_exp,
+                            token_version,
                         )
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
                     (pair, succ_exp)
@@ -640,19 +665,41 @@ pub fn refresh_docs(op: TransformOperation) -> TransformOperation {
 }
 
 /// POST /api/auth/logout
-/// Logout current user. Revokes all of the user's active refresh tokens
-/// so subsequent calls to /auth/refresh fail with REFRESH_TOKEN_REVOKED.
-/// Closes 01-auth F-02 (logout was a no-op).
+/// Logout current user. Ends every session the user holds — with two
+/// pre-existing residues noted below:
+///   - bumps `users.token_version`, so every already-issued ACCESS token stops
+///     validating at once (see `jwt_extractor::verify_token_version`);
+///   - revokes all of the user's active refresh tokens, so /auth/refresh fails
+///     with REFRESH_TOKEN_REVOKED (01-auth F-02);
+///   - clears the httpOnly refresh cookie;
+///   - signals the user's OTHER devices/tabs to re-bootstrap, so they tear down
+///     immediately rather than lingering on a stale authenticated UI.
 ///
-/// The access token itself remains valid for the remainder of its TTL
-/// (typically 24h). Clients must drop it from storage on logout. Server-
-/// side access-token revocation would require either short TTLs (already
-/// the design intent) or a per-request revocation check (deferred — adds
-/// a DB hit to every authenticated request).
+/// Sign-out-everywhere is not a new behavior — `revoke_all_for_user` has always
+/// revoked every refresh token the user holds (see migration 44). The bump only
+/// removes the up-to-24h delay before that intent took effect.
+///
+/// RESIDUE (pre-existing, unchanged here): a jti-LESS refresh token — minted
+/// before migration 44 — has no `refresh_tokens` row, so there is nothing to
+/// revoke, and `refresh`'s legacy-upgrade branch will mint it a fresh session
+/// carrying the CURRENT epoch. Those tokens are effectively extinct (the
+/// jti-less minter is deleted and the default refresh TTL is 30d), and
+/// `revoke_all_for_user` never covered them either. Closing it needs the legacy
+/// branch retired — its own change.
+///
+/// RESIDUE 2 (pre-existing): a file DOWNLOAD token (`DownloadTokenClaims`,
+/// `aud: ziee-download`, 1h TTL) is a separate signed credential with no `ver`,
+/// so one minted before a logout keeps serving its file until it expires. Narrow
+/// — a single, already-owned file, with permissions re-checked at download.
+///
+/// The bump + revoke are ONE transaction, and the sync signal is published only
+/// after it commits: see `refresh_tokens::end_session_atomically` for why a
+/// partial logout would hand the session straight back.
 #[debug_handler]
 pub async fn logout(
     auth: JwtAuth,
     Extension(ctx): Extension<AuthContext>,
+    origin: SyncOrigin,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     let user_id = uuid::Uuid::parse_str(&auth.claims.sub).map_err(|e| {
@@ -661,9 +708,21 @@ pub async fn logout(
             AppError::internal_with_id(format!("parse user id from token: {e}")),
         )
     })?;
-    refresh_tokens::revoke_all_for_user(ctx.pool(), user_id)
+    refresh_tokens::end_session_atomically(ctx.pool(), user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Both writes have committed — only now tell the user's other connections,
+    // so a device racing to /auth/me on this signal is guaranteed to observe
+    // the bump and get its 401. `origin.0` suppresses the echo back to the tab
+    // that logged out (it is tearing itself down already).
+    ctx.sync.publish(
+        AuthSyncEntity::Session,
+        AuthSyncAction::Update,
+        user_id,
+        Audience::owner(user_id),
+        origin.0,
+    );
 
     // Clear the httpOnly refresh cookie on web clients (harmless no-op
     // for body-token clients that never had one).
@@ -760,15 +819,14 @@ pub async fn update_profile<R: IdentityResolver<User = User, Group = Group>>(
 ) -> ApiResult<Json<User>> {
     let user_id = auth.user.id;
 
-    // Trim username; a blank one is rejected outright.
+    // Trim username, then run the shared bound/charset gate. Previously only
+    // the blank case was rejected, so this self-service route accepted a
+    // 500-character name (→ varchar(100) overflow → generic 500) and an
+    // injection-shaped name like `admin' OR '1'='1; DROP TABLE users;--`
+    // (→ persisted, locking the account out of login).
     let username = req.username.map(|u| u.trim().to_string());
-    if let Some(ref u) = username
-        && u.is_empty()
-    {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            AppError::bad_request("INVALID_USERNAME", "Username cannot be empty"),
-        ));
+    if let Some(ref u) = username {
+        crate::auth::username::validate_username(u).map_err(AppError::to_api_error)?;
     }
 
     // display_name is tri-state: absent/null → keep; a value → set
@@ -1018,19 +1076,31 @@ pub async fn oauth_authorize(
             .filter(|h| !h.is_empty())
             .map(|s| s.to_string())
     };
-    let origin = match host {
-        Some(h) => format!("{}://{}", scheme, h),
-        None => {
-            if cfg!(debug_assertions) {
-                "http://localhost".to_string()
-            } else {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    AppError::bad_request(
-                        "OAUTH_MISCONFIGURED",
-                        "Server cannot derive redirect URL",
-                    ),
-                ));
+    // Prefer the operator-configured https public origin when set (deploy
+    // behind an HTTPS edge): the header-derived scheme would be http there —
+    // the edge terminates TLS and forwards plain HTTP to this container — and
+    // Google rejects non-localhost http:// redirect_uris. A configured origin
+    // is operator-controlled (not request-derived), so it does not reintroduce
+    // the header-spoofing risk. Falls through to the header derivation below for
+    // local/direct deployments (whose configured value, if any, is an http
+    // loopback that fails the https gate).
+    let origin = if let Some(configured) = crate::auth::configured_public_origin() {
+        configured
+    } else {
+        match host {
+            Some(h) => format!("{}://{}", scheme, h),
+            None => {
+                if cfg!(debug_assertions) {
+                    "http://localhost".to_string()
+                } else {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        AppError::bad_request(
+                            "OAUTH_MISCONFIGURED",
+                            "Server cannot derive redirect URL",
+                        ),
+                    ));
+                }
             }
         }
     };
@@ -1428,10 +1498,19 @@ async fn oauth_complete_inner(
     // unique-collision race on the auth_link) used to leave a
     // password-less orphan that locked the user out forever —
     // re-login would trip the email-collision branch and refuse.
+    // Persist the provider's verification verdict for THIS email. The
+    // guard above drops any email the provider didn't assert as
+    // verified, and the `OAUTH_EMAIL_REQUIRED` branch then refuses to
+    // provision without one — so this is `true` on every reachable path
+    // today. Threading the computed value rather than hardcoding `true`
+    // keeps the row honest if either guard is ever relaxed.
+    let email_verified = email_verified_from_auth_result(&auth_result);
+
     let new_user_id = ctx.auth()
         .provision_external_user_atomic(
             &username,
             Some(email.as_str()),
+            email_verified,
             &display_name,
             provider_id,
             &auth_result.external_id,
@@ -1731,16 +1810,30 @@ pub async fn link_account(
         ));
     }
 
-    ctx.auth()
-        .create_auth_link_with_data(
+    // The pending link only exists because the provider asserted this
+    // email verified AND it matched this user's address (the FBL branch
+    // in `oauth_callback`), and the password just proved account
+    // ownership. So the provider's proof carries over to the local row:
+    // link the identity and mark the email verified, atomically. The
+    // repository re-checks the address match at the write.
+    //
+    // The `?` below is load-bearing: `ApiResult` is
+    // `Result<(StatusCode, T), (StatusCode, AppError)>` and axum lets the
+    // TUPLE's status win over the body's, so the `map_err(|e|
+    // (INTERNAL_SERVER_ERROR, e))` this call used to carry would ship the
+    // repository's typed 409 (a foreign identity already linked elsewhere)
+    // under a 500 — passing a body assertion while the status stayed wrong.
+    // `?` routes through `From<AppError>`, which reads `err.status_code`.
+    let verification_upgraded = ctx
+        .auth()
+        .link_verified_external_identity(
             user.id,
             pending.provider_id,
             &pending.external_id,
             pending.external_email.as_deref(),
             pending.external_data.as_ref(),
         )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .await?;
 
     // Consume the pending token now that the link is bound.
     let _ = ctx.auth().delete_pending_link(&req.link_token).await;
@@ -1754,6 +1847,19 @@ pub async fn link_account(
     let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // `user` was read BEFORE the link write, so its `email_verified` is
+    // stale when the link just verified it. Reflect the upgrade we made
+    // rather than returning a payload that contradicts the row we just
+    // wrote. (Today's web client happens to refetch /auth/me right after
+    // this, so it would self-correct — but a response that lies about
+    // state it just changed is a trap for the next consumer.)
+    // `verification_upgraded` is the DELTA, not the resulting state: an
+    // already-verified user upgrades nothing and keeps its own `true`.
+    let mut user = user;
+    if verification_upgraded {
+        user.email_verified = true;
+    }
 
     Ok(token_response(&headers, StatusCode::OK, minted, |tokens| {
         AuthResponse { user, tokens }
@@ -1918,6 +2024,12 @@ pub async fn admin_create_provider<R: IdentityResolver<User = User, Group = Grou
             ),
         ));
     }
+    // Propagate the error's OWN status. `ApiResult` is
+    // `Result<(StatusCode, T), (StatusCode, AppError)>` and axum's
+    // `(StatusCode, impl IntoResponse)` impl lets the tuple's status WIN over the
+    // body's — so the old hardcoded INTERNAL_SERVER_ERROR turned every typed
+    // error from this repo call (now incl. the 409 name conflict) into a 500.
+    // The `From<AppError> for (StatusCode, AppError)` impl reads `err.status_code`.
     let row = provider_repo::create_provider(
         ctx.pool(),
         req.name.trim(),
@@ -1926,8 +2038,7 @@ pub async fn admin_create_provider<R: IdentityResolver<User = User, Group = Grou
         &req.config,
         ctx.secret_key(),
     )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .await?;
     let row_id = row.id;
     // If enabled=true, probe immediately; on failure the row stays
     // created but `enabled` is flipped back to false and
@@ -2001,6 +2112,9 @@ pub async fn admin_update_provider<R: IdentityResolver<User = User, Group = Grou
         None
     };
 
+    // Propagate the error's OWN status — see the note in `admin_create_provider`.
+    // A hardcoded INTERNAL_SERVER_ERROR here would mask the 409 the repository
+    // now returns for a rename onto a taken provider name.
     let row = provider_repo::update_provider(
         ctx.pool(),
         id,
@@ -2009,8 +2123,7 @@ pub async fn admin_update_provider<R: IdentityResolver<User = User, Group = Grou
         final_config.as_ref(),
         ctx.secret_key(),
     )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    .await?;
 
     // Enforce: if enabled transitioned false → true, probe live; on
     // failure this returns Err(400) which the `?` propagates.

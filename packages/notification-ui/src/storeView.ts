@@ -1,6 +1,9 @@
-import { Stores } from '@ziee/framework/stores'
+import { createAppStoreSeam } from '@ziee/framework'
 
 import type { NotificationsStoreView } from './types'
+
+/** SEAM: the app injects its Notifications store once at boot via `notificationsSeam.set(Notifications)`. */
+export const notificationsSeam = createAppStoreSeam<NotificationsStoreView>('Notifications')
 
 /**
  * Read the app-registered `Stores.Notifications` through a typed-view cast —
@@ -14,6 +17,5 @@ import type { NotificationsStoreView } from './types'
  * unconditionally at the top of a component body, never behind a branch.
  */
 export function notificationsStore(): NotificationsStoreView {
-  return (Stores as unknown as { Notifications: NotificationsStoreView })
-    .Notifications
+  return notificationsSeam.get()
 }

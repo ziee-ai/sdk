@@ -27,8 +27,27 @@ pub fn create_modules() -> Vec<Box<dyn AppModule>> {
     // Collect modules from distributed slice
     let mut entries: Vec<_> = MODULE_ENTRIES.iter().collect();
 
-    // Sort by order (lower numbers first)
-    entries.sort_by_key(|e| e.order);
+    // Sort by order (lower numbers first), then by NAME to break ties.
+    //
+    // The name tiebreak is load-bearing, not tidiness. `sort_by_key` is STABLE,
+    // so without it two modules sharing an `order` keep the relative position
+    // linkme gave them — and a distributed slice's element order comes from the
+    // LINKER, which is stable for one binary but varies between builds. Orders
+    // collide freely in practice (in ziee: 70, 80, 82, 85, 87, 88, 89, 90 … each
+    // shared by 2-3 modules), so a rebuild could silently reorder module init.
+    //
+    // Two consequences, one visible and one latent:
+    //   • VISIBLE: routes register in module order, so the emitted openapi.json
+    //     path order changed from build to build. That made the committed spec
+    //     impossible to keep in sync — merge-gate's regen-parity check (C3)
+    //     could never pass, and every "fix" was a fresh regen that drifted again
+    //     on the next build. Diagnosed as a stale artifact twice before the real
+    //     cause was found.
+    //   • LATENT: any module whose init depends on a same-order module having
+    //     run first is a heisenbug that appears and disappears across rebuilds.
+    //
+    // Sorting by (order, name) makes the sequence a pure function of the source.
+    entries.sort_by_key(|e| (e.order, e.name));
 
     // Instantiate modules using their constructors
     let modules: Vec<Box<dyn AppModule>> =
@@ -324,4 +343,62 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received");
+}
+
+#[cfg(test)]
+mod order_determinism_tests {
+    use super::*;
+    use crate::module_api::ModuleEntry;
+
+    fn dummy() -> Box<dyn AppModule> {
+        unreachable!("constructor is never invoked by these tests")
+    }
+
+    /// The tiebreak must be the NAME, not the incoming (link) order.
+    ///
+    /// This is the regression that motivated it: `sort_by_key(|e| e.order)` is
+    /// stable, so two modules sharing an `order` kept whatever relative position
+    /// the LINKER happened to give them — deterministic within one binary,
+    /// different across builds. Feeding the same entries in two different
+    /// incoming orders simulates exactly that, and asserts the output does not
+    /// depend on it.
+    #[test]
+    fn same_order_modules_sort_by_name_regardless_of_link_order() {
+        let a = ModuleEntry { name: "alpha", order: 80, description: "", constructor: dummy };
+        let b = ModuleEntry { name: "bravo", order: 80, description: "", constructor: dummy };
+        let c = ModuleEntry { name: "charlie", order: 10, description: "", constructor: dummy };
+
+        let sorted = |mut v: Vec<&ModuleEntry>| {
+            v.sort_by_key(|e| (e.order, e.name));
+            v.into_iter().map(|e| e.name).collect::<Vec<_>>()
+        };
+
+        // Two different "link orders" of the same set.
+        let one = sorted(vec![&a, &b, &c]);
+        let two = sorted(vec![&b, &c, &a]);
+
+        assert_eq!(one, two, "module order must not depend on link order");
+        assert_eq!(one, vec!["charlie", "alpha", "bravo"], "order first, then name");
+    }
+
+    /// NEGATIVE CONTROL: the old key really was ambiguous. Without it, the test
+    /// above could pass for the wrong reason (e.g. if the inputs happened to be
+    /// pre-sorted) and would not prove the tiebreak does any work.
+    #[test]
+    fn the_old_order_only_key_was_link_order_dependent() {
+        let a = ModuleEntry { name: "alpha", order: 80, description: "", constructor: dummy };
+        let b = ModuleEntry { name: "bravo", order: 80, description: "", constructor: dummy };
+
+        let old = |mut v: Vec<&ModuleEntry>| {
+            v.sort_by_key(|e| e.order); // the pre-fix key
+            v.into_iter().map(|e| e.name).collect::<Vec<_>>()
+        };
+
+        assert_ne!(
+            old(vec![&a, &b]),
+            old(vec![&b, &a]),
+            "if these matched, order-only sorting would already be deterministic \
+             and the (order, name) tiebreak would be pointless"
+        );
+    }
 }
