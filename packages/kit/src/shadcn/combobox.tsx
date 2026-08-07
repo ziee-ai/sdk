@@ -2,6 +2,7 @@ import * as React from "react"
 import { Combobox as ComboboxPrimitive } from "@base-ui/react"
 
 import { cn } from "../lib/utils"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 import { Button } from "./button"
 import {
   InputGroup,
@@ -102,14 +103,20 @@ function ComboboxContent({
   align = "start",
   alignOffset = 0,
   anchor,
+  container,
   ...props
 }: ComboboxPrimitive.Popup.Props &
   Pick<
     ComboboxPrimitive.Positioner.Props,
     "side" | "align" | "sideOffset" | "alignOffset" | "anchor"
-  >) {
+  > & {
+    /** Portal target. Defaults to the document of the window this subtree renders in. */
+    container?: PortalContainerValue
+  }) {
+  const portalContainer = usePortalContainer(container)
   return (
-    <ComboboxPrimitive.Portal>
+    <ComboboxPrimitive.Portal container={portalContainer}>
+     <PortalContainerInherit>
       <ComboboxPrimitive.Positioner
         side={side}
         sideOffset={sideOffset}
@@ -131,6 +138,7 @@ function ComboboxContent({
           {...props}
         />
       </ComboboxPrimitive.Positioner>
+     </PortalContainerInherit>
     </ComboboxPrimitive.Portal>
   )
 }

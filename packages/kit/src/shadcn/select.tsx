@@ -4,6 +4,7 @@ import * as React from "react"
 import { Select as SelectPrimitive } from "@base-ui/react/select"
 
 import { cn } from "../lib/utils"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react"
 
 const Select = SelectPrimitive.Root
@@ -77,14 +78,20 @@ function SelectContent({
   // breaks click-the-option interactions (Playwright sees them as not visible).
   // A normal anchored dropdown renders every option in view + clickable.
   alignItemWithTrigger = false,
+  container,
   ...props
 }: SelectPrimitive.Popup.Props &
   Pick<
     SelectPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset" | "alignItemWithTrigger"
-  >) {
+  > & {
+    /** Portal target. Defaults to the document of the window this subtree renders in. */
+    container?: PortalContainerValue
+  }) {
+  const portalContainer = usePortalContainer(container)
   return (
-    <SelectPrimitive.Portal>
+    <SelectPrimitive.Portal container={portalContainer}>
+     <PortalContainerInherit>
       <SelectPrimitive.Positioner
         side={side}
         sideOffset={sideOffset}
@@ -111,6 +118,7 @@ function SelectContent({
           <SelectScrollDownButton />
         </SelectPrimitive.Popup>
       </SelectPrimitive.Positioner>
+     </PortalContainerInherit>
     </SelectPrimitive.Portal>
   )
 }

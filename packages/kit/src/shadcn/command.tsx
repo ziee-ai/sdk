@@ -69,7 +69,23 @@ function CommandInput({
   ...props
 }: React.ComponentProps<typeof CommandPrimitive.Input>) {
   return (
-    <div data-slot="command-input-wrapper" className="p-1 pb-0">
+    <div
+      data-slot="command-input-wrapper"
+      // The search field is a HEADER, and a header has to be a surface. It was `p-1 pb-0` with no
+      // background at all, so it read as one more row in the same stack as the list — reported as
+      // "should have solid background and appear on top of everything else". `bg-popover` is the
+      // token the palette surface itself uses (`Command`, `DialogContent`), so the field's own
+      // `bg-input/30` composites over a SOLID backdrop and keeps its intended subtle tint in both
+      // themes, rather than over whatever happens to be behind. The bottom padding (`p-1`, no
+      // longer `pb-0`) is what visually detaches it from the first list row.
+      //
+      // Deliberately NOT sticky/z-indexed: `CommandList` is a SIBLING with its own
+      // `overflow-y-auto`, so list content is clipped at this wrapper's bottom edge and never
+      // passes beneath it — measured overlap is exactly 0. `sticky top-0 z-10` here has no
+      // scrolling ancestor to stick to and nothing to out-stack; it was tried and rendered
+      // pixel-for-pixel identically. Shipping it would be a fix-shaped no-op.
+      className="bg-popover p-1"
+    >
       <InputGroup className="h-8! rounded-lg! border-input/30 bg-input/30 shadow-none! *:data-[slot=input-group-addon]:ps-2!">
         <CommandPrimitive.Input
           data-slot="command-input"

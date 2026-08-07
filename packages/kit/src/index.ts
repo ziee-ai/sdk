@@ -8,6 +8,12 @@
 export { KitSurfaceProvider, useSurface, Loading } from './kit/surface'
 export type { KitSurface } from './kit/surface'
 export { useControllableState } from './kit/use-controllable-state'
+// cross-window portal targeting — every kit overlay resolves its portal document through this.
+export {
+  PortalContainerProvider, PortalContainerInherit, usePortalContainer, usePortalContainerElement,
+  resolvePortalContainer,
+} from './kit/portal-container'
+export type { PortalContainerSource, PortalContainerValue } from './kit/portal-container'
 
 // multi-level menu primitives (composable; for nav flyouts / app menubars / right-click menus)
 export {

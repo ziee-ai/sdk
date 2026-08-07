@@ -5,6 +5,7 @@ import { AlertDialog as AlertDialogPrimitive } from "@base-ui/react/alert-dialog
 
 import { cn } from "../lib/utils"
 import { Button } from "./button"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 
 function AlertDialog({ ...props }: AlertDialogPrimitive.Root.Props) {
   return <AlertDialogPrimitive.Root data-slot="alert-dialog" {...props} />
@@ -44,12 +45,17 @@ function AlertDialogOverlay({
 function AlertDialogContent({
   className,
   size = "default",
+  container,
   ...props
 }: AlertDialogPrimitive.Popup.Props & {
   size?: "default" | "sm"
+  /** Portal target. Defaults to the document of the window this subtree renders in. */
+  container?: PortalContainerValue
 }) {
+  const portalContainer = usePortalContainer(container)
   return (
-    <AlertDialogPortal>
+    <AlertDialogPortal container={portalContainer}>
+     <PortalContainerInherit>
       <AlertDialogOverlay />
       <AlertDialogPrimitive.Popup
         data-slot="alert-dialog-content"
@@ -60,6 +66,7 @@ function AlertDialogContent({
         )}
         {...props}
       />
+     </PortalContainerInherit>
     </AlertDialogPortal>
   )
 }

@@ -185,15 +185,19 @@ function ResizeHandle<T>({ col, view, testid, width }: { col: TableColumn<T>; vi
     e.preventDefault()
     e.stopPropagation()
     const th = (e.currentTarget.closest('th') ?? e.currentTarget.parentElement) as HTMLElement | null
+    // The drag must be tracked on the window this handle actually lives in — in a popped-out pane
+    // that is NOT the ambient `window`, and listeners there would never fire. Mirrors
+    // `@ziee/dock`'s useGripDrag, which resolves its window the same way.
+    const win = e.currentTarget.ownerDocument?.defaultView ?? window
     const startX = e.clientX
     const startW = th ? th.getBoundingClientRect().width : 120
     const move = (ev: PointerEvent) => view.setWidth(col.key, startW + (ev.clientX - startX))
     const up = () => {
-      window.removeEventListener('pointermove', move)
-      window.removeEventListener('pointerup', up)
+      win.removeEventListener('pointermove', move)
+      win.removeEventListener('pointerup', up)
     }
-    window.addEventListener('pointermove', move)
-    window.addEventListener('pointerup', up)
+    win.addEventListener('pointermove', move)
+    win.addEventListener('pointerup', up)
   }
   const onKeyDown = (e: React.KeyboardEvent<HTMLSpanElement>) => {
     const th = (e.currentTarget.closest('th') ?? e.currentTarget.parentElement) as HTMLElement | null

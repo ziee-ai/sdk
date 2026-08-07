@@ -4,6 +4,7 @@ import { Dialog as SheetPrimitive } from "@base-ui/react/dialog"
 import { cn } from "../lib/utils"
 import { Button } from "./button"
 import { XIcon } from "lucide-react"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 
 function Sheet({ ...props }: SheetPrimitive.Root.Props) {
   return <SheetPrimitive.Root data-slot="sheet" {...props} />
@@ -46,16 +47,21 @@ function SheetContent({
   onTouchStart,
   onTouchMove,
   onTouchEnd,
+  container,
   ...props
 }: SheetPrimitive.Popup.Props & {
   side?: "top" | "right" | "bottom" | "left"
   showCloseButton?: boolean
+  /** Portal target. Defaults to the document of the window this subtree renders in. */
+  container?: PortalContainerValue
 }) {
   // Forward touch handlers to BOTH the overlay (mask) and the panel so a
   // swipe-to-close gesture can start on either.
   const touchHandlers = { onTouchStart, onTouchMove, onTouchEnd }
+  const portalContainer = usePortalContainer(container)
   return (
-    <SheetPortal>
+    <SheetPortal container={portalContainer}>
+     <PortalContainerInherit>
       <SheetOverlay {...touchHandlers} />
       <SheetPrimitive.Popup
         data-slot="sheet-content"
@@ -87,6 +93,7 @@ function SheetContent({
           </SheetPrimitive.Close>
         )}
       </SheetPrimitive.Popup>
+     </PortalContainerInherit>
     </SheetPortal>
   )
 }

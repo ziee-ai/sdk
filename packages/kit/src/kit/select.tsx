@@ -264,7 +264,11 @@ const SearchableSelect = React.forwardRef<HTMLButtonElement, SearchableSelectPro
     // are exercised in environments that have no layout at all.
     React.useEffect(() => {
       if (open && active !== '') {
-        document.getElementById(optionDomId(active))?.scrollIntoView?.({ block: 'nearest' })
+        // `ownerDocument`, never the ambient `document`: in a popped-out window this subtree lives
+        // in ANOTHER document, where a global lookup finds nothing (or, worse, a same-id node in
+        // the opener). See kit/portal-container.tsx.
+        const doc = inputRef.current?.ownerDocument ?? (typeof document === 'undefined' ? null : document)
+        doc?.getElementById(optionDomId(active))?.scrollIntoView?.({ block: 'nearest' })
       }
       // `optionDomId` closes over `listboxId`, which is stable for the component's lifetime.
       // eslint-disable-next-line react-hooks/exhaustive-deps

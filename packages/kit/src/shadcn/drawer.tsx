@@ -4,6 +4,7 @@ import * as React from "react"
 import { Drawer as DrawerPrimitive } from "vaul"
 
 import { cn } from "../lib/utils"
+import { usePortalContainerElement, PortalContainerInherit } from "../kit/portal-container"
 
 function Drawer({
   ...props
@@ -48,10 +49,21 @@ function DrawerOverlay({
 function DrawerContent({
   className,
   children,
+  container,
   ...props
-}: React.ComponentProps<typeof DrawerPrimitive.Content>) {
+}: React.ComponentProps<typeof DrawerPrimitive.Content> & {
+  /** Portal target. Defaults to the document of the window this subtree renders in.
+      vaul's portal is Radix's, so this is an element (no ref form). */
+  container?: HTMLElement | null
+}) {
+  // vaul additionally applies scroll-lock / background-scale styles to the AMBIENT
+  // `document.body`; portaling correctly is what makes the panel appear in the right
+  // window, but a Drawer opened from a popped-out pane still locks the opener's body.
+  // Pass `container` on the vaul Root as well if that ever matters.
+  const portalContainer = usePortalContainerElement(container)
   return (
-    <DrawerPortal data-slot="drawer-portal">
+    <DrawerPortal data-slot="drawer-portal" container={portalContainer ?? undefined}>
+     <PortalContainerInherit>
       <DrawerOverlay />
       <DrawerPrimitive.Content
         data-slot="drawer-content"
@@ -64,6 +76,7 @@ function DrawerContent({
         <div className="mx-auto mt-4 hidden h-1 w-[100px] shrink-0 rounded-full bg-muted group-data-[vaul-drawer-direction=bottom]/drawer-content:block" />
         {children}
       </DrawerPrimitive.Content>
+     </PortalContainerInherit>
     </DrawerPortal>
   )
 }
