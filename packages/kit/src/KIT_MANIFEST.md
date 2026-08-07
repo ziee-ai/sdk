@@ -1035,7 +1035,7 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). Options derive `${testid}-opt-${value}`. |
 | `options` | `(SelectOption | SelectOptionGroup)[]` |  |
 
-<details><summary>Optional props (22)</summary>
+<details><summary>Optional props (25)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -1048,6 +1048,7 @@ _No always-required props._
 | `clearLabel` | `string | undefined` |  |
 | `defaultValue` | `string | undefined` |  |
 | `disabled` | `boolean | undefined` |  |
+| `emptyText` | `string | undefined` | What the list reads as when the filter matches nothing. Same defaulting rationale as `searchPlaceholder`; an empty popup is indistinguish… |
 | `id` | `string | undefined` |  |
 | `invalid` | `boolean | undefined` |  |
 | `labelRender` | `((option: SelectOption | undefined) => ReactNode) | undefined` | Custom content for the selected value in the trigger. Receives the selected option (undefined if none). Overrides per-option `selectedLab… |
@@ -1059,6 +1060,8 @@ _No always-required props._
 | `optionRender` | `((option: SelectOption) => ReactNode) | undefined` | Custom content for each dropdown row. Receives the option. |
 | `placeholder` | `string | undefined` |  |
 | `popupMatchSelectWidth` | `boolean | undefined` | Constrain the dropdown to the trigger's width (legacy `popupMatchSelectWidth`). Default true (exact match); false lets the dropdown grow … |
+| `searchPlaceholder` | `string | undefined` | Placeholder for the search field. Optional with a default, unlike `MultiSelect`'s, because `'auto'` can turn search on for a caller that … |
+| `showSearch` | `boolean | "auto" | undefined` | Search inside the popup. `'auto'` (the default) turns it on once the option count reaches {@link SELECT_SEARCH_THRESHOLD}; `true` / `fals… |
 | `size` | `"default" | "sm" | "lg" | undefined` |  |
 | `value` | `string | undefined` |  |
 
@@ -1252,7 +1255,7 @@ _No always-required props._
 | `dataSource` | `T[]` |  |
 | `rowKey` | `(keyof T & string) | ((record: T, index: number) => string)` | Row key: a record field name (legacy string form) or a function. |
 
-<details><summary>Optional props (23)</summary>
+<details><summary>Optional props (24)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -1272,6 +1275,7 @@ _No always-required props._
 | `onRowClick` | `((record: T, index: number) => void) | undefined` |  |
 | `onSelectionChange` | `((tsv: string) => void) | undefined` | Called (from an effect) with the current selection serialised to TSV (empty string when nothing is selected) — lets an external "Copy" bu… |
 | `onViewChange` | `((view: T[], meta: { visibleColumns: string[]; }) => void) | undefined` | Called (from an effect) with the current filtered+sorted view whenever it changes, plus the currently-visible (non-gutter) column keys — … |
+| `renderRowDetail` | `((record: T, index: number) => ReactNode) | undefined` | PER-ROW DETAIL — a full-width band rendered as its own row directly BENEATH the row it belongs to. Return `null`/`undefined` for a row th… |
 | `resizable` | `boolean | undefined` | Column-drag resize handles + a `<colgroup>`/fixed layout in the plain path. |
 | `sanitizeClipboard` | `boolean | undefined` | Neutralize spreadsheet formulas (=,+,-,@) in copied/serialised TSV so an untrusted cell can't execute when pasted into Excel/Sheets. |
 | `scrollToIndex` | `number | null | undefined` | View-relative index to scroll into view (virtual: scrollToIndex; plain: scrollIntoView). Change the value to trigger a scroll. |

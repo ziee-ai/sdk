@@ -113,6 +113,27 @@ export interface TableProps<T> {
   /** View-relative index to scroll into view (virtual: scrollToIndex; plain:
    *  scrollIntoView). Change the value to trigger a scroll. */
   scrollToIndex?: number | null
+  /**
+   * PER-ROW DETAIL — a full-width band rendered as its own row directly BENEATH the row it
+   * belongs to. Return `null`/`undefined` for a row that has no detail; that row renders
+   * exactly as it does today.
+   *
+   * This is the one placement a columns-only grid cannot express. A value that belongs to a
+   * row but needs the whole width — a range control over two of that row's own bounds, a
+   * message, a preview — could previously only be squeezed into a column of its own, which
+   * makes it narrow and puts it BESIDE the fields it is about rather than under them.
+   *
+   * The pair reads as ONE unit, which is the whole point of putting it under rather than
+   * beside: the separator between them is suppressed so the rule falls after the BAND (i.e.
+   * between records, never between a record and its own detail), the band follows its row's
+   * hover, and DOM order is row → its band → next row, so keyboard order is too.
+   *
+   * NOT available on the virtualized path, and not silently so: the virtualizer measures ONE
+   * `<tr>` per index and positions it absolutely, so a second row per index has nowhere to be
+   * measured. Supplying this takes the plain path (see `showVirtual`), which is correct but
+   * unwindowed — a caller with 100k rows should not want a detail band on each of them.
+   */
+  renderRowDetail?: (record: T, index: number) => React.ReactNode
   /** Test selector — forwarded onto <root>. Rows derive `${testid}-row-${rowKey}`. */
   'data-testid': string
 }
@@ -344,7 +365,13 @@ export function Table<T>(props: TableProps<T>) {
 
   // Virtualize only when there's real data to window — loading/empty states use
   // the plain path (their skeleton/empty rows don't need a virtualizer).
-  const showVirtual = props.virtualized && !busy && view.viewData.length > 0
+  //
+  // …and never when the caller renders a per-row detail band: the virtualizer measures ONE
+  // `<tr>` per index and absolutely-positions it, so a second row per index has no slot to be
+  // measured in and would overlap the next record. Falling back to the plain path renders the
+  // detail CORRECTLY at the cost of windowing, which is the honest trade — dropping the band
+  // instead would make a declared control silently absent.
+  const showVirtual = props.virtualized && !busy && !props.renderRowDetail && view.viewData.length > 0
   const hasToolbar = !!(props.filterable || props.columnChooser || props.toolbarExtra)
 
   const body = showVirtual
@@ -449,46 +476,79 @@ function PlainTable<T>(props: TableProps<T> & { view: TableView<T>; busy: boolea
             <TableCell colSpan={cols.length} className="h-24">{empty ?? <Empty data-testid={`${testid}-empty`} />}</TableCell>
           </TableRow>
         ) : (
-          rows.map((record, i) => (
-            <TableRow
-              key={keyOf(record, i)}
-              data-testid={testid ? `${testid}-row-${keyOf(record, i)}` : undefined}
-              tabIndex={onRowClick ? 0 : undefined}
-              onClick={onRowClick ? () => onRowClick(record, i) : undefined}
-              onKeyDown={
-                onRowClick
-                  ? (e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault()
-                        onRowClick(record, i)
-                      }
-                    }
-                  : undefined
-              }
-              className={onRowClick ? 'cursor-pointer focus-visible:outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50' : undefined}
-            >
-              {cols.map((c) => {
-                const meta = metas.get(c.key)!
-                const pres = cellPresentation(c, meta, record)
-                const sel = cellSelected(props, view, i, c)
-                const selectable = selectionActive(props, c)
-                return (
-                  <TableCell
-                    key={c.key}
-                    title={pres.title}
-                    data-selected={sel || undefined}
-                    // Focusable in selection mode so a keyboard user can select +
-                    // the Ctrl/Cmd+C keydown bubbles to the wrapper's handler.
-                    tabIndex={selectable ? 0 : undefined}
-                    onClick={selectionHandler(props, view, i, c)}
-                    className={cn(pres.className, sel && 'ring-2 ring-inset ring-ring/60', selectable && 'cursor-cell focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50')}
+          rows.map((record, i) => {
+            const rk = keyOf(record, i)
+            // Evaluated ONCE per record: whether this row HAS a band decides the row's own
+            // separator, so asking twice could disagree with itself.
+            const detail = props.renderRowDetail?.(record, i)
+            const banded = detail != null && detail !== false
+            return (
+              <React.Fragment key={rk}>
+                <TableRow
+                  data-testid={testid ? `${testid}-row-${rk}` : undefined}
+                  tabIndex={onRowClick ? 0 : undefined}
+                  onClick={onRowClick ? () => onRowClick(record, i) : undefined}
+                  onKeyDown={
+                    onRowClick
+                      ? (e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            onRowClick(record, i)
+                          }
+                        }
+                      : undefined
+                  }
+                  className={cn(
+                    onRowClick && 'cursor-pointer focus-visible:outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
+                    // A rule between a record and its OWN band would split the unit the band
+                    // exists to be part of, so the rule falls after the band instead.
+                    //
+                    // Row-hover is suppressed on BOTH halves rather than made to follow: a
+                    // highlight that covers only the top half splits the pair visually, and
+                    // the CSS that would couple them (`peer-hover`) is the GENERAL sibling
+                    // combinator — hovering row 0 would light every later band. A banded row
+                    // is a form unit, not a selectable record; the separator is what says
+                    // where it ends.
+                    banded && 'border-b-0 hover:bg-transparent',
+                  )}
+                >
+                  {cols.map((c) => {
+                    const meta = metas.get(c.key)!
+                    const pres = cellPresentation(c, meta, record)
+                    const sel = cellSelected(props, view, i, c)
+                    const selectable = selectionActive(props, c)
+                    return (
+                      <TableCell
+                        key={c.key}
+                        title={pres.title}
+                        data-selected={sel || undefined}
+                        // Focusable in selection mode so a keyboard user can select +
+                        // the Ctrl/Cmd+C keydown bubbles to the wrapper's handler.
+                        tabIndex={selectable ? 0 : undefined}
+                        onClick={selectionHandler(props, view, i, c)}
+                        className={cn(pres.className, sel && 'ring-2 ring-inset ring-ring/60', selectable && 'cursor-cell focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50')}
+                      >
+                        {c.render ? c.render(record, i) : defaultCell((record as Record<string, unknown>)[c.dataIndex ?? c.key])}
+                      </TableCell>
+                    )
+                  })}
+                </TableRow>
+                {banded && (
+                  <TableRow
+                    data-testid={testid ? `${testid}-row-${rk}-detail` : undefined}
+                    className="hover:bg-transparent"
                   >
-                    {c.render ? c.render(record, i) : defaultCell((record as Record<string, unknown>)[c.dataIndex ?? c.key])}
-                  </TableCell>
-                )
-              })}
-            </TableRow>
-          ))
+                    {/* `whitespace-normal` undoes the data-cell default: a band is content,
+                        not a value, and a value's no-wrap rule would force the table wider
+                        than the viewport instead of letting the band use the width it has. */}
+                    <TableCell colSpan={cols.length} className="pt-0 pb-3 align-top whitespace-normal">
+                      {detail}
+                    </TableCell>
+                  </TableRow>
+                )}
+              </React.Fragment>
+            )
+          })
         )}
       </TableBody>
     </Base>
