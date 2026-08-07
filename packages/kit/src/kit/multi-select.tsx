@@ -15,6 +15,14 @@ export interface MultiSelectOption {
   label: string
   value: string
   disabled?: boolean
+  /** Optional heading this option sits under. Options carrying the same `group` are rendered
+   *  together beneath it, in first-appearance order; options with none keep today's flat list.
+   *  Additive: a caller that passes no `group` gets byte-identical behaviour.
+   *
+   *  A heading rather than a label suffix, because a suffix goes on the END of the option text —
+   *  which is exactly where tail-truncation removes it, so the part that distinguishes two
+   *  similar options is the first thing to disappear. */
+  group?: string
 }
 
 // Split a raw input string on the configured token separators, returning the cleaned tokens
@@ -26,6 +34,28 @@ function splitOnSeparators(text: string, separators: string[]): { tokens: string
   const rest = parts.pop() ?? ''
   const tokens = parts.map((p) => p.trim()).filter(Boolean)
   return { tokens, rest }
+}
+
+
+/** Split options into heading-bearing runs, in first-appearance order.
+ *
+ *  One anonymous run when nothing declares a `group`, so the ungrouped case renders exactly the
+ *  single `CommandGroup` it always did. */
+function groupOptions(options: MultiSelectOption[]): { heading?: string; options: MultiSelectOption[] }[] {
+  if (!options.some((o) => o.group)) return [{ options }]
+  const out: { heading?: string; options: MultiSelectOption[] }[] = []
+  const byHeading = new Map<string, { heading?: string; options: MultiSelectOption[] }>()
+  for (const o of options) {
+    const key = o.group ?? ''
+    let run = byHeading.get(key)
+    if (!run) {
+      run = { heading: o.group, options: [] }
+      byHeading.set(key, run)
+      out.push(run)
+    }
+    run.options.push(o)
+  }
+  return out
 }
 
 // Virtualized multi-select listbox for large option sets (cmdk renders all rows + can't window).
@@ -329,17 +359,19 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
                   </CommandItem>
                 </CommandGroup>
               )}
-              <CommandGroup>
-                {/* with allowCreate, cmdk filtering is off → filter here so the list still narrows. */}
-                {options
-                  .filter((o) => !allowCreate || trimmed === '' || o.label.toLowerCase().includes(trimmed.toLowerCase()))
-                  .map((o) => (
+              {/* with allowCreate, cmdk filtering is off → filter here so the list still narrows. */}
+              {groupOptions(
+                options.filter((o) => !allowCreate || trimmed === '' || o.label.toLowerCase().includes(trimmed.toLowerCase())),
+              ).map((g, gi) => (
+                <CommandGroup key={g.heading ?? `__ungrouped__${gi}`} heading={g.heading}>
+                  {g.options.map((o) => (
                     <CommandItem key={o.value} value={o.value} keywords={[o.label]} disabled={o.disabled} onSelect={() => toggle(o.value)} data-testid={optionTestid(o.value)}>
                       <Check className={cn('mr-2 size-4', selectedSet.has(o.value) ? 'opacity-100' : 'opacity-0')} aria-hidden />
-                      {o.label}
+                      <span className="truncate" title={o.label}>{o.label}</span>
                     </CommandItem>
                   ))}
-              </CommandGroup>
+                </CommandGroup>
+              ))}
             </CommandList>
           </Command>
         )}
