@@ -74,7 +74,7 @@ export { Input, PasswordInput } from './kit/input'
 export type { InputProps, PasswordInputProps } from './kit/input'
 export { Textarea } from './kit/textarea'
 export type { TextareaProps } from './kit/textarea'
-export { Select } from './kit/select'
+export { Select, SELECT_SEARCH_THRESHOLD } from './kit/select'
 export type { SelectProps, SelectOption, SelectOptionGroup } from './kit/select'
 export {
   SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel, SelectSeparator,
