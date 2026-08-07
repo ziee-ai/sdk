@@ -23,6 +23,19 @@ export interface MultiSelectOption {
    *  which is exactly where tail-truncation removes it, so the part that distinguishes two
    *  similar options is the first thing to disappear. */
   group?: string
+  /** What the SELECTED TAG shows, when that should differ from the row's `label` — the mirror
+   *  of `SelectOption.selectedLabel` on the single Select.
+   *
+   *  It exists because the row and the tag are read in different places: a row sits UNDER its
+   *  `group` heading, which already says where it came from, while a tag stands alone in the
+   *  trigger with no heading above it. Without this the tag can only repeat the bare row label,
+   *  so two options distinguished ONLY by their heading collapse into two identical tags — the
+   *  choice is legible while it is being made and illegible the moment it is made.
+   *
+   *  A node rather than a string, so the caller can decide what truncates and what must not.
+   *  Additive: an option that omits it renders exactly the `label` tag it always did. The
+   *  remove button's accessible name still comes from `label` (a string is what it needs). */
+  selectedLabel?: React.ReactNode
 }
 
 // Split a raw input string on the configured token separators, returning the cleaned tokens
@@ -262,6 +275,13 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
     for (const o of options) m.set(o.value, o.label)
     return m
   }, [options])
+  // The per-option tag override, kept SEPARATE from `labelByValue` so the remove button's
+  // accessible name (which needs a string) still comes from `label` while the tag renders a node.
+  const tagByValue = React.useMemo(() => {
+    const m = new Map<string, React.ReactNode>()
+    for (const o of options) if (o.selectedLabel != null) m.set(o.value, o.selectedLabel)
+    return m
+  }, [options])
   const selectedSet = React.useMemo(() => new Set(current), [current])
   // De-dupe incoming value/defaultValue so repeated entries never collide as React keys on the
   // tags + hidden inputs (a parent may pass a list with duplicates).
@@ -328,9 +348,14 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
             const label = labelByValue.get(v) ?? v
             return (
               // stop the remove click/keys from bubbling to the trigger (which would open it).
-              <span key={v} onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
-                <Tag data-testid={`${testid}-tag-${v}`} onClose={() => { if (!locked) toggle(v) }} closeLabel={removeLabel(label)}>
-                  {label}
+              <span className="min-w-0 max-w-full" key={v} onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                {/* max-w-full caps the tag at the trigger's own width, so a long option can no
+                    longer push the tag past the control's edge (the tag is `whitespace-nowrap`,
+                    so without a cap its content simply grows). What gives inside that cap is the
+                    caller's to decide — via `selectedLabel`, whose parts choose their own
+                    truncate/wrap. */}
+                <Tag className="min-w-0 max-w-full" data-testid={`${testid}-tag-${v}`} onClose={() => { if (!locked) toggle(v) }} closeLabel={removeLabel(label)}>
+                  {tagByValue.get(v) ?? label}
                 </Tag>
               </span>
             )
