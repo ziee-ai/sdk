@@ -1035,7 +1035,7 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). Options derive `${testid}-opt-${value}`. |
 | `options` | `(SelectOption | SelectOptionGroup)[]` |  |
 
-<details><summary>Optional props (25)</summary>
+<details><summary>Optional props (24)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -1059,7 +1059,6 @@ _No always-required props._
 | `onValueChange` | `((value: string) => void) | ((value: string) => void) | ((value: string) => void) | und…` |  |
 | `optionRender` | `((option: SelectOption) => ReactNode) | undefined` | Custom content for each dropdown row. Receives the option. |
 | `placeholder` | `string | undefined` |  |
-| `popupMatchSelectWidth` | `boolean | undefined` | Constrain the dropdown to the trigger's width (legacy `popupMatchSelectWidth`). Default true (exact match); false lets the dropdown grow … |
 | `searchPlaceholder` | `string | undefined` | Placeholder for the search field. Optional with a default, unlike `MultiSelect`'s, because `'auto'` can turn search on for a caller that … |
 | `showSearch` | `boolean | "auto" | undefined` | Search inside the popup. `'auto'` (the default) turns it on once the option count reaches {@link SELECT_SEARCH_THRESHOLD}; `true` / `fals… |
 | `size` | `"default" | "sm" | "lg" | undefined` |  |

@@ -5,6 +5,7 @@ import { Select as SelectPrimitive } from "@base-ui/react/select"
 
 import { cn } from "../lib/utils"
 import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
+import { optionListPopupWidth } from "./popup-width"
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react"
 
 const Select = SelectPrimitive.Root
@@ -110,7 +111,7 @@ function SelectContent({
         <SelectPrimitive.Popup
           data-slot="select-content"
           data-align-trigger={alignItemWithTrigger}
-          className={cn("relative isolate z-50 max-h-(--available-height) w-(--anchor-width) min-w-36 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95", className )}
+          className={cn(optionListPopupWidth, "relative isolate z-50 max-h-(--available-height) min-w-[max(var(--anchor-width),--spacing(36))] origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95", className )}
           {...props}
         >
           <SelectScrollUpButton />
@@ -154,7 +155,18 @@ function SelectItem({
       )}
       {...props}
     >
-      <SelectPrimitive.ItemText className="flex flex-1 shrink-0 gap-2 whitespace-nowrap">
+      {/* `min-w-0` (not `shrink-0`) so a caller's own `truncate`/`line-clamp` on the row
+          content ACTUALLY ENGAGES at the popup's cap. Two things blocked it, and only one of
+          them was this box: `shrink-0` refused to shrink at all, and `min-width:auto` on a
+          flex item resolves to the content's MIN-CONTENT size — which, for `whitespace-nowrap`
+          text, is the whole string. So the ellipsis a call site asked for never appeared; the
+          row ran past the popup's `overflow-x-hidden` and was cut mid-word.
+          The caller's own element needs no such permission from us: any truncation mechanism
+          sets `overflow: hidden`, and a flex item with a non-visible overflow already has an
+          automatic minimum size of ZERO. A `*:min-w-0` here was measured to change nothing.
+          The kit still imposes NO truncation of its own — what gives inside the cap is the
+          caller's to decide, which is why a two-line option node keeps both of its lines. */}
+      <SelectPrimitive.ItemText className="flex min-w-0 flex-1 gap-2 whitespace-nowrap">
         {children}
       </SelectPrimitive.ItemText>
       <SelectPrimitive.ItemIndicator

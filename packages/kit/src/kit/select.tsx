@@ -11,6 +11,7 @@ import {
   selectLabelClasses,
   selectTriggerClasses,
 } from '../shadcn/select'
+import { optionListPopupWidth } from '../shadcn/popup-width'
 import { Popover, PopoverTrigger, PopoverContent } from '../shadcn/popover'
 import { InputGroup, InputGroupAddon } from '../shadcn/input-group'
 import { Skeleton } from '../shadcn/skeleton'
@@ -72,9 +73,6 @@ interface SelectBase {
   /** Custom content for the selected value in the trigger. Receives the selected option
    *  (undefined if none). Overrides per-option `selectedLabel`. */
   labelRender?: (option: SelectOption | undefined) => React.ReactNode
-  /** Constrain the dropdown to the trigger's width (legacy `popupMatchSelectWidth`).
-   *  Default true (exact match); false lets the dropdown grow wider for long options. */
-  popupMatchSelectWidth?: boolean
   /** Search inside the popup. `'auto'` (the default) turns it on once the option count reaches
    *  {@link SELECT_SEARCH_THRESHOLD}; `true` / `false` force it either way.
    *
@@ -211,7 +209,6 @@ interface SearchableSelectProps {
   name?: string
   id?: string
   className?: string
-  popupMatchSelectWidth: boolean
   optionRender?: (option: SelectOption) => React.ReactNode
   display: React.ReactNode
   testid: string
@@ -231,7 +228,7 @@ const SearchableSelect = React.forwardRef<HTMLButtonElement, SearchableSelectPro
   function SearchableSelect(
     {
       options, current, onCommit, onBlur, placeholder, searchPlaceholder, emptyText, locked, loading,
-      invalid, size, name, id, className, popupMatchSelectWidth, optionRender, display, testid, clear, aria,
+      invalid, size, name, id, className, optionRender, display, testid, clear, aria,
     },
     ref,
   ) {
@@ -362,8 +359,11 @@ const SearchableSelect = React.forwardRef<HTMLButtonElement, SearchableSelectPro
           data-testid={`${testid}-popup`}
           align="start"
           className={cn(
-            'p-0',
-            popupMatchSelectWidth ? 'w-(--anchor-width)' : 'w-auto min-w-(--anchor-width)',
+            optionListPopupWidth,
+            // The SAME absolute floor the base-ui arm carries, restated with the trigger term
+            // because `twMerge` keeps only the last `min-w-*` (see `popup-width.ts`). The two
+            // arms must be indistinguishable to a reader, and width is the first thing read.
+            'min-w-[max(var(--anchor-width),--spacing(36))] p-0',
           )}
         >
           {/* The search FIELD, wearing the same chrome as `MultiSelect`'s. */}
@@ -426,7 +426,12 @@ const SearchableSelect = React.forwardRef<HTMLButtonElement, SearchableSelectPro
                       onMouseMove={() => { if (!o.disabled) setCursor(o.value) }}
                       onClick={() => { if (!o.disabled) commit(o.value) }}
                       className={cn(
-                        'relative flex w-full cursor-default items-center gap-1.5 rounded-md py-1 pe-8 ps-1.5 text-sm select-none',
+                        // `whitespace-nowrap` is the base-ui arm's `SelectItem` rule, restated
+                        // so the two arms stay indistinguishable at the length where it shows:
+                        // with the popup now free to grow, an option too long even for its CAP
+                        // used to WRAP here and CLIP over there — a five-line row in one arm and
+                        // a one-line row in the other, for the same option.
+                        'relative flex w-full cursor-default items-center gap-1.5 rounded-md py-1 pe-8 ps-1.5 text-sm whitespace-nowrap select-none',
                         o.value === active && 'bg-accent text-accent-foreground',
                         o.disabled && 'pointer-events-none opacity-50',
                       )}
@@ -452,7 +457,7 @@ const SearchableSelect = React.forwardRef<HTMLButtonElement, SearchableSelectPro
 export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(function Select(
   {
     options, value, defaultValue, onValueChange, onChange, onBlur, placeholder,
-    disabled, loading, invalid, size, name, id, className, optionRender, labelRender, popupMatchSelectWidth = true,
+    disabled, loading, invalid, size, name, id, className, optionRender, labelRender,
     showSearch = 'auto', searchPlaceholder, emptyText,
     'aria-describedby': ariaDescribedby, 'aria-label': ariaLabel,
     'aria-labelledby': ariaLabelledby, 'aria-required': ariaRequired,
@@ -554,7 +559,6 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(function 
         name={name}
         id={id}
         className={className}
-        popupMatchSelectWidth={popupMatchSelectWidth}
         optionRender={optionRender}
         // The SAME selected display the base-ui arm computes — one derivation, so a caller's
         // `labelRender` / `selectedLabel` cannot read one way below the threshold and another
@@ -610,12 +614,9 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(function 
       </div>
       {/* p-1: base-nova puts the list inset on SelectGroup only, so flat
           (ungrouped) items would sit flush against the popup edge — restore it
-          on the popup. match=false → let the popup grow past the trigger width
-          (Base UI defaults the popup to the trigger's `--anchor-width`). */}
-      <SelectContent
-        data-testid={testid ? `${testid}-popup` : undefined}
-        className={cn('p-1', !popupMatchSelectWidth && 'w-auto min-w-(--anchor-width)')}
-      >
+          on the popup. The WIDTH rule is the popup's own (`optionListPopupWidth`),
+          not this call site's. */}
+      <SelectContent data-testid={testid ? `${testid}-popup` : undefined} className="p-1">
         {items}
       </SelectContent>
     </SelectRoot>

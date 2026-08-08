@@ -2,6 +2,7 @@ import * as React from 'react'
 import { Check, ChevronsUpDown, Plus } from 'lucide-react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Popover as Root, PopoverTrigger, PopoverContent } from '../shadcn/popover'
+import { optionListPopupWidth } from '../shadcn/popup-width'
 import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem } from '../shadcn/command'
 import { Skeleton } from '../shadcn/skeleton'
 import { Tag } from './tag'
@@ -198,6 +199,12 @@ function VirtualMultiList({
                   )}
                 >
                   <Check className={cn('size-4 shrink-0', selected ? 'opacity-100' : 'opacity-0')} aria-hidden />
+                  {/* NOTE the VIRTUALIZED rows are absolutely positioned, so they contribute
+                      nothing to the popup's intrinsic width — a `virtual` list therefore rests
+                      on the trigger floor rather than growing to its content. That is the same
+                      width it had before `optionListPopupWidth` existed, so nothing regresses;
+                      widening it would mean measuring rows the virtualizer has deliberately not
+                      mounted. */}
                   <span className="truncate">{o.label}</span>
                 </div>
               )
@@ -363,7 +370,10 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
           <ChevronsUpDown className="ml-auto size-4 shrink-0 opacity-50" aria-hidden />
         </div>
       } />
-      <PopoverContent className="w-(--anchor-width) p-0" align="start">
+      {/* The option list sizes to its widest row, never to the trigger — `optionListPopupWidth`
+          is the ONE rule every option list in the kit wears. This popup had no knob at all
+          before it, which is precisely why it needed to be a default and not a prop. */}
+      <PopoverContent className={cn(optionListPopupWidth, 'p-0')} align="start">
         {virtual ? (
           <VirtualMultiList
             options={options} selectedSet={selectedSet} onToggle={toggle}

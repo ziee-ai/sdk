@@ -67,13 +67,14 @@ export function Dropdown({ items, children, side, align = 'end', collisionAvoida
   return (
     <Root open={open} onOpenChange={onOpenChange} defaultOpen={defaultOpen}>
       <DropdownMenuTrigger render={children} disabled={disabled} nativeButton={nativeButton} />
-      {/* w-fit: size the menu to its widest item, not the trigger width (the
-          vendored content defaults to w-(--anchor-width)).
+      {/* The menu sizes to its widest item — that is now the vendored content's OWN default
+          (`optionListPopupWidth`), so the `w-fit` that used to be stated here is gone: a local
+          override of a rule that is no longer wrong is just a second place for it to drift.
           overflow-y-hidden max-h-none p-0: hand scrolling off to the ScrollArea
           (OverlayScrollbars) below, so a long menu uses the app's overlay
           scrollbar instead of the native one. The ScrollArea owns the
           available-height cap + the p-1 item padding. */}
-      <DropdownMenuContent side={side} align={align} collisionAvoidance={collisionAvoidance} className="w-fit overflow-y-hidden max-h-none p-0" data-testid={testid}>
+      <DropdownMenuContent side={side} align={align} collisionAvoidance={collisionAvoidance} className="overflow-y-hidden max-h-none p-0" data-testid={testid}>
         <ScrollArea axis="y" autoHide="leave" className="max-h-(--available-height) p-1">
         {items.map((it, i) =>
           'type' in it && it.type === 'divider' ? (
