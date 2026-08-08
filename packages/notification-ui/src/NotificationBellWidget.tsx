@@ -3,7 +3,16 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
 import type { NotificationRendererCtx } from '@ziee/framework/notification'
-import { Badge, Button, Empty, Flex, Popover, Separator, Text } from '@ziee/kit'
+import {
+  Badge,
+  Button,
+  Empty,
+  Flex,
+  Popover,
+  ScrollArea,
+  Separator,
+  Text,
+} from '@ziee/kit'
 
 import { NotificationItem } from './NotificationItem'
 import { notificationsStore } from './storeView'
@@ -42,14 +51,27 @@ export function NotificationBellWidget() {
       }
     : undefined
 
+  // The panel — NOT a child of it — owns the width, and that width is bounded by
+  // the viewport. Previously this wrapper carried a fixed `width: 340` inline
+  // while the kit popup box is `w-72` (288px), so 62px of every row (the
+  // mark-read + delete controls) painted OUTSIDE the popover's background, and
+  // at a 320px viewport the fixed 340px pushed `document.scrollWidth` to 358 and
+  // scrolled the page sideways. `min(21.25rem, 100vw - 2rem)` keeps the old
+  // desktop density while making the panel viewport-relative; the kit `Popover`
+  // forwards `className` onto the popup, where tailwind-merge resolves it over
+  // the primitive's `w-72` (so the shared primitive needs no edit).
   const content = (
-    <div style={{ width: 340, maxHeight: 460, overflowY: 'auto' }}>
-      <Flex className="items-center justify-between px-1 pb-2">
-        <Text className="font-medium">Notifications</Text>
+    <div
+      className="flex w-full min-w-0 flex-col"
+      data-testid="notification-bell-panel"
+    >
+      <Flex className="items-center justify-between gap-2 px-1 pb-2">
+        <Text className="min-w-0 truncate font-medium">Notifications</Text>
         {unread > 0 && (
           <Button
             data-testid="notification-bell-mark-all"
             variant="ghost"
+            className="shrink-0"
             onClick={() => void notificationsStore().markAllRead()}
           >
             Mark all read
@@ -62,19 +84,33 @@ export function NotificationBellWidget() {
           data-testid="notification-bell-empty"
         />
       ) : (
-        <Flex className="flex-col">
-          {recent.map((n, i) => (
-            <div key={n.id} className="w-full px-1 py-1">
-              {i > 0 && <Separator className="mb-1" />}
-              <NotificationItem
-                n={n}
-                ctx={ctx}
-                testidPrefix="notification-bell"
-                onSelect={onSelect ? () => onSelect(n) : undefined}
-              />
-            </div>
-          ))}
-        </Flex>
+        // Only the LIST scrolls, so the header above and the "View all" footer
+        // below stay pinned and reachable however long the list gets (before,
+        // the scroll box wrapped all three and "View all" was unreachable
+        // without scrolling past 8 items). `--available-height` is the custom
+        // property base-ui's positioner publishes for the space between the
+        // anchor and the viewport edge — same bound `kit/dropdown.tsx` uses —
+        // so the cap tracks the real viewport instead of a fixed 460px.
+        <ScrollArea
+          axis="y"
+          autoHide="leave"
+          className="max-h-[min(26rem,calc(var(--available-height,100vh)-7rem))] w-full min-w-0"
+          data-testid="notification-bell-list"
+        >
+          <Flex className="w-full min-w-0 flex-col">
+            {recent.map((n, i) => (
+              <div key={n.id} className="w-full min-w-0 px-1 py-1">
+                {i > 0 && <Separator className="mb-1" />}
+                <NotificationItem
+                  n={n}
+                  ctx={ctx}
+                  testidPrefix="notification-bell"
+                  onSelect={onSelect ? () => onSelect(n) : undefined}
+                />
+              </div>
+            ))}
+          </Flex>
+        </ScrollArea>
       )}
       {inboxPath && (
         <Flex className="justify-center pt-2">
@@ -101,6 +137,7 @@ export function NotificationBellWidget() {
       align="end"
       open={open}
       onOpenChange={setOpen}
+      className="w-[min(21.25rem,calc(100vw-2rem))] max-w-[calc(100vw-1rem)]"
     >
       <div className="flex cursor-pointer items-center justify-center px-4 py-3">
         <Badge
