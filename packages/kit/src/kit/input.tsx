@@ -21,68 +21,88 @@ export type InputProps = Omit<React.ComponentProps<'input'>, 'size' | 'prefix' |
   'data-testid': string
 } & KitStyleProps
 
-export const Input = React.forwardRef<HTMLInputElement, InputProps>(
-  ({ size: ownSize, loading, prefix, suffix, invalid, disabled, readOnly, allowClear, style, allowStyle, className, ...props }, ref) => {
-    const s = useSurface({ disabled, readOnly, size: ownSize })
+export const Input = React.forwardRef<HTMLInputElement, InputProps>((allProps, ref) => {
+  const { size: ownSize, loading, prefix, suffix, invalid, disabled, readOnly, allowClear, style, allowStyle, className, ...props } = allProps
+  const s = useSurface({ disabled, readOnly, size: ownSize })
 
-    if (s.loading) {
-      return <Skeleton className={cn('h-9 w-full rounded-md', className)} />
-    }
+  if (s.loading) {
+    return <Skeleton className={cn('h-9 w-full rounded-md', className)} />
+  }
 
-    const showClear = allowClear && props.value != null && props.value !== '' && !s.disabled && !s.readOnly && !loading
-    const clearBtn = showClear ? (
-      <button
-        type="button"
-        aria-label="Clear"
-        className="pointer-events-auto text-muted-foreground hover:text-foreground"
-        onClick={() => props.onChange?.({ target: { value: '' } } as React.ChangeEvent<HTMLInputElement>)}
-      >
-        <X className="size-4" aria-hidden />
-      </button>
-    ) : null
-    const rightAdornment = loading ? <Loader2 className="size-4 animate-spin opacity-70" aria-hidden /> : (clearBtn ?? suffix)
-    const adorned = !!(prefix || rightAdornment)
-    const field = (
-      <InputBase
-        ref={ref}
-        style={style}
-        disabled={s.disabled || loading}
-        readOnly={s.readOnly}
-        aria-invalid={invalid || undefined}
-        aria-busy={loading || undefined}
-        className={cn(
-          prefix && 'pl-9',
-          rightAdornment && 'pr-9',
-          // When adorned, sizing lives on the wrapper (below) so the adornment
-          // sits at the input's edge; the field just fills that box.
-          adorned ? 'w-full' : className,
-        )}
-        {...props}
-        // A controlled input must never receive null/undefined (React warns + Base UI
-        // flips uncontrolled↔controlled). Form bindings pass a `value` that may be null
-        // before data loads → coerce to ''. Uncontrolled use (no `value`) is untouched.
-        {...('value' in props ? { value: props.value ?? '' } : {})}
-      />
-    )
-    if (!adorned) return field
-    return (
-      <div className={cn('relative w-full', className)}>
-        {prefix && (
-          <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground [&_svg]:size-4">
-            {prefix}
-          </span>
-        )}
-        {field}
-        {rightAdornment && (
-          // non-interactive by default; interactive adornments (password toggle) opt back in.
-          <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground [&_svg]:size-4">
-            {rightAdornment}
-          </span>
-        )}
-      </div>
-    )
-  },
-)
+  const showClear = allowClear && props.value != null && props.value !== '' && !s.disabled && !s.readOnly && !loading
+  const clearBtn = showClear ? (
+    <button
+      type="button"
+      aria-label="Clear"
+      className="pointer-events-auto text-muted-foreground hover:text-foreground"
+      onClick={() => props.onChange?.({ target: { value: '' } } as React.ChangeEvent<HTMLInputElement>)}
+    >
+      <X className="size-4" aria-hidden />
+    </button>
+  ) : null
+  const rightAdornment = loading ? <Loader2 className="size-4 animate-spin opacity-70" aria-hidden /> : (clearBtn ?? suffix)
+
+  // WHETHER THERE IS A WRAPPER IS DECIDED BY THE CALL SITE, NEVER BY THE VALUE.
+  //
+  // This was `!!(prefix || rightAdornment)` — and `rightAdornment` is VALUE-DERIVED: the
+  // `allowClear` × exists only while the field is non-empty. So this component's ROOT element
+  // changed from <input> to <div> on the FIRST character typed into an `allowClear` field (and
+  // back again when it was cleared). React reconciles a changed root type by unmounting the old
+  // subtree and mounting a new one, so the input the user was typing into was DESTROYED and
+  // replaced mid-keystroke — taking focus, caret position, selection and IME composition with
+  // it. The user typed one letter and had to re-click to type the second.
+  //
+  // Deriving it from which adornment SLOTS the caller declared gives the field ONE element tree
+  // for its whole life: filling or emptying a slot then changes this element's children and
+  // classes, which React updates in place. Key PRESENCE, not truthiness, so a call site whose
+  // adornment is itself conditional (`suffix={busy ? <Spin/> : undefined}`) declares the slot on
+  // every render and stays structurally stable too.
+  //
+  // Do NOT "fix" a focus loss here by re-focusing in an effect: that re-focuses a DIFFERENT
+  // element, steals focus back from wherever the user moved on to, and still discards the caret.
+  const adorned =
+    'prefix' in allProps || 'suffix' in allProps || 'allowClear' in allProps || 'loading' in allProps
+
+  const field = (
+    <InputBase
+      ref={ref}
+      style={style}
+      disabled={s.disabled || loading}
+      readOnly={s.readOnly}
+      aria-invalid={invalid || undefined}
+      aria-busy={loading || undefined}
+      className={cn(
+        prefix && 'pl-9',
+        rightAdornment && 'pr-9',
+        // When adorned, sizing lives on the wrapper (below) so the adornment
+        // sits at the input's edge; the field just fills that box.
+        adorned ? 'w-full' : className,
+      )}
+      {...props}
+      // A controlled input must never receive null/undefined (React warns + Base UI
+      // flips uncontrolled↔controlled). Form bindings pass a `value` that may be null
+      // before data loads → coerce to ''. Uncontrolled use (no `value`) is untouched.
+      {...('value' in props ? { value: props.value ?? '' } : {})}
+    />
+  )
+  if (!adorned) return field
+  return (
+    <div className={cn('relative w-full', className)}>
+      {prefix && (
+        <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground [&_svg]:size-4">
+          {prefix}
+        </span>
+      )}
+      {field}
+      {rightAdornment && (
+        // non-interactive by default; interactive adornments (password toggle) opt back in.
+        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground [&_svg]:size-4">
+          {rightAdornment}
+        </span>
+      )}
+    </div>
+  )
+})
 Input.displayName = 'Input'
 
 // shadcn has no password input — kit addition with a keyboard-accessible show/hide toggle.
