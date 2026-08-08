@@ -87,6 +87,12 @@ const TagInner = React.forwardRef<HTMLSpanElement, TagProps>(function Tag(
       {onClose != null && (
         <button
           type="button"
+          // The tag's own structural marker, beside the `data-slot="tag"` on its span. A
+          // container that embeds a closable Tag has to be able to tell "the × was pressed"
+          // from "the tag was pressed" — those mean different things and only the first is
+          // the tag's business (see `MultiSelect`'s `stopFromTagClose`, where conflating
+          // them made a bound combobox unopenable).
+          data-slot="tag-close"
           onClick={onClose}
           aria-label={closeLabel}
           data-testid={props['data-testid'] != null ? `${props['data-testid'] as string}-close` : undefined}

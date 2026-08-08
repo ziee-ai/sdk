@@ -216,6 +216,26 @@ function VirtualMultiList({
   )
 }
 
+/**
+ * Keep a TAG'S OWN REMOVE CONTROL from reaching the combobox trigger it sits inside — and
+ * nothing else.
+ *
+ * The remove button is the one part of a tag whose activation must not also open the list:
+ * pressing `×` means "drop this value", and a popover opening on top of that is noise at
+ * best. Every other part of the tag is, to a user, part of the control — clicking it is
+ * clicking the combobox — so it must bubble.
+ *
+ * The test is on the EVENT TARGET rather than on the handler's placement, because the two
+ * differ: a handler on the wrapper sees the events of everything inside it. `data-slot` is
+ * the kit's own structural marker (the tag span already carries one), so this asks the DOM
+ * which part was hit instead of assuming the wrapper only wraps the button.
+ */
+const stopFromTagClose = (e: React.SyntheticEvent): void => {
+  if (e.target instanceof Element && e.target.closest('[data-slot="tag-close"]') != null) {
+    e.stopPropagation()
+  }
+}
+
 // Multi-select with searchable list + removable tags (legacy Select mode="multiple").
 // `allowCreate` enables free-text tokens not present in `options` (legacy Select mode="tags").
 // Form-bindable: value:string[] + onChange(string[]) + name + id + ref.
@@ -354,8 +374,22 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
           {uniqueCurrent.map((v) => {
             const label = labelByValue.get(v) ?? v
             return (
-              // stop the remove click/keys from bubbling to the trigger (which would open it).
-              <span className="min-w-0 max-w-full" key={v} onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+              // stop the REMOVE control's click/keys from bubbling to the trigger (which would
+              // open it) — and ONLY the remove control's.
+              //
+              // These three handlers used to fire unconditionally, so the tag swallowed EVERY
+              // gesture aimed at it, not just the one aimed at its `×`. Once a value is chosen
+              // the tag IS most of what the trigger shows (it is `max-w-full`, and a caller's
+              // `selectedLabel` may be two lines), so the pointer lands on the tag for anything
+              // aimed at the middle of the control — and the list did not open. What was left
+              // was the chevron and whatever padding the tags had not filled: a combobox that
+              // stops responding to being clicked the moment it holds something is not a
+              // smaller version of a working one.
+              //
+              // Measured through the real control: with one tag bound, a click at the centre of
+              // the trigger left it FOCUSED and CLOSED (`aria-expanded` never flipped), which is
+              // indistinguishable from a picker whose options are gone.
+              <span className="min-w-0 max-w-full" key={v} onClick={stopFromTagClose} onPointerDown={stopFromTagClose} onKeyDown={stopFromTagClose}>
                 {/* max-w-full caps the tag at the trigger's own width, so a long option can no
                     longer push the tag past the control's edge (the tag is `whitespace-nowrap`,
                     so without a cap its content simply grows). What gives inside that cap is the
