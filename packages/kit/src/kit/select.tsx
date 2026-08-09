@@ -23,16 +23,37 @@ import type { ValueBinding } from './value-binding'
 /**
  * How many options a `Select` must offer before `showSearch: 'auto'` gives it a search field.
  *
- * TEN, and the number is read off the popup rather than picked: the list is capped at
- * `max-h-72` (288px) over ~32px rows, so NINE rows are on screen at once. At or below that the
- * whole set is visible and the eye is faster than the keyboard — a search box there is a second
- * thing to read for reach the user already has. The tenth option is the first one that can only
- * be reached by SCROLLING, which is exactly the point where typing becomes the shorter path.
+ * FIVE. This was TEN, derived from the popup's own geometry — `max-h-72` over ~32px rows puts
+ * nine rows on screen, so the tenth was the first that could only be reached by SCROLLING.
+ * That number answers the wrong question, and the correction is the reason to read this rather
+ * than to restore it: **scrolling is not the cost. Scanning is.** Reading down an unordered
+ * list to find out whether the thing you want is even in it is linear in the list's length, and
+ * it starts costing well before the list stops fitting. A list that FITS can still be slow to
+ * search, so "does it fit?" was never the question worth measuring.
  *
- * Exported because the threshold is a property callers and tests reason about; a literal `10`
- * repeated at each of those sites is how the two drift apart.
+ * And the two mistakes are not symmetric. A search field the user did not need costs a glance:
+ * it is one row of chrome above a list they can still simply look at, and it takes focus on
+ * open, so it sits where the keyboard already is and never has to be aimed at. A search field
+ * they did need and did not get costs a full read of every label. When one error is cheap and
+ * the other is not, the threshold belongs on the cheap side of the uncertainty.
+ *
+ * FIVE and not lower: at four or fewer the whole set is one glance, the labels are taken in
+ * together rather than read one at a time, and the field really would be pure chrome. Five is
+ * about where "read the labels" stops being free — and the sets these controls hold are mostly
+ * domain vocabularies (columns, metrics, fields) whose names the user arrives already knowing,
+ * where typing two characters beats reading N labels at every N past a handful.
+ *
+ * A caller with a short, ordered, well-known set the eye genuinely consumes whole (a size, a
+ * rating, a direction) says `showSearch={false}` and gets the old behaviour exactly. That is
+ * the escape hatch; raising this number to buy it globally is not.
+ *
+ * Exported because the threshold is a property callers and tests reason about; a literal
+ * repeated at each of those sites is how the two drift apart. The literal value is pinned by
+ * `select-search-threshold.test.tsx` — deliberately, because every test that derives its
+ * option count FROM this constant follows it anywhere and so guards the mechanism, not the
+ * number. Changing it means editing that file and this paragraph.
  */
-export const SELECT_SEARCH_THRESHOLD = 10
+export const SELECT_SEARCH_THRESHOLD = 5
 
 export interface SelectOption {
   label: React.ReactNode
