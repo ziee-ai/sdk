@@ -51,20 +51,28 @@ export function NotificationBellWidget() {
       }
     : undefined
 
-  // The panel — NOT a child of it — owns the width, and that width is bounded by
-  // the viewport. Previously this wrapper carried a fixed `width: 340` inline
-  // while the kit popup box is `w-72` (288px), so 62px of every row (the
-  // mark-read + delete controls) painted OUTSIDE the popover's background, and
-  // at a 320px viewport the fixed 340px pushed `document.scrollWidth` to 358 and
-  // scrolled the page sideways. `min(21.25rem, 100vw - 2rem)` keeps the old
-  // desktop density while making the panel viewport-relative; the kit `Popover`
-  // forwards `className` onto the popup, where tailwind-merge resolves it over
-  // the primitive's `w-72` (so the shared primitive needs no edit).
+  // The panel — NOT a child of it — owns the size, and that size is bounded by
+  // the viewport. Previously this wrapper carried a fixed
+  // `width: 340, maxHeight: 460` inline while the kit popup box is `w-72`
+  // (288px), so 62px of every row (the mark-read + delete controls) painted
+  // OUTSIDE the popover's background, and at a 320px viewport the fixed 340px
+  // pushed `document.scrollWidth` to 358 and scrolled the page sideways.
+  //
+  // The popup now carries BOTH bounds (see the `className` on `<Popover>`
+  // below): `w-[min(21.25rem,calc(100vw-2rem))]` keeps the old desktop density
+  // while making the width viewport-relative, and `max-h-(--available-height)`
+  // caps the whole panel at the space base-ui measured between the anchor and
+  // the viewport edge. The kit `Popover` forwards `className` onto the popup,
+  // where tailwind-merge resolves `w-[…]` over the primitive's `w-72` — so the
+  // shared kit popover primitive needs no edit.
+  //
+  // `min-h-0` here and on the scroller is what makes the height bound reach the
+  // list: the popup is `flex flex-col`, so with a bounded popup the list takes
+  // the leftover space via `flex-1` and scrolls the rest. That is deliberately
+  // NOT a hardcoded "reserve Nrem for header+footer" subtraction — such a
+  // constant silently breaks the moment the header or footer changes height.
   const content = (
-    <div
-      className="flex w-full min-w-0 flex-col"
-      data-testid="notification-bell-panel"
-    >
+    <div className="flex min-h-0 w-full min-w-0 flex-col">
       <Flex className="items-center justify-between gap-2 px-1 pb-2">
         <Text className="min-w-0 truncate font-medium">Notifications</Text>
         {unread > 0 && (
@@ -87,14 +95,19 @@ export function NotificationBellWidget() {
         // Only the LIST scrolls, so the header above and the "View all" footer
         // below stay pinned and reachable however long the list gets (before,
         // the scroll box wrapped all three and "View all" was unreachable
-        // without scrolling past 8 items). `--available-height` is the custom
-        // property base-ui's positioner publishes for the space between the
-        // anchor and the viewport edge — same bound `kit/dropdown.tsx` uses —
-        // so the cap tracks the real viewport instead of a fixed 460px.
+        // without scrolling past 8 items).
+        //
+        // `min-h-0 flex-1` — not a pixel cap — is what bounds it: the popup is
+        // capped at `--available-height` (the custom property base-ui's
+        // positioner publishes for the anchor-to-viewport-edge space; the same
+        // bound `kit/dropdown.tsx` uses), and the list then takes whatever is
+        // left after the pinned header + footer, whatever heights those happen
+        // to be. `max-h-[26rem]` is only an aesthetic ceiling so the popover
+        // doesn't run the full height of a tall desktop screen.
         <ScrollArea
           axis="y"
           autoHide="leave"
-          className="max-h-[min(26rem,calc(var(--available-height,100vh)-7rem))] w-full min-w-0"
+          className="max-h-[26rem] w-full min-h-0 min-w-0 flex-1"
           data-testid="notification-bell-list"
         >
           <Flex className="w-full min-w-0 flex-col">
@@ -137,7 +150,16 @@ export function NotificationBellWidget() {
       align="end"
       open={open}
       onOpenChange={setOpen}
-      className="w-[min(21.25rem,calc(100vw-2rem))] max-w-[calc(100vw-1rem)]"
+      // WIDTH: `100vw` is the layout viewport INCLUDING a classic vertical
+      // scrollbar, while the "no sideways body scroll" invariant is measured
+      // against `documentElement.clientWidth`, which excludes it. The 2rem
+      // gutter covers that ~15px difference with room to spare — do not shrink
+      // it below ~1.25rem or the invariant breaks on a vertically-scrolling
+      // page with classic scrollbars.
+      // HEIGHT: caps the WHOLE panel, so the pinned header/footer plus the
+      // list can never exceed the space base-ui measured. There is deliberately
+      // no second `max-w`: an inert bound reads as a safety net that isn't one.
+      className="w-[min(21.25rem,calc(100vw-2rem))] max-h-(--available-height)"
     >
       <div className="flex cursor-pointer items-center justify-center px-4 py-3">
         <Badge

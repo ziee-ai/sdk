@@ -136,8 +136,15 @@ export function NotificationItem({
         </Flex>
       </Flex>
       {renderer?.actions ? (
-        // `ps-4` (logical), not `pl-4` — DESIGN_SYSTEM.md's RTL-ready rule, and
-        // `npm run lint:logical-direction` enforces it on changed code.
+        // `ps-4` (logical), not `pl-4` — DESIGN_SYSTEM.md's RTL-ready rule.
+        // NOTE the repo's `npm run lint:logical-direction` does NOT reach this
+        // file: it diffs the PARENT repo and filters to
+        // `src-app/{ui,desktop/ui}/src/`, so a change inside the `sdk` submodule
+        // is invisible to it (the parent sees only a pointer bump). The actual
+        // enforcement for this package is the rendered-DOM sweep in
+        // `src-app/ui/src/modules/notification/components/NotificationBellPopover.test.tsx`
+        // (TEST-7), which mounts this component and fails on any
+        // physical-direction layout class anywhere in the subtree.
         // `flex-wrap` so a kind's action buttons wrap onto a second line in a
         // narrow panel instead of widening the row past it.
         <Flex className="w-full min-w-0 flex-wrap gap-2 ps-4">
