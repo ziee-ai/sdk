@@ -9,6 +9,11 @@
  *   3. runtime  — the runtime-health pass reports ZERO HIGH findings for the
  *                 surface (no console error / pageerror / failed request / crash /
  *                 WCAG-AA contrast failure).
+ * Flags: --skip-visual (skip the visual layer) · --skip-extra (skip every
+ * app-declared extra stage; --skip-coverage is an alias kept from the deleted
+ * desktop fork, which had exactly one extra stage) · --no-wait (do not queue on
+ * the host lock).
+ *
  *   4. visual   — the deterministic visual layer passes: Layer A layout invariants
  *                 + axe a11y (always), and Layer B pixel regression (toHave
  *                 Screenshot) when VISUAL_SNAPSHOTS=1 with blessed baselines.
@@ -48,6 +53,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // runs this with its `ui/` as cwd, so `gallery.config.json` + relative paths
 // resolve against it.
 const CFG = resolveGalleryConfig()
+// These scripts are SHARED by several app workspaces and are addressed by a long
+// relative path (`node ../../../sdk/packages/gallery/scripts/…`), so running them
+// from the wrong cwd is easy. Without a config file every anchor silently falls
+// back to the WEB defaults — including `portWhich`, which would point a desktop
+// run at the web gallery's port and let it be accepted as "ours". A bad PORT
+// already fails loudly two lines away; a missing config must too.
+if (!fs.existsSync(CFG.__configPath)) {
+  console.error(
+    `gate-ui: refusing to run — no gallery.config.json at ${CFG.__configPath}.\n` +
+      `  These scripts read their anchors (galleryDir, portWhich, galleryUrl, …) from the\n` +
+      `  APP's config, so cwd must be the app's ui/ directory (e.g. src-app/ui or\n` +
+      `  src-app/desktop/ui). Running elsewhere would silently use another app's defaults.`,
+  )
+  process.exit(2)
+}
 const UI_DIR = CFG.__cwd
 const GALLERY_DIR = path.resolve(UI_DIR, CFG.galleryDir)
 // Overridable ONLY so the end-to-end test can substitute a stub crawl and drive
@@ -68,6 +88,10 @@ const PORT_BASE = resolveGalleryPort({
 })
 let PORT = PORT_BASE // finalized in main()
 const SKIP_VISUAL = process.argv.includes('--skip-visual')
+// `--skip-coverage` is kept as an alias: it is what the (now-deleted) desktop
+// fork of this script accepted, and desktop's extra step is the coverage check.
+const SKIP_EXTRA =
+  process.argv.includes('--skip-extra') || process.argv.includes('--skip-coverage')
 
 const results = [] // { name, ok, detail }
 const step = (name, ok, detail = '') => {
@@ -262,6 +286,11 @@ async function main() {
     // this change exists to prevent.
     if (!runUsable) {
       step('visual', false, 'skipped — the runtime crawl was not usable')
+    } else if (!CFG.visualConfig) {
+      // An app with no visual layer (no playwright.visual.config.ts) is not a
+      // failure — it is a smaller app. Reported as not-configured so the line
+      // cannot be misread as "the visual layer passed".
+      step('visual', true, 'not configured for this app')
     } else if (SKIP_VISUAL) {
       step('visual', true, 'skipped (--skip-visual)')
     } else {
@@ -288,6 +317,24 @@ async function main() {
           : `${failed ?? '?'} failed`,
       )
       if (vis.code !== 0) console.log(vis.out.split('\n').slice(-25).join('\n'))
+    }
+
+    // 5. app-declared extra steps (config-driven, same shape as lintCmds) ------
+    for (const [label, cmd, args] of CFG.gateExtraCmds ?? []) {
+      if (!runUsable) {
+        // NOT reported as a FAIL: the step did not run, so it has no verdict.
+        // (The gate is already red on runtime-health, so nothing is softened.)
+        step(label, true, 'not run — the runtime crawl was not usable')
+        continue
+      }
+      if (SKIP_EXTRA) {
+        step(label, true, 'skipped (--skip-extra)')
+        continue
+      }
+      console.log(`• ${label} …`)
+      const r = run(cmd, args)
+      step(label, r.code === 0, r.code === 0 ? 'ok' : 'failed (see output above)')
+      if (r.code !== 0) console.log(r.out.slice(-1500))
     }
 
     printSurfaceTable(surfaceVerdicts)

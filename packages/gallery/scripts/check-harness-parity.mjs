@@ -3,30 +3,27 @@
  * and those copies have DRIFTED. This refuses a tree where a behavioural core is
  * present in one live copy and missing from another.
  *
- * ## Why
+ * ## What this proves — and what it CANNOT
  *
- * At the time this was written the harness lived in three places:
+ * It asserts each declared copy IMPORTS the shared behavioural module and CALLS
+ * its entry point. That is **WIRING, not LOGIC**: a copy can keep
+ * `verifyRunManifest(...)` and hardcode `const usable = { ok: true }` and this
+ * guard stays green — while the gate fails OPEN. Do not read a pass here as
+ * verification that a copy behaves correctly.
  *
- *   | script              | sdk/packages/gallery | src-app/ui | src-app/desktop/ui |
- *   |---------------------|----------------------|------------|--------------------|
- *   | runtime-health.mjs  | LIVE (ui workspace)  | DEAD       | LIVE (desktop)     |
- *   | gate-ui.mjs         | LIVE (ui workspace)  | absent     | LIVE (desktop)     |
+ * That limit is why the harness was UNIFIED rather than more heavily guarded.
+ * Both ziee ui workspaces now run ONE implementation (these very scripts) with
+ * their own `gallery.config.json`; the desktop forks were deleted. Parity is
+ * true by construction, and the check that actually carries the invariant is
+ * the consumer test's "no workspace re-forks the harness" assertion plus its
+ * content-based discovery walk — not this file.
  *
- * The three had genuinely diverged (the desktop copy already muted a
- * `net::ERR_ABORTED` that the sdk copy did not; the sdk copy read `CFG.galleryDir`
- * where the desktop copy hardcoded `src/dev/gallery`). A fix applied to one copy
- * silently did not reach the others — which is the mechanism that let a defect
- * class survive several rounds of fixing.
- *
- * ## What it checks, and what it deliberately does NOT
- *
- * It asserts each live copy IMPORTS the shared behavioural module and CALLS its
- * entry point. It does not attempt to compare the copies' logic — a source-text
- * comparison of two files that legitimately differ is a guard with an unbounded
- * evasion space, and this repo has paid for that pattern twice. The real defence
- * is that the behaviour lives in ONE module (`lib/host-lock.mjs`,
- * `lib/run-validity.mjs`) which both copies import and which has its own unit
- * tests; this guard only proves the wiring is present in every copy.
+ * Three rounds of blind audit each found a fresh evasion of an earlier,
+ * regex-based version of this guard, and the lifecycle validator's own tripwire
+ * ruled the loop non-converging: a hand-written static-analysis guard standing
+ * in for a behavioural test has an unbounded evasion space. Kept in reduced
+ * form for the case it still covers cheaply (a declared copy that silently
+ * stops importing a core), and it names that scope in its own output.
  *
  * Exit 0 = every live copy carries every core. Exit 1 = a copy is missing one.
  *
@@ -285,6 +282,9 @@ if (isMain) {
   const checked = new Set(copies.flatMap(c => requiredCores(c).map(x => x.id)))
   console.log(
     `harness parity: OK — ${copies.length} live copies (from ${path.relative(process.cwd(), source)}) ` +
-      `carry all ${checked.size} behavioural cores: ${[...checked].sort().join(', ')}.`,
+      `carry all ${checked.size} behavioural cores: ${[...checked].sort().join(', ')}.\n` +
+      `  note: this proves each copy WIRES each core (imports + calls it). It does ` +
+      `NOT prove the copy's logic is correct — a copy can keep a call and hardcode ` +
+      `its result. Single-sourcing the harness, not this guard, is what makes parity true.`,
   )
 }

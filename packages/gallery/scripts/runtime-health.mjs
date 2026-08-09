@@ -56,6 +56,21 @@ import {
 // Config-driven anchors (was `../src/dev/gallery` + `runtime-baseline.js` +
 // port 1420 hardcodes). Resolved from `gallery.config.json` in the app's cwd.
 const CFG = resolveGalleryConfig()
+// These scripts are SHARED by several app workspaces and are addressed by a long
+// relative path (`node ../../../sdk/packages/gallery/scripts/…`), so running them
+// from the wrong cwd is easy. Without a config file every anchor silently falls
+// back to the WEB defaults — including `portWhich`, which would point a desktop
+// run at the web gallery's port and let it be accepted as "ours". A bad PORT
+// already fails loudly two lines away; a missing config must too.
+if (!fs.existsSync(CFG.__configPath)) {
+  console.error(
+    `runtime-health: refusing to run — no gallery.config.json at ${CFG.__configPath}.\n` +
+      `  These scripts read their anchors (galleryDir, portWhich, galleryUrl, …) from the\n` +
+      `  APP's config, so cwd must be the app's ui/ directory (e.g. src-app/ui or\n` +
+      `  src-app/desktop/ui). Running elsewhere would silently use another app's defaults.`,
+  )
+  process.exit(2)
+}
 const GALLERY_DIR = path.resolve(CFG.__cwd, CFG.galleryDir)
 
 // The app's baselined-findings module (content) is injected via config; default

@@ -73,10 +73,18 @@ const DEFAULTS = {
   harnessCopies: null,
   /** App module exporting `isRuntimeBaselined(finding)` (or null = none). */
   runtimeBaselineModule: null,
-  /** Playwright visual config + spec list the gate runs. */
+  /** Playwright visual config + spec list the gate runs. `null` = this app has
+   *  no visual layer (no playwright.visual.config.ts), and the gate reports the
+   *  step as "not configured" rather than failing on a config that isn't there.
+   *  The desktop workspace is exactly that case. */
   visualConfig: 'playwright.visual.config.ts',
   visualSpecs: ['layout.spec.ts', 'states.spec.ts', 'overlays.spec.ts'],
   visualSnapshotSpecs: ['gallery.spec.ts'],
+  /** EXTRA gate steps, as `[label, cmd, args]`. Same shape as `lintCmds` — a
+   *  config-driven command list, so an app needing a stage the generic gate does
+   *  not have declares it here instead of forking the whole script. The desktop
+   *  workspace uses this for its gallery-coverage check. */
+  gateExtraCmds: [],
   /** Lint commands the gate runs (npm-script names). */
   lintCmds: [['npm', ['run', 'lint:guardrails']], ['npm', ['run', 'lint:colors']]],
 }
@@ -92,5 +100,19 @@ export function resolveGalleryConfig(cwd = process.cwd()) {
       throw new Error(`[gallery-config] failed to parse ${configPath}: ${e.message}`)
     }
   }
+  // An UNKNOWN key is a typo, and a typo here silently deletes behaviour: naming
+  // the extra-steps key `gateExtraCommands` made the gate skip its coverage stage
+  // entirely, print no line for it, and still exit 0. Config that quietly does
+  // less than it says is the exact failure this whole area was fixed for.
+  const unknown = Object.keys(file).filter(
+    k => !(k in DEFAULTS) && !k.startsWith('$') && !k.startsWith('__'),
+  )
+  if (unknown.length)
+    throw new Error(
+      `[gallery-config] ${configPath} has unknown key(s): ${unknown.join(', ')}. ` +
+        `Known keys: ${Object.keys(DEFAULTS).sort().join(', ')}. ` +
+        `(A typo'd key is silently ignored, which removes the behaviour you meant ` +
+        `to configure — so it is refused rather than defaulted.)`,
+    )
   return { ...DEFAULTS, ...file, __cwd: cwd, __configPath: configPath }
 }
