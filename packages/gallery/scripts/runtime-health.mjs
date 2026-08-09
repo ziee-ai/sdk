@@ -66,8 +66,9 @@ if (!fs.existsSync(CFG.__configPath)) {
   console.error(
     `runtime-health: refusing to run — no gallery.config.json at ${CFG.__configPath}.\n` +
       `  These scripts read their anchors (galleryDir, portWhich, galleryUrl, …) from the\n` +
-      `  APP's config, so cwd must be the app's ui/ directory (e.g. src-app/ui or\n` +
-      `  src-app/desktop/ui). Running elsewhere would silently use another app's defaults.`,
+      `  APP's config, so cwd must be the app's ui/ directory — the one whose\n` +
+      `  gallery.config.json you mean. Running elsewhere would silently use another\n` +
+      `  app's defaults (including portWhich, i.e. another gallery's port).`,
   )
   process.exit(2)
 }

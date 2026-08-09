@@ -9,11 +9,6 @@
  *   3. runtime  — the runtime-health pass reports ZERO HIGH findings for the
  *                 surface (no console error / pageerror / failed request / crash /
  *                 WCAG-AA contrast failure).
- * Flags: --skip-visual (skip the visual layer) · --skip-extra (skip every
- * app-declared extra stage; --skip-coverage is an alias kept from the deleted
- * desktop fork, which had exactly one extra stage) · --no-wait (do not queue on
- * the host lock).
- *
  *   4. visual   — the deterministic visual layer passes: Layer A layout invariants
  *                 + axe a11y (always), and Layer B pixel regression (toHave
  *                 Screenshot) when VISUAL_SNAPSHOTS=1 with blessed baselines.
@@ -22,6 +17,11 @@
  * pass" — is a human/vision-model review step documented in CLAUDE.md; it is not
  * mechanizable here, so the gate asserts the four automatable conditions and the
  * critic sign-off is recorded out of band.)
+ *
+ * Flags: --skip-visual (skip the visual layer) · --skip-extra (skip every
+ * app-declared extra stage; --skip-coverage is an alias kept from the deleted
+ * desktop fork, which had exactly one extra stage) · --no-wait (do not queue on
+ * the host lock).
  *
  * Usage:
  *   npm run gate:ui                 # full gate (Layer B skipped unless snapshots)
@@ -63,8 +63,9 @@ if (!fs.existsSync(CFG.__configPath)) {
   console.error(
     `gate-ui: refusing to run — no gallery.config.json at ${CFG.__configPath}.\n` +
       `  These scripts read their anchors (galleryDir, portWhich, galleryUrl, …) from the\n` +
-      `  APP's config, so cwd must be the app's ui/ directory (e.g. src-app/ui or\n` +
-      `  src-app/desktop/ui). Running elsewhere would silently use another app's defaults.`,
+      `  APP's config, so cwd must be the app's ui/ directory — the one whose\n` +
+      `  gallery.config.json you mean. Running elsewhere would silently use another\n` +
+      `  app's defaults (including portWhich, i.e. another gallery's port).`,
   )
   process.exit(2)
 }
@@ -322,9 +323,12 @@ async function main() {
     // 5. app-declared extra steps (config-driven, same shape as lintCmds) ------
     for (const [label, cmd, args] of CFG.gateExtraCmds ?? []) {
       if (!runUsable) {
-        // NOT reported as a FAIL: the step did not run, so it has no verdict.
-        // (The gate is already red on runtime-health, so nothing is softened.)
-        step(label, true, 'not run — the runtime crawl was not usable')
+        // FAIL, matching what `visual` does under the SAME condition twenty lines
+        // above. finish() prints only `PASS <name>` in the summary block, so a
+        // softened pass here reads as `PASS coverage` for a step that never ran —
+        // a verdict for something that did not execute. The gate is already red
+        // on runtime-health, so failing costs nothing and claims nothing.
+        step(label, false, 'not run — the runtime crawl was not usable')
         continue
       }
       if (SKIP_EXTRA) {

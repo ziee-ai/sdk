@@ -73,6 +73,13 @@ const DEFAULTS = {
   harnessCopies: null,
   /** App module exporting `isRuntimeBaselined(finding)` (or null = none). */
   runtimeBaselineModule: null,
+  /** Visual-layer fields read by this package's own `playwright/visual.config.ts`
+   *  (NOT by the gate). They live here so the one validator below recognises the
+   *  whole of `gallery.config.json`'s vocabulary — a shared package refusing a key
+   *  its own module documents is the "assumes one consumer" defect this area was
+   *  fixed for. */
+  visualTestDir: './tests/e2e/visual',
+  maxDiffPixelRatio: 0.05,
   /** Playwright visual config + spec list the gate runs. `null` = this app has
    *  no visual layer (no playwright.visual.config.ts), and the gate reports the
    *  step as "not configured" rather than failing on a config that isn't there.
@@ -80,10 +87,15 @@ const DEFAULTS = {
   visualConfig: 'playwright.visual.config.ts',
   visualSpecs: ['layout.spec.ts', 'states.spec.ts', 'overlays.spec.ts'],
   visualSnapshotSpecs: ['gallery.spec.ts'],
-  /** EXTRA gate steps, as `[label, cmd, args]`. Same shape as `lintCmds` — a
-   *  config-driven command list, so an app needing a stage the generic gate does
-   *  not have declares it here instead of forking the whole script. The desktop
-   *  workspace uses this for its gallery-coverage check. */
+  /** EXTRA gate steps, as `[label, cmd, args]` — a THREE-element entry.
+   *  Deliberately NOT the same shape as `lintCmds` (which is `[cmd, args]`): the
+   *  gate prints these under their own label, so each needs one. Following a
+   *  "same shape as lintCmds" reading yields `[['npm', ['run','x']]]`, which
+   *  destructures to `label='npm', cmd=['run','x']` and dies with an opaque
+   *  `The "file" argument must be of type string`. Example:
+   *    [["coverage", "npm", ["run", "check:gallery-coverage"]]]
+   *  A config-driven command list, so an app needing a stage the generic gate
+   *  does not have declares it here instead of forking the whole script. */
   gateExtraCmds: [],
   /** Lint commands the gate runs (npm-script names). */
   lintCmds: [['npm', ['run', 'lint:guardrails']], ['npm', ['run', 'lint:colors']]],
@@ -104,15 +116,20 @@ export function resolveGalleryConfig(cwd = process.cwd()) {
   // the extra-steps key `gateExtraCommands` made the gate skip its coverage stage
   // entirely, print no line for it, and still exit 0. Config that quietly does
   // less than it says is the exact failure this whole area was fixed for.
+  // Object.hasOwn, NOT `k in DEFAULTS`: `in` walks the prototype chain, so
+  // `constructor` / `toString` / `hasOwnProperty` / `valueOf` were all accepted —
+  // a typo landing on one is silently ignored (the very defect this refuses), and
+  // an own `toString` would shadow the method and break any coercion of CFG.
   const unknown = Object.keys(file).filter(
-    k => !(k in DEFAULTS) && !k.startsWith('$') && !k.startsWith('__'),
+    k => !Object.hasOwn(DEFAULTS, k) && !k.startsWith('$') && !k.startsWith('__'),
   )
   if (unknown.length)
     throw new Error(
       `[gallery-config] ${configPath} has unknown key(s): ${unknown.join(', ')}. ` +
         `Known keys: ${Object.keys(DEFAULTS).sort().join(', ')}. ` +
         `(A typo'd key is silently ignored, which removes the behaviour you meant ` +
-        `to configure — so it is refused rather than defaulted.)`,
+        `to configure — so it is refused rather than defaulted. For a comment, ` +
+        `prefix the key with "$", e.g. "$comment".)`,
     )
   return { ...DEFAULTS, ...file, __cwd: cwd, __configPath: configPath }
 }
