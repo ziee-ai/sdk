@@ -17,7 +17,6 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
 import { CORES, checkParity, requiredCores, resolveHarnessCopies } from './check-harness-parity.mjs'
 
 // A minimal fake tree: one producer + one consumer, each carrying every core.
@@ -250,16 +249,10 @@ test('the CORES set is PINNED — a core cannot be deleted silently', () => {
   )
 })
 
-test('the guard STATES its own limit in the text it prints', () => {
-  // TEST-40 claimed this and nothing checked it: the note lives in the isMain
-  // block, which no unit test executes. Assert the source of the operator-facing
-  // line, so the caveat cannot be quietly dropped while the claim survives.
-  const src = readFileSync(new URL('./check-harness-parity.mjs', import.meta.url), 'utf8')
-  const banner = src.slice(src.indexOf('harness parity: OK'))
-  assert.match(banner, /WIRES each core/, 'the success line must say it proves wiring')
-  assert.match(
-    banner,
-    /does NOT prove the copy's logic|NOT prove the copy.s logic/,
-    'and must say what it does NOT prove — a wiring check read as verification is the defect',
-  )
-})
+// NOTE: "the guard states its own limit" is asserted in the CONSUMER test, by
+// EXECUTING the guard and reading its stdout. It was briefly asserted here by
+// scanning the source for the caveat text — a blind auditor defeated that in one
+// move: delete the words from the printed line, leave them in a comment beside
+// it, suite green and the operator sees nothing. Source-text assertions have an
+// unbounded evasion space; assert the behaviour (what is printed), not the
+// spelling.
