@@ -1,7 +1,7 @@
 import { Text, Title } from '@ziee/kit'
 import { ReactNode, useId } from 'react'
 import { DivScrollY } from '../components/DivScrollY'
-import { appLayoutSeam } from '../app-store-seams'
+import { appLayoutChrome } from '../app-store-seams'
 
 interface SettingsPageContainerProps {
   title: string | ReactNode
@@ -27,9 +27,7 @@ export function SettingsPageContainer({
   // mobile flag (off by default), so fall back to `false` in a store-less context
   // (the dev gallery) rather than crashing. Runtime matches reading
   // `Stores.AppLayout.nativeScroll` directly.
-  const nativeScroll =
-    (appLayoutSeam.peek() as { nativeScroll?: boolean } | null)
-      ?.nativeScroll ?? false
+  const { nativeScroll } = appLayoutChrome()
 
   // Vertical spacing notes:
   //   pt-3 keeps the title close to the top header bar.
