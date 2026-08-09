@@ -17,6 +17,8 @@ import {
   isViteDevAsset,
   normalizeAssetUrl,
   requestUrlOf,
+  classifyConsoleMessage,
+  REACT_WARNING_STRICT,
 } from './finding-classify.mjs'
 
 const F = (over = {}) => ({
@@ -204,3 +206,168 @@ test('normalizeAssetUrl strips the query', () => {
   assert.equal(normalizeAssetUrl('http://x/src/a.tsx?t=1'), '/src/a.tsx')
   assert.equal(normalizeAssetUrl('/src/a.tsx?import'), '/src/a.tsx')
 })
+
+// ---------------------------------------------------------------------------
+// TEST-32 — console-message classification is CHANNEL-INDEPENDENT.
+//
+// React 19 routes its developer warnings through `console.error`, not
+// `console.warn`. The harness taxonomy classifies `unique "key" prop` (and the
+// rest of REACT_WARNING) as `react-warning`/MEDIUM, but that branch used to be
+// consulted ONLY when `msg.type() === 'warning'` — so on React 19 every React
+// warning was recorded as `console-error`/HIGH and GATED the surface. That is a
+// misclassification against the harness's own taxonomy, not a flake.
+//
+// Asserted in BOTH directions: the warning texts must be MEDIUM on the error
+// channel, AND a genuine runtime error on the same channel must still be HIGH
+// (a blanket downgrade of console.error would blind the gate entirely).
+// ---------------------------------------------------------------------------
+test('TEST-32 a React warning on the ERROR channel is react-warning/MEDIUM', () => {
+  for (const t of [
+    'Each child in a list should have a unique "key" prop.',
+    'Warning: validateDOMNesting: <div> cannot appear as a descendant of <p>.',
+    'An update to Foo inside a test was not wrapped in act(...)',
+  ])
+    assert.deepEqual(
+      classifyConsoleMessage('error', 'loaded', t),
+      { category: 'react-warning', severity: 'MEDIUM' },
+      t,
+    )
+})
+
+test('TEST-32 the same texts on the WARNING channel are unchanged (MEDIUM)', () => {
+  assert.deepEqual(
+    classifyConsoleMessage('warning', 'loaded', 'Each child in a list should have a unique "key" prop.'),
+    { category: 'react-warning', severity: 'MEDIUM' },
+  )
+})
+
+test('TEST-32 a genuine console error still gates HIGH — no blanket downgrade', () => {
+  for (const t of [
+    'TypeError: Cannot read properties of undefined (reading "map")',
+    'Internal React error: Expected static flag was missing. Please notify the React team.',
+    'Failed to fetch /api/files',
+  ])
+    assert.deepEqual(
+      classifyConsoleMessage('error', 'loaded', t),
+      { category: 'console-error', severity: 'HIGH' },
+      t,
+    )
+})
+
+test('TEST-32 an ErrorBoundary crash outranks the warning arm and stays HIGH', () => {
+  // The fixture MUST match a react-warning pattern too, or the two arms never
+  // contend and the test passes with the precedence reversed. (An ErrorBoundary
+  // report quotes the error it caught, so this text shape is realistic.)
+  for (const t of [
+    '[AppErrorBoundary [x]] Error: Each child in a list should have a unique "key" prop.',
+    '[AppErrorBoundary [x]] Error: validateDOMNesting failed',
+  ]) {
+    assert.ok(
+      REACT_WARNING_STRICT.some(re => re.test(t)),
+      `fixture must actually match the warning arm, else the test is hollow: ${t}`,
+    )
+    assert.deepEqual(classifyConsoleMessage('error', 'loaded', t), {
+      category: 'crash',
+      severity: 'HIGH',
+    })
+  }
+})
+
+test('TEST-32 a NON-React error containing warning-list words still gates HIGH', () => {
+  // Both blind auditors found this independently: the historical react-warning
+  // list is deliberately loose, which is harmless on the warning channel (already
+  // non-gating) but is a GATE HOLE on the error channel. These are real product
+  // failures whose text merely contains an English phrase from that list.
+  for (const t of [
+    '[ApiClient] GET /api/models failed: 410 Gone — this endpoint is deprecated',
+    'Uncaught (in promise) Error: crypto.subtle is deprecated in insecure contexts',
+    'TypeError: ReactDOM.findDOMNode is not a function',
+    'Warning: Failed to persist draft — data loss',
+  ])
+    assert.deepEqual(
+      classifyConsoleMessage('error', 'loaded', t),
+      { category: 'console-error', severity: 'HIGH' },
+      `must still gate: ${t}`,
+    )
+})
+
+test('TEST-32 the WARNING channel keeps the loose list (unchanged behaviour)', () => {
+  // The loose patterns are still honoured where they cost nothing.
+  for (const t of [
+    'Warning: something reactish',
+    'ReactDOM.render is deprecated and will be removed',
+    'findDOMNode is deprecated in StrictMode',
+  ])
+    assert.deepEqual(
+      classifyConsoleMessage('warning', 'loaded', t),
+      { category: 'react-warning', severity: 'MEDIUM' },
+      t,
+    )
+})
+
+test('TEST-32 non-diagnostic channels record NOTHING (no ledger inflation)', () => {
+  // Consulting the warning list before the channel would newly record ordinary
+  // app logging — including, in the gating direction, an ErrorBoundary log.
+  for (const ch of ['log', 'info', 'debug', 'trace'])
+    for (const t of [
+      'ReactDOM.render is deprecated',
+      'Each child in a list should have a unique "key" prop.',
+      '[AppErrorBoundary [x]] Error: boom',
+    ])
+      assert.equal(classifyConsoleMessage(ch, 'loaded', t), null, `${ch}: ${t}`)
+})
+
+test('TEST-32 the error-state MEDIUM downgrade is preserved for real errors', () => {
+  assert.deepEqual(
+    classifyConsoleMessage('error', 'error', 'TypeError: boom'),
+    { category: 'console-error', severity: 'MEDIUM' },
+  )
+})
+
+test('TEST-32 a non-React message on the warning channel is not recorded', () => {
+  assert.equal(classifyConsoleMessage('warning', 'loaded', 'some random warning'), null)
+})
+
+// ---------------------------------------------------------------------------
+// F6 — each STRICT pattern is pinned INDIVIDUALLY.
+//
+// The earlier fixtures each matched two or more patterns and asserted only on
+// the RESULT, so deleting `/unique "key" prop/i` or `/Each child in a list/i`
+// was a silent no-op (they mask each other). A pattern nobody pins can be
+// deleted or rot against a React upgrade without a test noticing — which is
+// exactly what happened to the DOM-nesting patterns.
+//
+// One case per pattern, each text matching THAT pattern and no other.
+// ---------------------------------------------------------------------------
+const STRICT_CASES = [
+  ['key warning', 'Each child in a list should have a unique "key" prop.'],
+  ['not wrapped in act(', 'An update to Foo inside a test was not wrapped in act(...)'],
+  ['React 19 DOM nesting', 'In HTML, <div> cannot be a child of <p>. This will cause a hydration error.'],
+  ['React 19 DOM nesting (descendant)', 'In HTML, <div> cannot be a descendant of <p>. This will cause a hydration error.'],
+  ['validateDOMNesting (React 18)', 'validateDOMNesting: something is off'],
+  ['cannot appear as a descendant of (React 18)', '<td> cannot appear as a descendant of <div>.'],
+]
+
+test('TEST-32 each STRICT pattern is individually load-bearing', () => {
+  for (const [name, text] of STRICT_CASES) {
+    const matching = REACT_WARNING_STRICT.filter(re => re.test(text))
+    assert.equal(
+      matching.length,
+      1,
+      `"${name}" must be pinned by EXACTLY ONE pattern or deleting that pattern ` +
+        `is masked by another; matched ${matching.length}: ${matching.map(String).join(', ')}`,
+    )
+    assert.deepEqual(
+      classifyConsoleMessage('error', 'loaded', text),
+      { category: 'react-warning', severity: 'MEDIUM' },
+      `${name}: must be downgraded on the error channel`,
+    )
+  }
+})
+
+// NOTE: the "does the STRICT list match the INSTALLED React?" backstop lives in
+// the CONSUMER test (`src-app/ui/scripts/react-warning-coverage.test.mjs`).
+// react-dom is the APP's dependency, not this package's, so resolving it from
+// here silently found nothing and the test skipped itself into a vacuous pass —
+// which let a wrong pattern spelling go green. A test that cannot see its
+// subject must live where its subject is.

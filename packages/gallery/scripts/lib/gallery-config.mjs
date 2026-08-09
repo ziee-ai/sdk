@@ -63,6 +63,14 @@ const DEFAULTS = {
   devCmd: ['npm', 'run', 'dev'],
   /** Additional source trees (desktop) the dual-tree generators scan. */
   extraTrees: [],
+  /**
+   * The app's LIVE harness copies, for `check-harness-parity`. Either a STRING
+   * path (relative to cwd) to a `{ "copies": [...] }` manifest — whose `file`
+   * paths are relative to the MANIFEST, so several workspaces share ONE
+   * declaration — or an inline array with `file` relative to cwd. `null` = no
+   * consumer copies to check (a standalone package), and the guard says so and
+   * exits 0 rather than hardcoding some app's layout. */
+  harnessCopies: null,
   /** App module exporting `isRuntimeBaselined(finding)` (or null = none). */
   runtimeBaselineModule: null,
   /** Playwright visual config + spec list the gate runs. */

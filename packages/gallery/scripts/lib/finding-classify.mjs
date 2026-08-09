@@ -23,6 +23,123 @@ import {
 export const ERRORBOUNDARY = /\[AppErrorBoundary/
 
 /**
+ * React developer warnings. The harness taxonomy rates these MEDIUM — they are
+ * real quality debt but not a gating runtime failure.
+ *
+ * These live HERE, next to the classifier, rather than in each crawl copy,
+ * because the channel a warning arrives on is a REACT-VERSION detail and the
+ * classification must not depend on it: React 19 routes `console.error` for
+ * developer warnings that React 18 sent to `console.warn`. When the list and the
+ * channel test were duplicated in each `runtime-health.mjs`, the taxonomy said
+ * MEDIUM while the code recorded HIGH — a misclassification that gated every
+ * surface carrying a stray `key` warning.
+ */
+/**
+ * The subset that is UNAMBIGUOUSLY a React developer warning by its text alone.
+ * Only these may be downgraded on the ERROR channel.
+ *
+ * The distinction is load-bearing. On the warning channel a false match costs
+ * nothing — the message was already non-gating. On the error channel every false
+ * match is a GATE HOLE, and the looser patterns below are ordinary English:
+ * `/is deprecated/i` matches `GET /api/models failed: 410 Gone — this endpoint
+ * is deprecated`, and `/findDOMNode/i` matches React 19's `TypeError:
+ * ReactDOM.findDOMNode is not a function`, which is a real crash, not a warning.
+ * Each pattern here names a specific React warning string that no plausible
+ * application error contains.
+ */
+export const REACT_WARNING_STRICT = [
+  // ONE pattern per React message. Two patterns for the same warning
+  // (`/unique "key" prop/i` AND `/Each child in a list/i`) mask each other:
+  // deleting either is a silent no-op, so neither is pinned by any test.
+  // Quote-independent, because the runtime string embeds real quotes.
+  /Each child in a list should have a unique/i,
+  /not wrapped in act\(/i,
+  // DOM nesting. React 19 REWROTE this warning, so matching only the React 18
+  // spelling left the whole family gating HIGH against the very version the fix
+  // was written for. Verified against the installed react-dom 19 dev build:
+  // `In HTML, %s cannot be a child of <%s>.` / `… cannot be a descendant of …`,
+  // and `cannot appear as a descendant` / `validateDOMNesting` appear ZERO times.
+  // Both spellings are kept — a repo can be on either major.
+  /In HTML, .{0,80}cannot be a (child|descendant) of/i, // React 19
+  /validateDOMNesting/i, //                                React 18
+  /cannot appear as a descendant of/i, //                  React 18
+]
+
+/**
+ * The warning-channel list: the historical loose patterns PLUS the strict ones.
+ *
+ * Not quite "the historical list" — the strict set adds the React-19 DOM-nesting
+ * texts and `validateDOMNesting`, so a handful of messages that previously went
+ * unrecorded on the warning channel are now recorded as MEDIUM. That is a
+ * deliberate widening in the NON-gating direction (ledger only); the loose
+ * patterns are still never consulted on the error channel, which is the half
+ * that decides whether the build fails.
+ */
+export const REACT_WARNING = [
+  ...REACT_WARNING_STRICT,
+  /^Warning:/,
+  /not wrapped in act/i,
+  /is deprecated/i,
+  /cannot appear as a descendant/i,
+  /findDOMNode/i,
+]
+
+/** Channels the crawl records at all. `log`/`info`/`debug` are not diagnostics —
+ *  consulting the warning list before the channel would newly record ordinary
+ *  app logging as findings. */
+const DIAGNOSTIC_CHANNELS = new Set(['error', 'warning', 'warn'])
+
+/**
+ * Severity of a raw console-error / uncaught exception, given the state it fired
+ * in. The `error` state DELIBERATELY makes the mock API return 500s to exercise
+ * each surface's failure handling, so a store logging / rethrowing that injected
+ * failure is EXPECTED there — MEDIUM (the tracked "error-handling gap" backlog),
+ * not a gating defect. An ErrorBoundary crash is HIGH regardless. In every other
+ * state a console-error / pageerror is an unexpected runtime defect → HIGH.
+ */
+export function errSeverity(state, text) {
+  if (ERRORBOUNDARY.test(text)) return 'HIGH'
+  return state === 'error' ? 'MEDIUM' : 'HIGH'
+}
+
+/**
+ * Classify a console message into `{category, severity}`, or `null` when it is
+ * not recorded at all.
+ *
+ * **Channel-independent by design.** The message TYPE (`error` / `warning`) only
+ * decides whether a NON-React message is recorded; it never decides a React
+ * warning's severity. A blanket downgrade of the error channel would blind the
+ * gate, so the arms are ordered: an ErrorBoundary crash outranks everything, a
+ * known React warning is MEDIUM on any channel, and anything else on the error
+ * channel keeps its state-aware HIGH.
+ *
+ * @param type   playwright's `msg.type()` — 'error' | 'warning' | 'warn' | …
+ * @param state  the gallery cell state ('loaded' | 'empty' | 'error' | …)
+ * @param text   the message text
+ */
+export function classifyConsoleMessage(type, state, text) {
+  // Channel-independent BETWEEN the two diagnostic channels — NOT channel-blind.
+  // `log`/`info`/`debug` stay unrecorded, as they always were.
+  if (!DIAGNOSTIC_CHANNELS.has(type)) return null
+
+  if (type === 'error') {
+    // A render crash outranks everything, including a message that also carries
+    // React-warning text (an ErrorBoundary report quotes the error it caught).
+    if (ERRORBOUNDARY.test(text)) return { category: 'crash', severity: 'HIGH' }
+    // THE FIX: a React developer warning is MEDIUM even though React 19 emits it
+    // here. Narrow list only — on this channel a false match is a gate hole.
+    if (matchesAny(text, REACT_WARNING_STRICT))
+      return { category: 'react-warning', severity: 'MEDIUM' }
+    return { category: 'console-error', severity: errSeverity(state, text) }
+  }
+
+  // Warning channel — the loose list; over-matching here is non-gating.
+  if (matchesAny(text, REACT_WARNING))
+    return { category: 'react-warning', severity: 'MEDIUM' }
+  return null
+}
+
+/**
  * A failed request to a Vite-served dev asset (source module, `/@`-internal,
  * node_modules font/chunk) — dev transport, never a product fetch. Product data
  * goes to `/api`, which the mock cassette intercepts before the network.

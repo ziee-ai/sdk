@@ -30,13 +30,12 @@
  *
  * Exit 0 = every live copy carries every core. Exit 1 = a copy is missing one.
  *
- * Run: node check-harness-parity.mjs [--root <repo-root>]
+ * Run (from the app's ui/ cwd, so gallery.config.json resolves):
+ *   node node_modules/@ziee/gallery/scripts/check-harness-parity.mjs
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
-
-const HERE = path.dirname(fileURLToPath(import.meta.url))
+import { resolveGalleryConfig } from './lib/gallery-config.mjs'
 
 /**
  * Each core: the shared module that owns the behaviour, plus a call site that
@@ -45,6 +44,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 export const CORES = [
   {
     id: 'host-lock',
+    roles: ['producer', 'consumer'],
     why: 'serializes crawls across worktrees on one host (D3)',
     module: 'host-lock.mjs',
     // Either entry point: the crawl wraps itself in withHostLock; the gate takes
@@ -53,6 +53,7 @@ export const CORES = [
   },
   {
     id: 'run-manifest',
+    roles: ['producer', 'consumer'],
     why: 'makes a killed crawl unable to inherit a previous run (D4)',
     module: 'run-validity.mjs',
     // A PRODUCER writes the manifest; a CONSUMER verifies it. One alternation
@@ -63,6 +64,7 @@ export const CORES = [
   },
   {
     id: 'run-validity',
+    roles: ['producer', 'consumer'],
     why: 'VOIDs a run whose origin died or whose findings are mostly transport noise (D1)',
     module: 'run-validity.mjs',
     // Specifically assessRun — NOT an alternation with clearRunArtifacts. The
@@ -72,7 +74,23 @@ export const CORES = [
     consumerCallSite: /clearRunArtifacts\s*\(/,
   },
   {
+    id: 'origin-watchdog',
+    roles: ['producer'],
+    why:
+      'watches the dev server for the whole crawl, so a run whose ORIGIN DIED ' +
+      'mid-crawl is VOIDed rather than reported as a clean pass (D1)',
+    module: 'run-validity.mjs',
+    // run-validity's `why` names TWO behaviours — "origin died OR findings are
+    // mostly transport noise" — but only `assessRun` was pinned, so the entire
+    // origin-death half could be dropped from a copy with every suite green.
+    // That is the guard naming a behaviour it does not check, which this file's
+    // own comments condemn. Pinned as its own core rather than widened into an
+    // alternation, because an alternation lets either half satisfy both.
+    callSite: /watchOrigin\s*\(|originAlive\s*\(/,
+  },
+  {
     id: 'transport-mirror-classification',
+    roles: ['producer'],
     why:
       'mutes the console TWIN of an already-muted dev-asset transport failure, ' +
       'and refuses to mute a dyn-import crash without same-module corroboration (D1)',
@@ -81,48 +99,103 @@ export const CORES = [
     module: 'finding-classify.mjs',
     callSite: /classifyAll\s*\(/,
   },
+  {
+    id: 'console-classification',
+    roles: ['producer'],
+    why:
+      'classifies a console message by TEXT, not by channel — React 19 emits ' +
+      'developer warnings on console.error, so a channel-derived severity gated ' +
+      'every React warning as HIGH against the harness\'s own MEDIUM taxonomy',
+    module: 'finding-classify.mjs',
+    // The crawl must DELEGATE the decision. A copy that reconstructs its own
+    // `m.type() === 'error' ? … : …` branch re-introduces the version coupling
+    // this core exists to remove, and would not match.
+    callSite: /classifyConsoleMessage\s*\(/,
+  },
 ]
 
-/** The copies that are actually EXECUTED by some npm script. A dead copy is not
- *  checked — it is deleted (CODING_GUIDELINES §15). */
-export const LIVE_COPIES = [
-  { id: 'sdk/runtime-health', file: 'sdk/packages/gallery/scripts/runtime-health.mjs' },
-  { id: 'sdk/gate-ui', file: 'sdk/packages/gallery/scripts/gate-ui.mjs' },
-  { id: 'desktop/runtime-health', file: 'src-app/desktop/ui/scripts/runtime-health.mjs' },
-  { id: 'desktop/gate-ui', file: 'src-app/desktop/ui/scripts/gate-ui.mjs' },
-]
+/**
+ * WHICH copies exist is the CONSUMER's fact, not this package's.
+ *
+ * This guard used to hardcode `src-app/desktop/ui/...` — ziee's layout — inside
+ * the shared `@ziee/gallery` package, which made the guard and its own test
+ * red-by-construction in a standalone sdk checkout or in any second consumer.
+ * That is the SAME defect class the guard exists to prevent (shared tooling that
+ * assumes one consumer), so the paths are now supplied the way every other
+ * generic gallery script takes its anchors: from the app's `gallery.config.json`
+ * (cf. `srcDir` / `extraTrees` / `kitTestIds` in `lib/gallery-config.mjs`).
+ *
+ * `harnessCopies` is either
+ *   - a STRING: a path (relative to the app's cwd) to a JSON manifest
+ *     `{ "copies": [ … ] }` whose own `file` paths are relative to the MANIFEST,
+ *     so several workspaces can share ONE declaration instead of duplicating it
+ *     (duplicating the list would re-create the drift this guard checks for); or
+ *   - an inline ARRAY of the same entries, with `file` relative to cwd.
+ *
+ * Each entry: `{ id, file, role: 'producer'|'consumer', cores: [coreId, …] }`.
+ * Absent/empty ⇒ nothing to check (a standalone package legitimately has no
+ * consumer copies) and the guard exits 0 saying so.
+ */
 
-/** Which cores each copy is REQUIRED to carry. `gate-ui` drives the crawl and
- *  consumes its manifest; `runtime-health` performs the crawl and produces it. */
-export const REQUIRED = {
-  'sdk/runtime-health': ['host-lock', 'run-manifest', 'run-validity', 'transport-mirror-classification'],
-  'sdk/gate-ui': ['host-lock', 'run-manifest', 'run-validity'],
-  'desktop/runtime-health': ['host-lock', 'run-manifest', 'run-validity', 'transport-mirror-classification'],
-  'desktop/gate-ui': ['host-lock', 'run-manifest', 'run-validity'],
-}
+/** The cores a copy must carry, derived from its ROLE (not from the manifest). */
+export const requiredCores = copy => CORES.filter(c => c.roles.includes(copy.role))
 
-/** `runtime-health` PRODUCES the manifest/verdict; `gate-ui` CONSUMES them. */
-export const ROLE = {
-  'sdk/runtime-health': 'producer',
-  'desktop/runtime-health': 'producer',
-  'sdk/gate-ui': 'consumer',
-  'desktop/gate-ui': 'consumer',
-}
-
-/** Pure core — exported so the test can drive it against mutated fixtures. */
-export function checkParity(readFile, copies = LIVE_COPIES, required = REQUIRED, roles = ROLE) {
+/** Pure core — drives against whatever `copies` it is handed. `readFile(file)`
+ *  returns the source or `null`. */
+export function checkParity(readFile, copies) {
   const violations = []
+
+  // --- declaration integrity -----------------------------------------------
+  // WHICH cores a copy must carry is derived from its ROLE, by this package —
+  // it is NOT read from the consumer's manifest. An earlier version let the
+  // manifest list the cores per copy, which reintroduced the exact bug the guard
+  // exists to catch: dropping a core from ONE copy's list made that copy stop
+  // being checked, silently, while the CLI still printed "all N cores". The
+  // consumer declares only WHERE its copies are and WHAT each one is.
+  const ROLES = new Set(['producer', 'consumer'])
+  for (const copy of copies) {
+    if (!ROLES.has(copy.role))
+      violations.push(
+        `${copy.id}: has role "${copy.role ?? '(none)'}" — must be one of ` +
+          `${[...ROLES].join(' | ')}. The role determines which cores the copy ` +
+          `must carry, so an unrecognised one would check nothing.`,
+      )
+    if (copy.cores)
+      violations.push(
+        `${copy.id}: declares "cores" — remove it. Required cores are derived ` +
+          `from the role by @ziee/gallery; a per-copy list is how a core silently ` +
+          `stops being checked.`,
+      )
+  }
+  const ids = copies.map(c => c.id)
+  const files = copies.map(c => c.file)
+  for (const dup of [...new Set(ids.filter((x, i) => ids.indexOf(x) !== i))])
+    violations.push(`duplicate copy id "${dup}" — each live copy must be listed once.`)
+  for (const dup of [...new Set(files.filter((x, i) => files.indexOf(x) !== i))])
+    violations.push(
+      `two entries point at the same file "${dup}" — one source would be read ` +
+        `twice and a real copy would go unchecked.`,
+    )
+  // Every core must be exercised by at least one copy of a role that carries it.
+  for (const core of CORES)
+    if (!copies.some(c => core.roles.includes(c.role)))
+      violations.push(
+        `core "${core.id}" is required by no declared copy (no ${core.roles.join('/')} ` +
+          `is listed), so it is never checked. That core ${core.why}.`,
+      )
+
+  if (violations.length) return violations
+
   for (const copy of copies) {
     const src = readFile(copy.file)
     if (src == null) {
       violations.push(`${copy.id}: expected harness copy is MISSING at ${copy.file}`)
       continue
     }
-    for (const coreId of required[copy.id] ?? []) {
-      const core = CORES.find(c => c.id === coreId)
+    for (const core of requiredCores(copy)) {
       const imports = src.includes(core.module)
       const site =
-        roles[copy.id] === 'consumer' && core.consumerCallSite
+        copy.role === 'consumer' && core.consumerCallSite
           ? core.consumerCallSite
           : core.callSite
       const calls = site.test(src)
@@ -138,29 +211,80 @@ export function checkParity(readFile, copies = LIVE_COPIES, required = REQUIRED,
   return violations
 }
 
+/**
+ * Resolve the consumer's declared copies into entries whose `file` is ABSOLUTE.
+ * Returns `{ copies, source }`; `source` names where the declaration came from
+ * (for the operator-facing log), or `null` when nothing is configured.
+ */
+export function resolveHarnessCopies(cfg, io = fs) {
+  const spec = cfg.harnessCopies
+  if (!spec || (Array.isArray(spec) && spec.length === 0))
+    return { copies: [], source: null }
+
+  let entries
+  let base
+  let source
+  if (typeof spec === 'string') {
+    source = path.resolve(cfg.__cwd, spec)
+    let raw
+    try {
+      raw = io.readFileSync(source, 'utf8')
+    } catch (e) {
+      // A configured-but-unreadable manifest must be an ERROR, never an empty
+      // list: silently checking nothing is how a gate stops gating.
+      throw new Error(`[harness-parity] harnessCopies manifest not readable at ${source}: ${e.message}`)
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (e) {
+      throw new Error(`[harness-parity] failed to parse ${source}: ${e.message}`)
+    }
+    entries = parsed.copies
+    base = path.dirname(source)
+    if (!Array.isArray(entries))
+      throw new Error(`[harness-parity] ${source} has no "copies" array`)
+  } else {
+    entries = spec
+    base = cfg.__cwd
+    source = cfg.__configPath
+  }
+
+  return {
+    source,
+    copies: entries.map(e => ({ ...e, file: path.resolve(base, e.file) })),
+  }
+}
+
 const isMain =
   import.meta.url === `file://${process.argv[1]}` ||
   process.argv[1]?.endsWith('check-harness-parity.mjs')
 
 if (isMain) {
-  const rootArg = process.argv.indexOf('--root')
-  // Default: this file lives at <root>/sdk/packages/gallery/scripts/.
-  const root =
-    rootArg >= 0 ? path.resolve(process.argv[rootArg + 1]) : path.resolve(HERE, '../../../..')
-  const readFile = rel => {
+  const { copies, source } = resolveHarnessCopies(resolveGalleryConfig())
+  if (!copies.length) {
+    console.log(
+      'harness parity: no consumer harness copies configured ' +
+        '(set "harnessCopies" in gallery.config.json) — nothing to check.',
+    )
+    process.exit(0)
+  }
+  const readFile = abs => {
     try {
-      return fs.readFileSync(path.join(root, rel), 'utf-8')
+      return fs.readFileSync(abs, 'utf-8')
     } catch {
       return null
     }
   }
-  const violations = checkParity(readFile)
+  const violations = checkParity(readFile, copies)
   if (violations.length) {
     console.error(`harness parity: ${violations.length} violation(s)\n`)
     for (const v of violations) console.error(`  ✗ ${v}\n`)
     process.exit(1)
   }
+  const checked = new Set(copies.flatMap(c => requiredCores(c).map(x => x.id)))
   console.log(
-    `harness parity: OK — ${LIVE_COPIES.length} live copies carry all ${CORES.length} behavioural cores.`,
+    `harness parity: OK — ${copies.length} live copies (from ${path.relative(process.cwd(), source)}) ` +
+      `carry all ${checked.size} behavioural cores: ${[...checked].sort().join(', ')}.`,
   )
 }

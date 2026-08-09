@@ -40,8 +40,9 @@ import { resolveGalleryConfig } from './lib/gallery-config.mjs'
 import { resolveGalleryPort, resolveWorktreeRoot } from './lib/run-key.mjs'
 import { withHostLock } from './lib/host-lock.mjs'
 import {
-  ERRORBOUNDARY,
   classifyAll,
+  classifyConsoleMessage,
+  errSeverity,
 } from './lib/finding-classify.mjs'
 import {
   assessRun,
@@ -125,31 +126,6 @@ const IGNORE_REQUEST = [
   /@vite\/client/i,
   /@react-refresh/i,
 ]
-const REACT_WARNING = [
-  /^Warning:/,
-  /unique "key" prop/i,
-  /not wrapped in act/i,
-  /is deprecated/i,
-  /Each child in a list/i,
-  /cannot appear as a descendant/i,
-  /findDOMNode/i,
-]
-
-// An ErrorBoundary catch is a genuine render CRASH in ANY state (the surface
-// failed to render, incl. its error UI) — always HIGH.
-
-/**
- * Severity of a raw console-error / uncaught exception, given the state it fired
- * in. The `error` state DELIBERATELY makes the mock API return 500s to exercise
- * each surface's failure handling, so a store logging / rethrowing that injected
- * failure is EXPECTED there — MEDIUM (the tracked "error-handling gap" backlog),
- * not a gating defect. An ErrorBoundary crash is HIGH regardless. In every other
- * state a console-error / pageerror is an unexpected runtime defect → HIGH.
- */
-function errSeverity(state, text) {
-  if (ERRORBOUNDARY.test(text)) return 'HIGH'
-  return state === 'error' ? 'MEDIUM' : 'HIGH'
-}
 
 const matchesAny = (s, list) => list.some(re => re.test(s))
 
@@ -495,29 +471,21 @@ async function main() {
     p.on('console', m => {
       const t = m.text()
       if (matchesAny(t, IGNORE_CONSOLE)) return
-      if (m.type() === 'error')
-        record(cell, theme, {
-          category: ERRORBOUNDARY.test(t) ? 'crash' : 'console-error',
-          severity: errSeverity(cell.state, t),
-          selector: null,
-          // Chromium's "Failed to load resource: net::ERR_…" console mirror does
-          // NOT name the resource in its text — the URL is only on the message's
-          // location. Without it the transport-mirror arm could not tell a dev
-          // asset from a product fetch, so it would have to mute both (blind) or
-          // neither (the defect).
-          resourceUrl: m.location?.()?.url || null,
-          detail: t.replace(/\s+/g, ' ').slice(0, 300),
-        })
-      else if (
-        (m.type() === 'warning' || m.type() === 'warn') &&
-        matchesAny(t, REACT_WARNING)
-      )
-        record(cell, theme, {
-          category: 'react-warning',
-          severity: 'MEDIUM',
-          selector: null,
-          detail: t.replace(/\s+/g, ' ').slice(0, 300),
-        })
+      // Channel-INDEPENDENT classification (shared, single-sourced). React 19
+      // emits developer warnings on console.error; deciding severity from the
+      // channel recorded every React warning as a gating HIGH against the
+      // harness's own MEDIUM taxonomy.
+      const c = classifyConsoleMessage(m.type(), cell.state, t)
+      if (!c) return
+      record(cell, theme, {
+        category: c.category,
+        severity: c.severity,
+        selector: null,
+        // Chromium's transport-mirror console message does NOT name the
+        // resource in its text — the URL is only on the message's location.
+        resourceUrl: m.location?.()?.url || null,
+        detail: t.replace(/\s+/g, ' ').slice(0, 300),
+      })
     })
     p.on('pageerror', e => {
       const msg = (e.message || String(e)).replace(/\s+/g, ' ').slice(0, 300)
