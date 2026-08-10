@@ -7,11 +7,39 @@ interface Props {
   label?: string
   /** Optional `onError` side effect (telemetry, etc.). */
   onError?: (error: Error, info: ErrorInfo) => void
+  /**
+   * When any value here changes WHILE the boundary is showing its fallback, the
+   * error state is cleared and the children get another render.
+   *
+   * An error boundary latches by design, so without a reset signal one crash is
+   * permanent for the life of the tab — observed in production as a surface that
+   * stayed dead across four subsequent navigations. `AppShell` passes a history
+   * epoch, so navigating away gives the module a fresh attempt.
+   *
+   * The PROP is inert while there is no error: `componentDidUpdate` returns early
+   * unless a fallback is showing, so a healthy subtree is never remounted or
+   * re-rendered on account of this prop. Note this is a claim about the prop, NOT
+   * about the caller: whatever the caller derives the key FROM (in `AppShell`, a
+   * history epoch) does re-render the caller on change, and that cost is the
+   * caller's to justify.
+   */
+  resetKeys?: readonly unknown[]
   children: ReactNode
 }
 
 interface State {
   error: Error | null
+}
+
+/** Shallow, length-aware comparison of two `resetKeys` arrays. */
+function changed(
+  a: readonly unknown[] | undefined,
+  b: readonly unknown[] | undefined,
+): boolean {
+  if (a === b) return false
+  if (!a || !b) return a !== b
+  if (a.length !== b.length) return true
+  return a.some((v, i) => !Object.is(v, b[i]))
 }
 
 /**
@@ -34,8 +62,20 @@ export class AppErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     const tag = this.props.label ? ` [${this.props.label}]` : ''
+    // Logged UNCONDITIONALLY, including for a crash that a `resetKeys` change
+    // later clears. Auto-reset must never make a crash invisible to the
+    // runtime-health gate (which counts `[AppErrorBoundary…]` console errors) —
+    // recovery is for the user, not for the metrics.
     console.error(`[AppErrorBoundary${tag}]`, error, info.componentStack)
     this.props.onError?.(error, info)
+  }
+
+  componentDidUpdate(prev: Props) {
+    // Only act while actually showing a fallback: a healthy subtree must never be
+    // disturbed by a resetKeys change.
+    if (!this.state.error) return
+    if (!changed(prev.resetKeys, this.props.resetKeys)) return
+    this.setState({ error: null })
   }
 
   reset = () => {

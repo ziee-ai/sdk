@@ -3,6 +3,8 @@ import type { ComponentRegistration } from '@ziee/framework/module-system/types'
 import { ModuleSystem } from '@ziee/framework/stores'
 import { initSync } from '@ziee/framework/sync'
 import { AppErrorBoundary } from '../error/AppErrorBoundary'
+import { ModuleErrorFallback } from '../error/ModuleErrorFallback'
+import { useHistoryEpoch } from '../hooks/useHistoryEpoch'
 import { ThemeProvider } from '../theme/ThemeProvider'
 import { LazyComponentRenderer } from '../components/LazyComponentRenderer'
 import { usePrefetchModules } from '../hooks/usePrefetchModules'
@@ -122,11 +124,34 @@ function AppShellBody({
   // Prefetch lazy-loaded modules when the browser is idle
   usePrefetchModules()
 
+  // Navigating is the "give it another go" signal for a latched boundary. Read
+  // above the router (which is itself one of the module components below), so
+  // `useLocation` is not available here — see `useHistoryEpoch`.
+  const historyEpoch = useHistoryEpoch()
+
   return (
     <ThemeProvider>
       <div data-testid="app-root" className="h-full">
         {sortedComponents.map(comp => (
-          <AppErrorBoundary key={comp.id} label={comp.id} fallback={() => null}>
+          <AppErrorBoundary
+            key={comp.id}
+            label={comp.id}
+            resetKeys={[historyEpoch]}
+            // A caught module crash renders a VISIBLE, actionable surface — not
+            // `null`. `null` was the white-screen bug: the ROUTER is a module
+            // component too, and it renders the entire routed app, so swallowing
+            // its crash emptied the document with no message and no way back.
+            // Keeping the fallback per-module preserves the isolation half of the
+            // contract: a non-router module failing still leaves the shell and
+            // every sibling module rendering normally.
+            fallback={(error, reset) => (
+              <ModuleErrorFallback
+                error={error}
+                reset={reset}
+                moduleId={comp.id}
+              />
+            )}
+          >
             <ConditionalComponent registration={comp} />
           </AppErrorBoundary>
         ))}
