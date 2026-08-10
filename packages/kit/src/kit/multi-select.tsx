@@ -10,6 +10,7 @@ import { useSurface } from './surface'
 import { useControllableState } from './use-controllable-state'
 import { type KitStyleProps } from './style-guard'
 import type { ValueBinding } from './value-binding'
+import type { NoUndeclaredAria } from './aria-passthrough'
 import { cn } from '../lib/utils'
 
 export interface MultiSelectOption {
@@ -268,6 +269,9 @@ interface MultiSelectBase {
 }
 // Controlled `value` requires a change handler (see ValueBinding); FormField stays valid.
 export type MultiSelectProps = MultiSelectBase &
+  // `Also` names the two the trailing union below declares — they live there rather than in the
+  // base because exactly one of them is REQUIRED, and the ban is derived from what is declared.
+  NoUndeclaredAria<MultiSelectBase, 'aria-label' | 'aria-labelledby'> &
   ValueBinding<string[]> &
   KitStyleProps &
   // An accessible name is REQUIRED — either an inline label or a referenced one (no silent default).

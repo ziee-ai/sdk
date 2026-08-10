@@ -19,6 +19,7 @@ import { useSurface } from './surface'
 import { useControllableState } from './use-controllable-state'
 import { cn } from '../lib/utils'
 import type { ValueBinding } from './value-binding'
+import type { NoUndeclaredAria } from './aria-passthrough'
 
 /**
  * How many options a `Select` must offer before `showSearch: 'auto'` gives it a search field.
@@ -120,6 +121,7 @@ interface SelectBase {
 // allowClear adds a clear button → its accessible name (clearLabel) is REQUIRED (no default, for i18n).
 // Controlled `value` requires a change handler (see ValueBinding); FormField stays valid.
 export type SelectProps = SelectBase &
+  NoUndeclaredAria<SelectBase> &
   ValueBinding<string> &
   ({ allowClear?: false; clearLabel?: never } | { allowClear: true; clearLabel: string })
 

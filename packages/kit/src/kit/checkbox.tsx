@@ -4,6 +4,7 @@ import { Skeleton } from '../shadcn/skeleton'
 import { useSurface } from './surface'
 import { cn } from '../lib/utils'
 import type { CheckedBinding } from './value-binding'
+import type { NoUndeclaredAria } from './aria-passthrough'
 
 interface CheckboxBase {
   /** Mixed state (legacy `indeterminate`); overrides `checked` visually until toggled. */
@@ -17,16 +18,21 @@ interface CheckboxBase {
   'aria-label'?: string
   'aria-labelledby'?: string
   'aria-describedby'?: string
+  /** Marks the control required for assistive tech. `FormField required` INJECTS this (via
+   *  cloneElement, untyped), so a control that neither declares nor forwards it drops it
+   *  silently — the same silent-drop class `aria-passthrough.ts` exists for, and one the type
+   *  ban cannot see because the injection is untyped. */
+  'aria-required'?: boolean
   invalid?: boolean
   /** Test selector — forwarded onto <root> (i18n-safe). */
   'data-testid': string
 }
 // Controlled `checked` requires a change handler (see CheckedBinding); FormField stays valid.
-export type CheckboxProps = CheckboxBase & CheckedBinding
+export type CheckboxProps = CheckboxBase & NoUndeclaredAria<CheckboxBase> & CheckedBinding
 
 export const Checkbox = React.forwardRef<HTMLButtonElement, CheckboxProps>(function Checkbox(
   { checked, value, defaultChecked, indeterminate, onCheckedChange, onChange, onBlur, disabled, name, id, label, className,
-    'aria-label': ariaLabel, 'aria-labelledby': ariaLabelledby, 'aria-describedby': ariaDescribedby, invalid,
+    'aria-label': ariaLabel, 'aria-labelledby': ariaLabelledby, 'aria-describedby': ariaDescribedby, 'aria-required': ariaRequired, invalid,
     'data-testid': testid },
   ref,
 ) {
@@ -54,6 +60,7 @@ export const Checkbox = React.forwardRef<HTMLButtonElement, CheckboxProps>(funct
       aria-labelledby={ariaLabelledby}
       aria-describedby={ariaDescribedby}
       aria-invalid={invalid || undefined}
+      aria-required={ariaRequired || undefined}
       data-testid={testid}
       className={className}
     />

@@ -5,6 +5,7 @@ import { useSurface } from './surface'
 import { useControllableState } from './use-controllable-state'
 import { cn } from '../lib/utils'
 import type { ValueBinding } from './value-binding'
+import type { NoUndeclaredAria } from './aria-passthrough'
 
 export interface SegmentedOption {
   label: React.ReactNode
@@ -29,7 +30,7 @@ interface SegmentedBase {
   'data-testid': string
 }
 // Controlled `value` requires a change handler (see ValueBinding); FormField stays valid.
-export type SegmentedProps = SegmentedBase & ValueBinding<string>
+export type SegmentedProps = SegmentedBase & NoUndeclaredAria<SegmentedBase> & ValueBinding<string>
 
 // A segmented control is a Tabs header without panels: same nova-base TabsList /
 // TabsTrigger styling (muted rail + raised active pill, themed for light & dark),

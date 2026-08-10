@@ -7,6 +7,7 @@ import { Skeleton } from '../shadcn/skeleton'
 import { useSurface } from './surface'
 import { useControllableState } from './use-controllable-state'
 import { type KitStyleProps } from './style-guard'
+import type { NoUndeclaredAria } from './aria-passthrough'
 import { cn } from '../lib/utils'
 
 // Coerce a Date | ISO-string | '' into a Date (or undefined). String values come from
@@ -22,7 +23,7 @@ function toDate(v: Date | string | undefined): Date | undefined {
 // Form-bindable: value + onChange (alias onValueChange) + name (hidden input) + id + ref(→trigger).
 // `value` accepts a Date or an ISO string; the change handlers EMIT a string in `valueFormat`
 // (default ISO `yyyy-MM-dd`) so RHF / JSON-schema forms get a stable serializable value.
-export type DatePickerProps = {
+interface DatePickerBase {
   value?: Date | string
   defaultValue?: Date | string
   /** Emits the picked date as a string in `valueFormat` (or '' when cleared). */
@@ -56,7 +57,9 @@ export type DatePickerProps = {
   'aria-required'?: boolean
   /** Test selector — forwarded onto <root> (i18n-safe). */
   'data-testid': string
-} & KitStyleProps
+}
+
+export type DatePickerProps = DatePickerBase & NoUndeclaredAria<DatePickerBase> & KitStyleProps
 
 export const DatePicker = React.forwardRef<HTMLButtonElement, DatePickerProps>(function DatePicker(
   {

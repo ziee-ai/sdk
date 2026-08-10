@@ -6,7 +6,8 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "test": "vitest run"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && vitest run"
   },
   "exports": {
     ".": "./src/index.ts",
