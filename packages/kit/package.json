@@ -7,7 +7,8 @@
   "types": "src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "npm run typecheck && vitest run"
+    "test:node": "node ../../scripts/run-node-tests.mjs --min 1",
+    "test": "npm run typecheck && vitest run && npm run test:node"
   },
   "exports": {
     ".": "./src/index.ts",

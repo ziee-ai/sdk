@@ -1,7 +1,7 @@
-import { readFileSync, readdirSync } from 'node:fs'
-import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
+import { fileURLToPath } from 'node:url'
+// @ts-expect-error - plain .mjs tooling shared by every package's config + node runner
+import { listNodeTestFiles } from '../../scripts/node-test-files.mjs'
 
 // Unit runner for @ziee/kit. Most of the kit is exercised through the consuming app's suites; this
 // pass exists for behaviour that can ONLY be asserted about the kit itself — currently the
@@ -13,21 +13,16 @@ const here = fileURLToPath(new URL('.', import.meta.url))
 /**
  * `node:test` suites are excluded, DERIVED rather than hand-listed — vitest reports a `node:test`
  * file as a passing file with zero tests, so leaving one in `include` turns a real suite into a
- * hollow green tick (the same trap the app's vitest.config.ts documents). Run those with
- * `node --test`.
+ * hollow green tick (the same trap the app's vitest.config.ts documents).
+ *
+ * The derivation now comes from the SHARED `scripts/node-test-files.mjs`, which is also what
+ * `npm run test:node` uses to RUN them. Previously this config excluded them and nothing ran them,
+ * so `src/kit/table-view-core.test.ts` (14 tests) was dark; one criterion, two consumers, no gap.
  */
-function nodeTestFiles(): string[] {
-  const dir = join(here, 'src', 'kit')
-  return readdirSync(dir)
-    .filter(f => /\.test\.tsx?$/.test(f))
-    .filter(f => /from ['"]node:test['"]/.test(readFileSync(join(dir, f), 'utf8')))
-    .map(f => `src/kit/${f}`)
-}
-
 export default defineConfig({
   test: {
     environment: 'node',
     include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
-    exclude: ['**/node_modules/**', ...nodeTestFiles()],
+    exclude: ['**/node_modules/**', ...listNodeTestFiles(here)],
   },
 })
