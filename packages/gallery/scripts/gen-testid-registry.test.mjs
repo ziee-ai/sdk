@@ -250,6 +250,43 @@ test('collectSourceFiles skips gallery seeds, generated output, tests + src/dev'
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('collectSourceFiles skips CO-LOCATED test suites, wherever they sit', () => {
+  // The class the `tests`-directory skip above does NOT cover, and the one that was
+  // actually live: a suite beside the component it exercises. `@ziee/kit` co-locates
+  // its component tests under `src/kit/`, ziee scans that tree via `kitTestIds`, and
+  // `sheet-bottom-track.test.tsx`'s `data-testid="body-child"` fixture was harvested
+  // straight into the production `KnownTestId` union.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'testid-colocated-'))
+  const src = path.join(root, 'src')
+  fs.mkdirSync(path.join(src, 'kit'), { recursive: true })
+
+  // Every co-located suite spelling, at depth, in both extensions.
+  for (const f of [
+    'sheet-bottom-track.test.tsx',
+    'table-view-core.test.ts',
+    'portal.spec.tsx',
+    'view.spec.ts',
+  ])
+    fs.writeFileSync(path.join(src, 'kit', f), 'x')
+
+  // NEGATIVE CONTROL — real source whose NAME merely contains "test"/"spec" must
+  // still be collected. A substring match here would silently delete real ids from
+  // the registry, which is the opposite failure and just as bad.
+  for (const f of ['TestModeBanner.tsx', 'latest.ts', 'Inspector.tsx', 'spectrum.ts'])
+    fs.writeFileSync(path.join(src, 'kit', f), 'x')
+
+  const got = collectSourceFiles(src)
+    .map(f => path.basename(f))
+    .sort()
+  assert.deepEqual(got, [
+    'Inspector.tsx',
+    'TestModeBanner.tsx',
+    'latest.ts',
+    'spectrum.ts',
+  ])
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 // ---------------------------------------------------------------------------
 // TEST-21 — GOLDEN set-equality against the REAL configured trees, with every
 // removed and added id asserted BY NAME.

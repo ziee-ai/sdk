@@ -49,10 +49,32 @@ export const ID_SHAPE = /^[a-zA-Z0-9_-]+$/
 const MENTIONS_TESTID = 'data-testid'
 
 /**
+ * A CO-LOCATED test file (`foo.test.tsx`, `bar.spec.ts`). Its `data-testid`s are
+ * fixtures — markers a test renders to find its own scratch DOM — and they are not
+ * app surfaces, so they must never enter the typed production registry.
+ *
+ * The `tests` DIRECTORY skip below is not sufficient for this: it only covers a tree
+ * that keeps its tests in one place (both apps' e2e specs), and misses the far more
+ * common unit-test layout where the suite sits beside the component it exercises.
+ * That gap was live and load-bearing: `@ziee/kit` co-locates its component suites
+ * under `src/kit/`, and ziee's `gallery.config.json` scans that tree via
+ * `kitTestIds`, so `kit/src/kit/sheet-bottom-track.test.tsx`'s `data-testid=
+ * "body-child"` — a bare `<div/>` the sheet test mounts to observe layout — was
+ * harvested into `KnownTestId` and made `check:testid-registry` fail. CytoAnalyst
+ * never saw it only because it does not configure `kitTestIds` at all.
+ *
+ * Anchored to the extension boundary (`.test.`/`.spec.` immediately before the final
+ * extension) so an ordinary source file whose name merely CONTAINS "test" — say
+ * `TestModeBanner.tsx` or `latest.ts` — is still collected.
+ */
+const CO_LOCATED_TEST_FILE = /\.(test|spec)\.(tsx|jsx|ts)$/
+
+/**
  * Recursively collect `.ts/.tsx/.jsx` source files under `dir`, skipping build/vcs
- * dirs, the `tests` tree, the dev-only gallery (`src/dev`), per-module `gallery.*`
- * seed files, and any `testIds.generated.ts` (so walking a package's own output
- * never feeds it back). Pure — exported for the unit test.
+ * dirs, the `tests` tree, co-located `*.test.*`/`*.spec.*` suites, the dev-only
+ * gallery (`src/dev`), per-module `gallery.*` seed files, and any
+ * `testIds.generated.ts` (so walking a package's own output never feeds it back).
+ * Pure — exported for the unit test.
  */
 export function collectSourceFiles(dir, acc = []) {
   if (!fs.existsSync(dir)) return acc
@@ -72,6 +94,7 @@ export function collectSourceFiles(dir, acc = []) {
         collectSourceFiles(full, acc)
     } else if (
       /\.(tsx|jsx|ts)$/.test(e) &&
+      !CO_LOCATED_TEST_FILE.test(e) &&
       // Per-module `gallery.tsx` seeds carry gallery-internal testids (a seeded
       // dialog's `testid:`); they must not expand the production registry.
       e !== 'gallery.tsx' &&
