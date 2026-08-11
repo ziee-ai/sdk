@@ -395,6 +395,126 @@ describe('B(kit Tooltip) — an outer <Tooltip> composes onto a foreign trigger 
   })
 })
 
+/**
+ * The regression the tooltip fix INTRODUCED, and the pass that caught it.
+ *
+ * Once composing a tooltip onto a trigger worked, the natural spelling for a raw trigger became
+ * `<Popover><Tooltip><button/></Tooltip></Popover>`. But `Popover`/`Dropdown` guess Base UI's
+ * `nativeButton` flag from the child's TYPE, and a kit `<Tooltip>` is TRANSPARENT — it renders its
+ * child through a Slot. So the guess flipped from "native button" to "not one", and Base UI logged
+ * an ERROR on every render.
+ *
+ * Nothing else saw it: typecheck, lints, 2232 unit tests, the 94-surface tooltip sweep and 41 e2e
+ * tests were all green on the tree that logged it. It was CytoAnalyst's runtime-health pass —
+ * 6 gating HIGH findings on each of 5 workbench surfaces — that said so. Hence this test, which
+ * makes the same statement in milliseconds.
+ */
+describe('E — a tooltip wrapper does not lie to Base UI about the tag underneath', () => {
+  /**
+   * THE ORACLE IS THE DOM, not the console. Base UI does log an error for this
+   * ("…expected a non-<button> because the `nativeButton` prop is false…"), but it dedupes the
+   * message process-wide, so a spy in one test is silent once any earlier test has tripped it —
+   * a guard that passes for the wrong reason. The rendered difference does not dedupe:
+   *
+   *     nativeButton=true   … aria-haspopup=dialog | tabindex=0 | type=button
+   *     nativeButton=false  … aria-haspopup=dialog | role=button | tabindex=0 | type=button
+   *
+   * `role="button"` on an element that already IS a button is Base UI supplying semantics the tag
+   * already carries — i.e. the exact statement "I was told this is not a button", made in the DOM.
+   */
+  const roleOf = (id: string) => byTestId(id).getAttribute('role')
+
+  it('a raw <button> inside a <Tooltip> inside a Popover trigger', () => {
+    render(
+      <Popover content={<div>body</div>}>
+        <Tooltip content="Add a pane">
+          <button type="button" aria-label="Add a pane" data-testid="e1">
+            <Icon />
+          </button>
+        </Tooltip>
+      </Popover>,
+    )
+    expect(
+      roleOf('e1'),
+      'the trigger IS a <button>; a redundant role means Base UI was told it was not, and it ' +
+        'logs an error on every render saying so',
+    ).toBeNull()
+  })
+
+  it('a kit <Button> inside a <Tooltip> inside a Dropdown trigger', () => {
+    render(
+      <Dropdown data-testid="e-dd" items={[{ key: 'a', label: 'A' }]}>
+        <Tooltip content="More">
+          <Button size="icon" aria-label="More" data-testid="e2">
+            <Icon />
+          </Button>
+        </Tooltip>
+      </Dropdown>,
+    )
+    expect(roleOf('e2')).toBeNull()
+  })
+
+  it('a NON-button child still gets the button semantics supplied — transparent, not a rubber stamp', () => {
+    render(
+      <Dropdown data-testid="e-dd2" items={[{ key: 'a', label: 'A' }]}>
+        <Tooltip content="Project actions">
+          <div tabIndex={0} aria-label="Project actions" data-testid="e3">
+            <Icon />
+          </div>
+        </Tooltip>
+      </Dropdown>,
+    )
+    expect(
+      roleOf('e3'),
+      'a <div> trigger needs the role Base UI supplies — resolving THROUGH the wrapper must not ' +
+        'become "everything is a button"',
+    ).toBe('button')
+  })
+
+  it('a COMPONENT child that renders a non-button is still not a button', () => {
+    // The kit Button is the one component known to render a native <button>; every other
+    // component has to be assumed otherwise, because a component cannot be introspected for the
+    // tag it renders. `Tag` renders a <span> and is the case the Dropdown doc comment names.
+    render(
+      <Dropdown data-testid="e-dd3" items={[{ key: 'a', label: 'A' }]}>
+        <Tag data-testid="e7">Filter</Tag>
+      </Dropdown>,
+    )
+    expect(
+      roleOf('e7'),
+      'a <span> trigger needs the role Base UI supplies — "it is a component, so call it a ' +
+        'button" would silently strip the semantics off every pill trigger in the kit',
+    ).toBe('button')
+  })
+
+  it('the un-wrapped forms still resolve the way they always did', () => {
+    render(
+      <Popover content={<div>b</div>}>
+        <button type="button" aria-label="Bare" data-testid="e4">
+          <Icon />
+        </button>
+      </Popover>,
+    )
+    expect(roleOf('e4')).toBeNull()
+    cleanup()
+    render(
+      <Popover content={<div>b</div>}>
+        <Button size="icon" tooltip="Kit" icon={<Icon />} data-testid="e5" />
+      </Popover>,
+    )
+    expect(roleOf('e5')).toBeNull()
+    cleanup()
+    render(
+      <Popover content={<div>b</div>}>
+        <div tabIndex={0} aria-label="Div" data-testid="e6">
+          <Icon />
+        </div>
+      </Popover>,
+    )
+    expect(roleOf('e6'), 'a bare div trigger is still not a button').toBe('button')
+  })
+})
+
 describe('D — the controls the KIT draws explain themselves too', () => {
   it("the Dialog's close button", async () => {
     render(

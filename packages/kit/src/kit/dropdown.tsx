@@ -3,7 +3,7 @@ import {
   DropdownMenu as Root, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuLabel, DropdownMenuGroup,
 } from '../shadcn/dropdown-menu'
 import { ScrollArea } from './scroll-area'
-import { Button } from './button'
+import { rendersNativeButton } from './native-button'
 import { cn } from '../lib/utils'
 
 export type DropdownItem =
@@ -57,13 +57,10 @@ export function Dropdown({ items, children, side, align = 'end', collisionAvoida
   // pattern) or a styled pill like kit <Tag> (renders a <span>). Only a real
   // <button> wants nativeButton=true; everything else needs nativeButton=false so
   // Base UI supplies the button ARIA/keyboard semantics on the non-button element.
-  // A component child can't be introspected for its rendered tag, so we key off
-  // identity: the kit Button is the one component known to render a native button.
+  // A component child can't be introspected for its rendered tag, so we key off identity — see
+  // `rendersNativeButton`, which also resolves THROUGH a transparent kit <Tooltip> wrapper.
   // A caller can still force the value with the `nativeButton` prop.
-  const childType = (children as React.ReactElement)?.type
-  const nativeButton =
-    nativeButtonProp ??
-    (typeof childType === 'string' ? childType === 'button' : childType === Button)
+  const nativeButton = nativeButtonProp ?? rendersNativeButton(children)
   return (
     <Root open={open} onOpenChange={onOpenChange} defaultOpen={defaultOpen}>
       <DropdownMenuTrigger render={children} disabled={disabled} nativeButton={nativeButton} />
