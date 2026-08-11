@@ -2,6 +2,7 @@ import * as React from 'react'
 import { Check, ChevronsUpDown, Plus } from 'lucide-react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { Popover as Root, PopoverTrigger, PopoverContent } from '../shadcn/popover'
+import { optionListPopupWidth } from '../shadcn/popup-width'
 import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem } from '../shadcn/command'
 import { Skeleton } from '../shadcn/skeleton'
 import { Tag } from './tag'
@@ -9,12 +10,34 @@ import { useSurface } from './surface'
 import { useControllableState } from './use-controllable-state'
 import { type KitStyleProps } from './style-guard'
 import type { ValueBinding } from './value-binding'
+import type { NoUndeclaredAria } from './aria-passthrough'
 import { cn } from '../lib/utils'
 
 export interface MultiSelectOption {
   label: string
   value: string
   disabled?: boolean
+  /** Optional heading this option sits under. Options carrying the same `group` are rendered
+   *  together beneath it, in first-appearance order; options with none keep today's flat list.
+   *  Additive: a caller that passes no `group` gets byte-identical behaviour.
+   *
+   *  A heading rather than a label suffix, because a suffix goes on the END of the option text —
+   *  which is exactly where tail-truncation removes it, so the part that distinguishes two
+   *  similar options is the first thing to disappear. */
+  group?: string
+  /** What the SELECTED TAG shows, when that should differ from the row's `label` — the mirror
+   *  of `SelectOption.selectedLabel` on the single Select.
+   *
+   *  It exists because the row and the tag are read in different places: a row sits UNDER its
+   *  `group` heading, which already says where it came from, while a tag stands alone in the
+   *  trigger with no heading above it. Without this the tag can only repeat the bare row label,
+   *  so two options distinguished ONLY by their heading collapse into two identical tags — the
+   *  choice is legible while it is being made and illegible the moment it is made.
+   *
+   *  A node rather than a string, so the caller can decide what truncates and what must not.
+   *  Additive: an option that omits it renders exactly the `label` tag it always did. The
+   *  remove button's accessible name still comes from `label` (a string is what it needs). */
+  selectedLabel?: React.ReactNode
 }
 
 // Split a raw input string on the configured token separators, returning the cleaned tokens
@@ -26,6 +49,28 @@ function splitOnSeparators(text: string, separators: string[]): { tokens: string
   const rest = parts.pop() ?? ''
   const tokens = parts.map((p) => p.trim()).filter(Boolean)
   return { tokens, rest }
+}
+
+
+/** Split options into heading-bearing runs, in first-appearance order.
+ *
+ *  One anonymous run when nothing declares a `group`, so the ungrouped case renders exactly the
+ *  single `CommandGroup` it always did. */
+function groupOptions(options: MultiSelectOption[]): { heading?: string; options: MultiSelectOption[] }[] {
+  if (!options.some((o) => o.group)) return [{ options }]
+  const out: { heading?: string; options: MultiSelectOption[] }[] = []
+  const byHeading = new Map<string, { heading?: string; options: MultiSelectOption[] }>()
+  for (const o of options) {
+    const key = o.group ?? ''
+    let run = byHeading.get(key)
+    if (!run) {
+      run = { heading: o.group, options: [] }
+      byHeading.set(key, run)
+      out.push(run)
+    }
+    run.options.push(o)
+  }
+  return out
 }
 
 // Virtualized multi-select listbox for large option sets (cmdk renders all rows + can't window).
@@ -155,6 +200,12 @@ function VirtualMultiList({
                   )}
                 >
                   <Check className={cn('size-4 shrink-0', selected ? 'opacity-100' : 'opacity-0')} aria-hidden />
+                  {/* NOTE the VIRTUALIZED rows are absolutely positioned, so they contribute
+                      nothing to the popup's intrinsic width — a `virtual` list therefore rests
+                      on the trigger floor rather than growing to its content. That is the same
+                      width it had before `optionListPopupWidth` existed, so nothing regresses;
+                      widening it would mean measuring rows the virtualizer has deliberately not
+                      mounted. */}
                   <span className="truncate">{o.label}</span>
                 </div>
               )
@@ -164,6 +215,26 @@ function VirtualMultiList({
       )}
     </div>
   )
+}
+
+/**
+ * Keep a TAG'S OWN REMOVE CONTROL from reaching the combobox trigger it sits inside — and
+ * nothing else.
+ *
+ * The remove button is the one part of a tag whose activation must not also open the list:
+ * pressing `×` means "drop this value", and a popover opening on top of that is noise at
+ * best. Every other part of the tag is, to a user, part of the control — clicking it is
+ * clicking the combobox — so it must bubble.
+ *
+ * The test is on the EVENT TARGET rather than on the handler's placement, because the two
+ * differ: a handler on the wrapper sees the events of everything inside it. `data-slot` is
+ * the kit's own structural marker (the tag span already carries one), so this asks the DOM
+ * which part was hit instead of assuming the wrapper only wraps the button.
+ */
+const stopFromTagClose = (e: React.SyntheticEvent): void => {
+  if (e.target instanceof Element && e.target.closest('[data-slot="tag-close"]') != null) {
+    e.stopPropagation()
+  }
 }
 
 // Multi-select with searchable list + removable tags (legacy Select mode="multiple").
@@ -198,6 +269,9 @@ interface MultiSelectBase {
 }
 // Controlled `value` requires a change handler (see ValueBinding); FormField stays valid.
 export type MultiSelectProps = MultiSelectBase &
+  // `Also` names the two the trailing union below declares — they live there rather than in the
+  // base because exactly one of them is REQUIRED, and the ban is derived from what is declared.
+  NoUndeclaredAria<MultiSelectBase, 'aria-label' | 'aria-labelledby'> &
   ValueBinding<string[]> &
   KitStyleProps &
   // An accessible name is REQUIRED — either an inline label or a referenced one (no silent default).
@@ -230,6 +304,13 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
   const labelByValue = React.useMemo(() => {
     const m = new Map<string, string>()
     for (const o of options) m.set(o.value, o.label)
+    return m
+  }, [options])
+  // The per-option tag override, kept SEPARATE from `labelByValue` so the remove button's
+  // accessible name (which needs a string) still comes from `label` while the tag renders a node.
+  const tagByValue = React.useMemo(() => {
+    const m = new Map<string, React.ReactNode>()
+    for (const o of options) if (o.selectedLabel != null) m.set(o.value, o.selectedLabel)
     return m
   }, [options])
   const selectedSet = React.useMemo(() => new Set(current), [current])
@@ -297,10 +378,29 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
           {uniqueCurrent.map((v) => {
             const label = labelByValue.get(v) ?? v
             return (
-              // stop the remove click/keys from bubbling to the trigger (which would open it).
-              <span key={v} onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
-                <Tag data-testid={`${testid}-tag-${v}`} onClose={() => { if (!locked) toggle(v) }} closeLabel={removeLabel(label)}>
-                  {label}
+              // stop the REMOVE control's click/keys from bubbling to the trigger (which would
+              // open it) — and ONLY the remove control's.
+              //
+              // These three handlers used to fire unconditionally, so the tag swallowed EVERY
+              // gesture aimed at it, not just the one aimed at its `×`. Once a value is chosen
+              // the tag IS most of what the trigger shows (it is `max-w-full`, and a caller's
+              // `selectedLabel` may be two lines), so the pointer lands on the tag for anything
+              // aimed at the middle of the control — and the list did not open. What was left
+              // was the chevron and whatever padding the tags had not filled: a combobox that
+              // stops responding to being clicked the moment it holds something is not a
+              // smaller version of a working one.
+              //
+              // Measured through the real control: with one tag bound, a click at the centre of
+              // the trigger left it FOCUSED and CLOSED (`aria-expanded` never flipped), which is
+              // indistinguishable from a picker whose options are gone.
+              <span className="min-w-0 max-w-full" key={v} onClick={stopFromTagClose} onPointerDown={stopFromTagClose} onKeyDown={stopFromTagClose}>
+                {/* max-w-full caps the tag at the trigger's own width, so a long option can no
+                    longer push the tag past the control's edge (the tag is `whitespace-nowrap`,
+                    so without a cap its content simply grows). What gives inside that cap is the
+                    caller's to decide — via `selectedLabel`, whose parts choose their own
+                    truncate/wrap. */}
+                <Tag className="min-w-0 max-w-full" data-testid={`${testid}-tag-${v}`} onClose={() => { if (!locked) toggle(v) }} closeLabel={removeLabel(label)}>
+                  {tagByValue.get(v) ?? label}
                 </Tag>
               </span>
             )
@@ -308,7 +408,10 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
           <ChevronsUpDown className="ml-auto size-4 shrink-0 opacity-50" aria-hidden />
         </div>
       } />
-      <PopoverContent className="w-(--anchor-width) p-0" align="start">
+      {/* The option list sizes to its widest row, never to the trigger — `optionListPopupWidth`
+          is the ONE rule every option list in the kit wears. This popup had no knob at all
+          before it, which is precisely why it needed to be a default and not a prop. */}
+      <PopoverContent className={cn(optionListPopupWidth, 'p-0')} align="start">
         {virtual ? (
           <VirtualMultiList
             options={options} selectedSet={selectedSet} onToggle={toggle}
@@ -329,17 +432,19 @@ export const MultiSelect = React.forwardRef<HTMLDivElement, MultiSelectProps>(fu
                   </CommandItem>
                 </CommandGroup>
               )}
-              <CommandGroup>
-                {/* with allowCreate, cmdk filtering is off → filter here so the list still narrows. */}
-                {options
-                  .filter((o) => !allowCreate || trimmed === '' || o.label.toLowerCase().includes(trimmed.toLowerCase()))
-                  .map((o) => (
+              {/* with allowCreate, cmdk filtering is off → filter here so the list still narrows. */}
+              {groupOptions(
+                options.filter((o) => !allowCreate || trimmed === '' || o.label.toLowerCase().includes(trimmed.toLowerCase())),
+              ).map((g, gi) => (
+                <CommandGroup key={g.heading ?? `__ungrouped__${gi}`} heading={g.heading}>
+                  {g.options.map((o) => (
                     <CommandItem key={o.value} value={o.value} keywords={[o.label]} disabled={o.disabled} onSelect={() => toggle(o.value)} data-testid={optionTestid(o.value)}>
                       <Check className={cn('mr-2 size-4', selectedSet.has(o.value) ? 'opacity-100' : 'opacity-0')} aria-hidden />
-                      {o.label}
+                      <span className="truncate" title={o.label}>{o.label}</span>
                     </CommandItem>
                   ))}
-              </CommandGroup>
+                </CommandGroup>
+              ))}
             </CommandList>
           </Command>
         )}

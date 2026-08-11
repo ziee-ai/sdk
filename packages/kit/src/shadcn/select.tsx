@@ -4,6 +4,8 @@ import * as React from "react"
 import { Select as SelectPrimitive } from "@base-ui/react/select"
 
 import { cn } from "../lib/utils"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
+import { optionListPopupWidth } from "./popup-width"
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react"
 
 const Select = SelectPrimitive.Root
@@ -28,6 +30,16 @@ function SelectValue({ className, ...props }: SelectPrimitive.Value.Props) {
   )
 }
 
+// The trigger's LOOK, as one string.
+//
+// A searchable Select cannot use this component — Base UI's Trigger only exists inside a
+// Select root, and the searchable arm is a Popover — but it must be visually the SAME control,
+// or one form grows two kinds of picker depending on how many options it happens to have. So
+// the classes live here, named, and both arms wear them. (Same reason SelectItem's classes are
+// a component rather than copied per call site.)
+const selectTriggerClasses =
+  "flex w-fit items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent py-2 pe-2 ps-2.5 text-sm whitespace-nowrap transition-colors outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 data-placeholder:text-muted-foreground data-[size=default]:h-8 data-[size=sm]:h-7 data-[size=sm]:rounded-[min(var(--radius-md),10px)] *:data-[slot=select-value]:line-clamp-1 *:data-[slot=select-value]:flex *:data-[slot=select-value]:items-center *:data-[slot=select-value]:gap-1.5 dark:bg-input/30 dark:hover:bg-input/50 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4"
+
 function SelectTrigger({
   className,
   size = "default",
@@ -40,10 +52,7 @@ function SelectTrigger({
     <SelectPrimitive.Trigger
       data-slot="select-trigger"
       data-size={size}
-      className={cn(
-        "flex w-fit items-center justify-between gap-1.5 rounded-lg border border-input bg-transparent py-2 pe-2 ps-2.5 text-sm whitespace-nowrap transition-colors outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 data-placeholder:text-muted-foreground data-[size=default]:h-8 data-[size=sm]:h-7 data-[size=sm]:rounded-[min(var(--radius-md),10px)] *:data-[slot=select-value]:line-clamp-1 *:data-[slot=select-value]:flex *:data-[slot=select-value]:items-center *:data-[slot=select-value]:gap-1.5 dark:bg-input/30 dark:hover:bg-input/50 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
-        className
-      )}
+      className={cn(selectTriggerClasses, className)}
       {...props}
     >
       {children}
@@ -70,14 +79,20 @@ function SelectContent({
   // breaks click-the-option interactions (Playwright sees them as not visible).
   // A normal anchored dropdown renders every option in view + clickable.
   alignItemWithTrigger = false,
+  container,
   ...props
 }: SelectPrimitive.Popup.Props &
   Pick<
     SelectPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset" | "alignItemWithTrigger"
-  >) {
+  > & {
+    /** Portal target. Defaults to the document of the window this subtree renders in. */
+    container?: PortalContainerValue
+  }) {
+  const portalContainer = usePortalContainer(container)
   return (
-    <SelectPrimitive.Portal>
+    <SelectPrimitive.Portal container={portalContainer}>
+     <PortalContainerInherit>
       <SelectPrimitive.Positioner
         side={side}
         sideOffset={sideOffset}
@@ -96,7 +111,7 @@ function SelectContent({
         <SelectPrimitive.Popup
           data-slot="select-content"
           data-align-trigger={alignItemWithTrigger}
-          className={cn("relative isolate z-50 max-h-(--available-height) w-(--anchor-width) min-w-36 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95", className )}
+          className={cn(optionListPopupWidth, "relative isolate z-50 max-h-(--available-height) min-w-[max(var(--anchor-width),--spacing(36))] origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95", className )}
           {...props}
         >
           <SelectScrollUpButton />
@@ -104,9 +119,14 @@ function SelectContent({
           <SelectScrollDownButton />
         </SelectPrimitive.Popup>
       </SelectPrimitive.Positioner>
+     </PortalContainerInherit>
     </SelectPrimitive.Portal>
   )
 }
+
+// A group heading's LOOK, shared with the searchable arm for the same reason
+// `selectTriggerClasses` is: the two arms must be indistinguishable to a reader.
+const selectLabelClasses = "px-1.5 py-1 text-xs text-muted-foreground"
 
 function SelectLabel({
   className,
@@ -115,7 +135,7 @@ function SelectLabel({
   return (
     <SelectPrimitive.GroupLabel
       data-slot="select-label"
-      className={cn("px-1.5 py-1 text-xs text-muted-foreground", className)}
+      className={cn(selectLabelClasses, className)}
       {...props}
     />
   )
@@ -135,7 +155,18 @@ function SelectItem({
       )}
       {...props}
     >
-      <SelectPrimitive.ItemText className="flex flex-1 shrink-0 gap-2 whitespace-nowrap">
+      {/* `min-w-0` (not `shrink-0`) so a caller's own `truncate`/`line-clamp` on the row
+          content ACTUALLY ENGAGES at the popup's cap. Two things blocked it, and only one of
+          them was this box: `shrink-0` refused to shrink at all, and `min-width:auto` on a
+          flex item resolves to the content's MIN-CONTENT size — which, for `whitespace-nowrap`
+          text, is the whole string. So the ellipsis a call site asked for never appeared; the
+          row ran past the popup's `overflow-x-hidden` and was cut mid-word.
+          The caller's own element needs no such permission from us: any truncation mechanism
+          sets `overflow: hidden`, and a flex item with a non-visible overflow already has an
+          automatic minimum size of ZERO. A `*:min-w-0` here was measured to change nothing.
+          The kit still imposes NO truncation of its own — what gives inside the cap is the
+          caller's to decide, which is why a two-line option node keeps both of its lines. */}
+      <SelectPrimitive.ItemText className="flex min-w-0 flex-1 gap-2 whitespace-nowrap">
         {children}
       </SelectPrimitive.ItemText>
       <SelectPrimitive.ItemIndicator
@@ -206,6 +237,8 @@ export {
   SelectGroup,
   SelectItem,
   SelectLabel,
+  selectLabelClasses,
+  selectTriggerClasses,
   SelectScrollDownButton,
   SelectScrollUpButton,
   SelectSeparator,

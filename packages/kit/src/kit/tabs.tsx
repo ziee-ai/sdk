@@ -31,8 +31,9 @@ interface TabsBase {
   variant?: 'default' | 'line'
   className?: string
   /** Fill the container: root becomes a flex column, the tab strip stays a fixed
-   *  row, and the active panel gets the remaining height (so its content can
-   *  scroll). Use for a tabbed viewer that must fit a bounded box. */
+   *  row, and the active panel gets the remaining height AS A FLEX COLUMN — so a
+   *  panel's content can lay itself out against that height and scroll inside it.
+   *  Use for a tabbed viewer that must fit a bounded box. */
   fill?: boolean
   /** Extra classes on the tab strip row (e.g. `justify-center px-3`). */
   tabStripClassName?: string
@@ -119,7 +120,20 @@ export function Tabs({
           key={t.key}
           value={t.key}
           data-testid={testid ? `${testid}-panel-${t.key}` : undefined}
-          className={fill ? 'flex-1 min-h-0 overflow-hidden' : undefined}
+          // A flex COLUMN, not a bounded block. `flex-1 min-h-0 overflow-hidden` alone gives the
+          // panel the right height and the right clipping and leaves it `display: block` — under
+          // which every `flex-1` / `min-h-0` a child states is INERT. A panel hosting a pane with
+          // its own internal structure (a scrolling body plus something pinned beside it — the
+          // shape most panes have) then laid that pane out at its full content height and the
+          // panel's own `overflow-hidden` swallowed the excess: content CLIPPED, with no track
+          // anywhere to scroll it back. Measured at 390px: an 896px pane in a 688px panel, 208px
+          // of it — including its primary action — unreachable rather than merely below the fold.
+          //
+          // Safe to make `flex` because base-ui's Tabs.Panel is `keepMounted={false}`: an
+          // inactive panel is ABSENT, never present-and-`hidden` (where an author-level
+          // `display: flex` would out-cascade the UA's `[hidden] { display: none }` and draw
+          // every panel at once). Pinned, with the box contract, in `tabs-fill-panel.test.tsx`.
+          className={fill ? 'flex flex-1 min-h-0 flex-col overflow-hidden' : undefined}
         >
           {t.children}
         </TabsContent>

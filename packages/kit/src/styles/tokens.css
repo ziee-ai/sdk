@@ -168,3 +168,31 @@
    * "night sky" and the iOS bars match the darkened backdrop edge. */
   --auth-backdrop: hsl(205 78% 7%);
 }
+
+/* Apply the token layer to the document root. Without this, an app that CONSUMES
+ * this file (rather than inlining its own copy) leaves `body` at the browser
+ * default `color: black` — which looks fine in light mode but renders text
+ * invisible on the dark background in dark mode. (This is the base rule the app#1
+ * `index.css` has inline; it was dropped when the kit token layer was extracted.)
+ * `color-scheme` also aligns native controls/scrollbars/form widgets to the theme. */
+@layer base {
+  :root {
+    color-scheme: light;
+  }
+  .dark {
+    color-scheme: dark;
+  }
+  /* Tailwind v4 defaults an unqualified border/outline to `currentColor`; restore
+   * the shadcn default so a `border-t` / `border` with no explicit color uses the
+   * muted `--border` token instead of the text color. Without this, once `body`
+   * sets a light `--foreground` (dark mode), every colorless divider renders WHITE.
+   * (The other half of the base rule app#1's index.css has inline + was dropped.) */
+  * {
+    border-color: var(--border);
+    outline-color: var(--ring);
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+  }
+}

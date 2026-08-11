@@ -1,6 +1,7 @@
 import { PreviewCard as PreviewCardPrimitive } from "@base-ui/react/preview-card"
 
 import { cn } from "../lib/utils"
+import { usePortalContainer, type PortalContainerValue } from "../kit/portal-container"
 
 function HoverCard({ ...props }: PreviewCardPrimitive.Root.Props) {
   return <PreviewCardPrimitive.Root data-slot="hover-card" {...props} />
@@ -18,14 +19,20 @@ function HoverCardContent({
   sideOffset = 4,
   align = "center",
   alignOffset = 4,
+  container,
   ...props
 }: PreviewCardPrimitive.Popup.Props &
   Pick<
     PreviewCardPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset"
-  >) {
+  > & {
+    /** Portal target. Defaults to the document of the window this subtree renders in. */
+    container?: PortalContainerValue
+  }) {
+  // Lite portal (publishes no portal node) — the container keeps flowing down. See tooltip.tsx.
+  const portalContainer = usePortalContainer(container)
   return (
-    <PreviewCardPrimitive.Portal data-slot="hover-card-portal">
+    <PreviewCardPrimitive.Portal data-slot="hover-card-portal" container={portalContainer}>
       <PreviewCardPrimitive.Positioner
         align={align}
         alignOffset={alignOffset}

@@ -100,6 +100,14 @@ export function Sheet({ open, onOpenChange, title, description, footer, side = '
           <SheetTitle>{title}</SheetTitle>
           {description != null && <SheetDescription>{description}</SheetDescription>}
         </SheetHeader>
+        {/* No `min-h-0` here, and that is a measured decision rather than an oversight — the
+            obvious companion to the `max-h-[85svh]` cap in `shadcn/sheet.tsx`, and it would do
+            nothing. A flex item's automatic minimum size is its min-content size only while its
+            computed `overflow` is `visible`; this element is the scroll container itself
+            (`overflow-y-auto`), so its automatic minimum is already 0 and it shrinks without
+            help. Measured on a 390×800 phone with 3000px of content and no `min-h-0`: body
+            height 607, scrollHeight 3220 — a real track. Adding the class changed nothing, and a
+            class the layout does not depend on is one more thing a test would certify falsely. */}
         <div className="flex-1 overflow-y-auto px-4">
           {/* min-h centers reliably even though SheetContent isn't a flex column. */}
           {loading

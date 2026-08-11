@@ -248,8 +248,28 @@ export function warmIdle(cb: () => void): void {
  * framework's existing `import.meta.env.DEV` reads — so Vite const-folds it to a
  * literal and the warm loop below dead-code-eliminates when off.
  */
-const STORE_PREFETCH_ENABLED =
-  import.meta.env.VITE_STORE_PREFETCH !== 'off'
+const STORE_PREFETCH_ENABLED = ((): boolean => {
+  try {
+    return import.meta.env.VITE_STORE_PREFETCH !== 'off'
+  } catch {
+    // `import.meta.env` is injected by the BUNDLER and is undefined under a
+    // plain node runtime — so the read above throws a TypeError at MODULE
+    // SCOPE, taking down anything that merely imports this file outside a
+    // bundle. That is not hypothetical: a consuming app's `collect-actions` /
+    // `action-refs-lint` / `actions-unit` tooling esbuild-bundles app sources
+    // and runs them on `platform: 'node'`; the moment an app store reached
+    // store-kit, `npm run check` died with no useful message. Its neighbour
+    // `module-system/store.ts::isDev()` already guards the identical hazard.
+    //
+    // The try/catch does NOT defeat the dead-code elimination the plain read
+    // exists for: under Vite the expression const-folds to a literal BEFORE
+    // minification (`'off' !== 'off'` → `false`), the IIFE inlines, and the
+    // warm loop below is eliminated exactly as before. Under node there are no
+    // chunks to warm and no network-idle to wait for, so `false` is also the
+    // behaviourally correct answer rather than merely a safe one.
+    return false
+  }
+})()
 
 /** BAKED-IN PREFETCH: on init, warm every lazy-action chunk on idle so the store's
  *  interactions are instant — with NO per-store `.preload()` wiring. Actions already
