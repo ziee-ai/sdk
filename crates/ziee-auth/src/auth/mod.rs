@@ -55,8 +55,9 @@ pub use module::AuthModule;
 
 // Re-exports (mirror the app auth module's public surface).
 pub use context::{
-    AuthContext, AuthEventSink, AuthSyncAction, AuthSyncEntity, AuthSyncSink, NoopAuthEventSink,
-    NoopAuthSyncSink,
+    AuthContext, AuthEventSink, AuthSyncAction, AuthSyncEntity, AuthSyncNotDeclared, AuthSyncSink,
+    AuthSyncWiring, NoopAuthEventSink, NoopAuthSyncSink, declare_auth_sync,
+    declare_auth_sync_inert, declared_auth_sync, install_auth_sync_sink, resolve_auth_sync,
 };
 pub use jwt::JwtService;
 #[allow(unused_imports)]

@@ -18,7 +18,7 @@
 //! byte-identical — same events, same audiences; only the coupling direction
 //! and the abstract enum names changed.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -179,6 +179,161 @@ impl AuthSyncSink for NoopAuthSyncSink {
     fn publish_session_to_users(&self, _user_ids: &[Uuid], _origin: Option<Uuid>) {}
 }
 
+// ─────────────────── the auth sync wiring DECLARATION ────────────────────
+//
+// `AuthContext::new` has always made the sink a parameter, so an app that
+// builds its own context (the `mount_auth` path) cannot avoid naming one.
+// `AuthModule` — the turnkey `MODULE_ENTRIES` path — is constructed by a fixed
+// `fn() -> Box<dyn AppModule>` with no arguments, so it had nowhere to take one
+// and hard-coded `NoopAuthSyncSink`. Every `ctx.sync.publish(...)` in the auth
+// handlers still ran, computed its frame, and dropped it. That is invisible at
+// every call site: the code reads as fully wired, the tests that exercise the
+// handlers pass, and only a second device notices — by never converging.
+//
+// So the fix is NOT "make a sink injectable and keep the no-op default". A
+// default you fall into by doing nothing is the bug. The declaration below is
+// REQUIRED: `AuthModule::init` refuses to boot until the app has said which of
+// the two it wants, and `Inert` carries the reason so the choice is recorded
+// where a reader will find it.
+
+/// How this process wires auth's cross-device sync notifications — a **required,
+/// explicit decision**, not a defaultable option.
+///
+/// There is deliberately no `Default` impl and no fallback: see
+/// [`AuthSyncNotDeclared`] for what `AuthModule::init` does when nothing has
+/// been declared.
+pub enum AuthSyncWiring {
+    /// Route auth's publishes into the app's real sync fan-out. The app's impl
+    /// maps [`AuthSyncEntity`] onto its own concrete `SyncEntity`.
+    Live(Arc<dyn AuthSyncSink>),
+    /// Deliberately drop them, with the reason recorded. Behaviourally
+    /// identical to the old hard-coded [`NoopAuthSyncSink`] — the difference is
+    /// that somebody chose it and said why, so the next reader finds a sentence
+    /// instead of a silence.
+    Inert {
+        /// Why this deployment has no auth cross-device sync (e.g. "single-user
+        /// desktop build: one device, nothing to converge").
+        reason: &'static str,
+    },
+}
+
+impl AuthSyncWiring {
+    /// The sink this wiring installs.
+    pub fn sink(&self) -> Arc<dyn AuthSyncSink> {
+        match self {
+            AuthSyncWiring::Live(sink) => Arc::clone(sink),
+            AuthSyncWiring::Inert { .. } => Arc::new(NoopAuthSyncSink),
+        }
+    }
+
+    /// A one-line description for logs / the already-declared warning.
+    pub fn describe(&self) -> String {
+        match self {
+            AuthSyncWiring::Live(_) => "live (app-supplied AuthSyncSink)".to_string(),
+            AuthSyncWiring::Inert { reason } => format!("inert ({reason})"),
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthSyncWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+/// The error [`AuthModule::init`](crate::auth::module::AuthModule) returns when
+/// no [`AuthSyncWiring`] has been declared.
+///
+/// Its `Display` is the whole point: it names BOTH ways out, so "I didn't know
+/// there was a decision here" stops being a possible state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthSyncNotDeclared;
+
+/// The auth publishes that are dropped when the sink is inert — named in the
+/// error so the cost of choosing `Inert` is concrete rather than abstract.
+pub(crate) const AUTH_SYNC_PUBLISHES: &str = "Profile/Update (POST /auth/profile), SessionSettings/Update \
+     (PUT /auth/admin/session-settings), Session/Update (POST /auth/logout), \
+     AuthProvider/{Create,Update,Delete} (the admin auth-provider routes), and the \
+     Session fan-out to many users";
+
+impl std::fmt::Display for AuthSyncNotDeclared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ziee-auth: this app has not declared how auth's cross-device sync is wired.\n\
+             \n\
+             AuthModule mounts handlers that publish {AUTH_SYNC_PUBLISHES}. Installing a \
+             no-op sink by default would drop all of them silently — the handlers still \
+             run and still compute their frames, so nothing anywhere reports a problem \
+             and a second device simply never converges. That is why this is an error \
+             and not a default.\n\
+             \n\
+             Declare the choice ONCE, before `initialize_modules`:\n\
+             \x20 • ziee_auth::install_auth_sync_sink(Arc::new(MyAuthSyncSink))  — map \
+             AuthSyncEntity onto the app's SyncEntity and publish\n\
+             \x20 • ziee_auth::declare_auth_sync_inert(\"<why this deployment drops them>\") \
+             — keep the old no-op behaviour, on the record"
+        )
+    }
+}
+
+impl std::error::Error for AuthSyncNotDeclared {}
+
+/// The process-wide declaration. `OnceLock` (not a swappable slot) because the
+/// wiring is a boot-time property: a later change would silently split the
+/// publishes of one run across two sinks.
+static WIRING: OnceLock<AuthSyncWiring> = OnceLock::new();
+
+/// Declare how auth's cross-device sync is wired. Call ONCE at boot, before
+/// `initialize_modules`.
+///
+/// First declaration wins. A second one does NOT replace it and is reported at
+/// `warn` — an overwrite that silently discarded the first would be the same
+/// class of invisible drop this whole seam exists to remove.
+pub fn declare_auth_sync(wiring: AuthSyncWiring) {
+    let attempted = wiring.describe();
+    if let Err(rejected) = WIRING.set(wiring) {
+        let _ = rejected;
+        tracing::warn!(
+            attempted = %attempted,
+            existing = %WIRING.get().map(AuthSyncWiring::describe).unwrap_or_default(),
+            "ziee-auth: auth sync wiring was already declared; the FIRST declaration stands \
+             and this one is ignored"
+        );
+    }
+}
+
+/// Route auth's sync publishes into the app's fan-out. Shorthand for
+/// [`declare_auth_sync`]`(AuthSyncWiring::Live(sink))`.
+pub fn install_auth_sync_sink(sink: Arc<dyn AuthSyncSink>) {
+    declare_auth_sync(AuthSyncWiring::Live(sink));
+}
+
+/// Deliberately drop auth's sync publishes, with the reason on the record.
+/// Shorthand for [`declare_auth_sync`]`(AuthSyncWiring::Inert { reason })`.
+pub fn declare_auth_sync_inert(reason: &'static str) {
+    declare_auth_sync(AuthSyncWiring::Inert { reason });
+}
+
+/// The declaration this process made, if any.
+pub fn declared_auth_sync() -> Option<&'static AuthSyncWiring> {
+    WIRING.get()
+}
+
+/// Resolve a declaration into the sink `AuthModule` installs.
+///
+/// Pure (the `Option` is the caller's business), so the whole decision —
+/// including the refusal — is unit-testable without touching the process-wide
+/// `OnceLock`.
+pub fn resolve_auth_sync(
+    declared: Option<&AuthSyncWiring>,
+) -> Result<Arc<dyn AuthSyncSink>, AuthSyncNotDeclared> {
+    match declared {
+        Some(w) => Ok(w.sink()),
+        None => Err(AuthSyncNotDeclared),
+    }
+}
+
 #[cfg(test)]
 mod noop_sink_tests {
     use super::*;
@@ -211,4 +366,150 @@ mod noop_sink_tests {
         let _events: Arc<dyn AuthEventSink> = Arc::new(NoopAuthEventSink);
         let _sync: Arc<dyn AuthSyncSink> = Arc::new(NoopAuthSyncSink);
     }
+}
+
+/// The wiring DECISION, tested without the process-wide `OnceLock`.
+///
+/// Everything here drives [`resolve_auth_sync`] directly, which is why it is a
+/// free function taking an `Option` rather than reading the static: a decision
+/// that can only be observed through a global is a decision that can only be
+/// tested once per process.
+#[cfg(test)]
+mod sync_wiring_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records what it was asked to publish, so "the sink I declared is the sink
+    /// that got used" is a behavioural assertion rather than a pointer compare.
+    #[derive(Default)]
+    struct RecordingSink {
+        published: Mutex<Vec<AuthSyncEntity>>,
+        fanouts: Mutex<Vec<usize>>,
+    }
+
+    impl AuthSyncSink for RecordingSink {
+        fn publish(
+            &self,
+            entity: AuthSyncEntity,
+            _action: AuthSyncAction,
+            _id: Uuid,
+            _audience: Audience,
+            _origin: Option<Uuid>,
+        ) {
+            self.published.lock().unwrap().push(entity);
+        }
+        fn publish_session_to_users(&self, user_ids: &[Uuid], _origin: Option<Uuid>) {
+            self.fanouts.lock().unwrap().push(user_ids.len());
+        }
+    }
+
+    /// NOT DECLARING IS AN ERROR. This is the whole fix: the previous behaviour
+    /// was to fall back to `NoopAuthSyncSink`, which is indistinguishable from a
+    /// working sink at every call site.
+    #[test]
+    fn an_undeclared_wiring_is_refused_not_defaulted() {
+        // `Arc<dyn AuthSyncSink>` is not `Debug`, so match rather than `expect_err`.
+        match resolve_auth_sync(None) {
+            Err(e) => assert_eq!(e, AuthSyncNotDeclared),
+            Ok(_) => panic!(
+                "no declaration must be an ERROR — falling back to a no-op sink is the bug \
+                 this seam exists to remove"
+            ),
+        }
+    }
+
+    /// The refusal names BOTH ways out. An error that only says "you must supply
+    /// a sink" pushes every app that genuinely does not want one into either
+    /// hand-rolling a no-op or reverting the guard.
+    #[test]
+    fn the_refusal_names_both_ways_out() {
+        let msg = AuthSyncNotDeclared.to_string();
+        assert!(
+            msg.contains("install_auth_sync_sink"),
+            "the error must name the LIVE path; got:\n{msg}"
+        );
+        assert!(
+            msg.contains("declare_auth_sync_inert"),
+            "the error must name the explicit-opt-out path, or an app that wants no sync \
+             has no sanctioned way to say so; got:\n{msg}"
+        );
+        // …and it must say what is being dropped, so choosing `Inert` is an
+        // informed choice rather than a shrug.
+        for named in ["Profile", "SessionSettings", "Session", "AuthProvider"] {
+            assert!(
+                msg.contains(named),
+                "the error must name the `{named}` publish it drops; got:\n{msg}"
+            );
+        }
+    }
+
+    /// A declared LIVE sink is the sink that gets installed — the frames reach it.
+    #[test]
+    fn a_declared_live_sink_receives_the_publishes() {
+        let rec = Arc::new(RecordingSink::default());
+        let wiring = AuthSyncWiring::Live(rec.clone());
+        let sink = resolve_auth_sync(Some(&wiring)).expect("a declared wiring resolves");
+
+        sink.publish(
+            AuthSyncEntity::Profile,
+            AuthSyncAction::Update,
+            Uuid::nil(),
+            Audience::owner(Uuid::nil()),
+            None,
+        );
+        sink.publish_session_to_users(&[Uuid::nil(), Uuid::nil()], None);
+
+        assert_eq!(
+            *rec.published.lock().unwrap(),
+            vec![AuthSyncEntity::Profile],
+            "a resolved Live wiring must hand back the DECLARED sink, not a fresh no-op"
+        );
+        assert_eq!(*rec.fanouts.lock().unwrap(), vec![2]);
+    }
+
+    /// `Inert` really is inert — the opt-out has to be the old behaviour, or an
+    /// app choosing it would be choosing something else.
+    #[test]
+    fn an_inert_wiring_drops_without_panicking() {
+        let wiring = AuthSyncWiring::Inert {
+            reason: "single-device desktop build",
+        };
+        let sink = resolve_auth_sync(Some(&wiring)).expect("inert is a valid declaration");
+        sink.publish(
+            AuthSyncEntity::Session,
+            AuthSyncAction::Update,
+            Uuid::nil(),
+            Audience::owner(Uuid::nil()),
+            None,
+        );
+        sink.publish_session_to_users(&[Uuid::nil()], None);
+    }
+
+    /// The reason survives into the description — an `Inert` choice whose reason
+    /// never reaches a log or a message is back to being a silent default.
+    #[test]
+    fn the_inert_reason_is_carried_into_the_description() {
+        let wiring = AuthSyncWiring::Inert {
+            reason: "no SSE stream in the CLI build",
+        };
+        assert!(
+            wiring.describe().contains("no SSE stream in the CLI build"),
+            "got: {}",
+            wiring.describe()
+        );
+        assert!(
+            AuthSyncWiring::Live(Arc::new(NoopAuthSyncSink))
+                .describe()
+                .contains("live"),
+            "a Live wiring must describe itself as live"
+        );
+    }
+
+    // NOTE: the process-wide declaration (`declare_auth_sync` / `declared_auth_sync`)
+    // is deliberately NOT tested here. It is a `OnceLock`, so its interesting
+    // property — "the first declaration wins, and until one is made the module
+    // refuses to boot" — is order-dependent and cannot be asserted from a test
+    // that shares a process with siblings that declare. It is proved end to end,
+    // in declaration order, in the OWN-PROCESS integration test
+    // `tests/auth_sync_must_be_declared.rs`.
 }

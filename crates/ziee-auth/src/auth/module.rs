@@ -44,7 +44,9 @@ use linkme::distributed_slice;
 
 use ziee_framework::module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
 
-use super::context::{AuthContext, NoopAuthEventSink, NoopAuthSyncSink};
+use super::context::{
+    AuthContext, AuthSyncWiring, NoopAuthEventSink, declared_auth_sync, resolve_auth_sync,
+};
 use super::http::{auth_admin_routes, auth_routes};
 use super::jwt::JwtService;
 use super::turnkey::DefaultIdentityResolver;
@@ -108,15 +110,30 @@ impl AppModule for AuthModule {
             jwt.clone(),
         ));
 
-        // A no-op-sink AuthContext (an app with no event bus / sync stream yet).
-        // The `RequirePermissions`-gated user routes don't need the sinks; the
-        // auth handlers still emit lifecycle events, which the no-op sinks drop.
-        let auth_ctx = AuthContext::new(
-            ctx.db_pool.clone(),
-            None,
-            Arc::new(NoopAuthEventSink),
-            Arc::new(NoopAuthSyncSink),
-        );
+        // The cross-device sync sink. This used to be a hard-coded
+        // `NoopAuthSyncSink` with no way to override it, so every
+        // `ctx.sync.publish(...)` in the auth handlers ran and was dropped —
+        // invisible at the call site, invisible in the logs, visible only as a
+        // second device that never converges. It is now a REQUIRED declaration:
+        // an app calls `install_auth_sync_sink` or `declare_auth_sync_inert`
+        // before `initialize_modules`, and boot fails with instructions if it
+        // called neither. See `context::AuthSyncNotDeclared`.
+        let declared = declared_auth_sync();
+        let sync = resolve_auth_sync(declared)?;
+        if let Some(AuthSyncWiring::Inert { reason }) = declared {
+            tracing::info!(
+                reason,
+                "ziee-auth: auth cross-device sync is DECLARED INERT; profile / session / \
+                 session-settings / auth-provider changes will not reach other devices"
+            );
+        }
+
+        // The event sink stays no-op here: the auth handlers still emit their
+        // lifecycle events and this module's callers have no in-process event
+        // bus to route them to. Unlike sync, that is not an invisible drop —
+        // `AuthEventSink` has no cross-device half whose absence is silent.
+        let auth_ctx =
+            AuthContext::new(ctx.db_pool.clone(), None, Arc::new(NoopAuthEventSink), sync);
 
         // Reverse-proxy trust flag (idempotent OnceLock set), mirroring ziee.
         super::set_trust_forwarded_headers(ctx.config.server.trust_forwarded_headers);
@@ -257,6 +274,16 @@ mod tests {
         let config = test_config();
         let app_config: Arc<dyn Any + Send + Sync> = config.clone();
         let ctx = ModuleContext::new(Arc::new(pool.clone()), config, app_config);
+
+        // This test is about ROUTING, not sync — but it still has to say so.
+        // That is the point of the seam: there is no longer a way to boot
+        // `AuthModule` without naming what happens to its sync publishes, so
+        // even a test that does not care has to make the choice visible.
+        // Idempotent (first declaration wins), so it is safe alongside any
+        // sibling in this binary.
+        crate::auth::context::declare_auth_sync_inert(
+            "routing test: asserts nesting + extension reach, publishes nothing",
+        );
 
         // Order matters: AuthModule LAST (mirrors the `order`-sorted production
         // sequence) so its layer covers the probe module's route.
