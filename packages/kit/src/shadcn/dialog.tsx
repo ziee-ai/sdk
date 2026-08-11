@@ -6,7 +6,7 @@ import { Dialog as DialogPrimitive } from "@base-ui/react/dialog"
 import { cn } from "../lib/utils"
 import { Button } from "./button"
 import { XIcon } from "lucide-react"
-import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
+import { usePortalContainer, PortalContainerInherit } from "../kit/portal-container"
 
 function Dialog({ ...props }: DialogPrimitive.Root.Props) {
   return <DialogPrimitive.Root data-slot="dialog" {...props} />
