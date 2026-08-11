@@ -17,13 +17,16 @@ export interface DialogProps {
   footer?: React.ReactNode
   size?: keyof typeof widths
   trigger?: React.ReactElement
+  /** Accessible name AND hover text for the corner ×. Defaults to 'Close' — the word this
+   *  component has always hardcoded — so it is optional; supply it in a translated app. */
+  closeLabel?: string
   className?: string
   children?: React.ReactNode
   /** Test selector — forwarded onto the dialog content <root> (i18n-safe). */
   'data-testid': string
 }
 
-export function Dialog({ open, onOpenChange, title, description, footer, size = 'default', trigger, className, children, 'data-testid': testid }: DialogProps) {
+export function Dialog({ open, onOpenChange, title, description, footer, size = 'default', trigger, closeLabel, className, children, 'data-testid': testid }: DialogProps) {
   // If this Dialog lives inside a host focus-trap (a vaul Drawer), portal the
   // popup INTO that trap so its focus scope doesn't steal focus from — and
   // silence onChange on — inputs in the popup. Resolved from an always-mounted
@@ -50,6 +53,7 @@ export function Dialog({ open, onOpenChange, title, description, footer, size = 
         container={container ?? undefined}
         className={cn('max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto]', widths[size], className)}
         data-testid={testid}
+        {...(closeLabel != null ? { closeLabel } : {})}
         {...(description == null ? { 'aria-describedby': undefined } : {})}
       >
         <DialogHeader>

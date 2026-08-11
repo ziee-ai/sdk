@@ -16,6 +16,9 @@ type SheetBase = {
   trigger?: React.ReactElement
   /** Allow closing by clicking the backdrop (legacy `maskClosable`). Default true. */
   maskClosable?: boolean
+  /** Accessible name AND hover text for the corner ×. Defaults to 'Close' — the word this
+   *  component has always hardcoded — so it is optional; supply it in a translated app. */
+  closeLabel?: string
   className?: string
   children?: React.ReactNode
   /** Test selector — forwarded onto the sheet content <root> (i18n-safe). */
@@ -40,7 +43,7 @@ export type SheetProps =
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), hi)
 
-export function Sheet({ open, onOpenChange, title, description, footer, side = 'right', trigger, maskClosable = true, loading, loadingLabel, className, children, 'data-testid': testid, ...rest }: SheetProps) {
+export function Sheet({ open, onOpenChange, title, description, footer, side = 'right', trigger, maskClosable = true, loading, loadingLabel, closeLabel, className, children, 'data-testid': testid, ...rest }: SheetProps) {
   const resizable = (rest as { resizable?: boolean }).resizable
   const resizeLabel = (rest as { resizeLabel?: string }).resizeLabel
   const minSize = (rest as { minSize?: number }).minSize ?? 280
@@ -94,6 +97,7 @@ export function Sheet({ open, onOpenChange, title, description, footer, side = '
         className={cn(resizable && 'max-w-none', className)}
         style={resizable ? (horizontal ? { width: size } : { height: size }) : undefined}
         data-testid={testid}
+        {...(closeLabel != null ? { closeLabel } : {})}
         {...(description == null ? { 'aria-describedby': undefined } : {})}
       >
         <SheetHeader>

@@ -2,6 +2,7 @@ import * as React from 'react'
 import { Eye, EyeOff, Loader2, X } from 'lucide-react'
 import { Input as InputBase } from '../shadcn/input'
 import { Skeleton } from '../shadcn/skeleton'
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '../shadcn/tooltip'
 import { useSurface } from './surface'
 import { type KitStyleProps } from './style-guard'
 import { cn } from '../lib/utils'
@@ -121,15 +122,29 @@ export const PasswordInput = React.forwardRef<HTMLInputElement, PasswordInputPro
         ref={ref}
         type={show ? 'text' : 'password'}
         suffix={
-          <button
-            type="button"
-            onClick={() => setShow((v) => !v)}
-            className="pointer-events-auto text-muted-foreground hover:text-foreground"
-            aria-label={show ? hideLabel : showLabel}
-            aria-pressed={show}
-          >
-            {show ? <EyeOff aria-hidden /> : <Eye aria-hidden />}
-          </button>
+          /* The reveal toggle is an eye glyph and nothing else, and which of the two things it
+             means depends on the CURRENT state — so the label has to be visible on hover, not
+             only in the accessibility tree. Both channels are fed the same state-dependent
+             string, so they flip together and can never disagree. */
+          <TooltipProvider delay={300}>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    data-slot="password-reveal"
+                    onClick={() => setShow((v) => !v)}
+                    className="pointer-events-auto text-muted-foreground hover:text-foreground"
+                    aria-label={show ? hideLabel : showLabel}
+                    aria-pressed={show}
+                  >
+                    {show ? <EyeOff aria-hidden /> : <Eye aria-hidden />}
+                  </button>
+                }
+              />
+              <TooltipContent>{show ? hideLabel : showLabel}</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         }
       />
     )

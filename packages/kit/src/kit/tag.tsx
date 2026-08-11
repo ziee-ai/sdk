@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { X } from 'lucide-react'
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '../shadcn/tooltip'
 import { cn } from '../lib/utils'
 import { type KitStyleProps } from './style-guard'
 
@@ -84,22 +85,36 @@ const TagInner = React.forwardRef<HTMLSpanElement, TagProps>(function Tag(
     >
       {icon != null && <span className="[&_svg]:size-3" aria-hidden>{icon}</span>}
       {children}
+      {/* Icon-only, so `closeLabel` is shown on hover as well as exposed as the name. A × on a
+          tag is the most ambiguous glyph in the kit — "remove this tag" vs "close this thing" —
+          and in a MultiSelect there is one per value, so the label is also what tells them apart.
+          `data-slot="tag-close"` is preserved through the tooltip trigger (base-ui merges the
+          RENDERED element's props last), which `MultiSelect.stopFromTagClose` depends on. */}
       {onClose != null && (
-        <button
-          type="button"
-          // The tag's own structural marker, beside the `data-slot="tag"` on its span. A
-          // container that embeds a closable Tag has to be able to tell "the × was pressed"
-          // from "the tag was pressed" — those mean different things and only the first is
-          // the tag's business (see `MultiSelect`'s `stopFromTagClose`, where conflating
-          // them made a bound combobox unopenable).
-          data-slot="tag-close"
-          onClick={onClose}
-          aria-label={closeLabel}
-          data-testid={props['data-testid'] != null ? `${props['data-testid'] as string}-close` : undefined}
-          className="relative -me-0.5 ms-0.5 inline-flex items-center justify-center rounded-sm opacity-60 hover:opacity-100 focus-visible:outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
-        >
-          <X className="size-3" aria-hidden />
-        </button>
+        <TooltipProvider delay={300}>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  // The tag's own structural marker, beside the `data-slot="tag"` on its span. A
+                  // container that embeds a closable Tag has to be able to tell "the × was pressed"
+                  // from "the tag was pressed" — those mean different things and only the first is
+                  // the tag's business (see `MultiSelect`'s `stopFromTagClose`, where conflating
+                  // them made a bound combobox unopenable).
+                  data-slot="tag-close"
+                  onClick={onClose}
+                  aria-label={closeLabel}
+                  data-testid={props['data-testid'] != null ? `${props['data-testid'] as string}-close` : undefined}
+                  className="relative -me-0.5 ms-0.5 inline-flex items-center justify-center rounded-sm opacity-60 hover:opacity-100 focus-visible:outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                >
+                  <X className="size-3" aria-hidden />
+                </button>
+              }
+            />
+            <TooltipContent>{closeLabel}</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       )}
     </span>
   )

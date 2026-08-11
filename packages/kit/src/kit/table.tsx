@@ -173,27 +173,63 @@ function colMeta<T>(col: TableColumn<T>, props: TableProps<T>, view: TableView<T
   return { align, numeric, sortable, resizable, width: view.widths[col.key] ?? col.width }
 }
 
+/**
+ * Whether this column's HEADING is allowed to give way.
+ *
+ * `ellipsis` says "this column may be narrowed": it already puts `truncate max-w-0` on the BODY
+ * cell. It did not touch the heading, and a heading is `whitespace-nowrap` — so in an auto-layout
+ * table the column's minimum stayed the heading's full text and the grid was floored by its own
+ * chrome even where the caller had explicitly allowed narrowing. Measured on the consumer's QC
+ * metrics form at its default pane: grid 305px inside a 284px box, columns [60, 60, 138, 48],
+ * where the 138 is the word "Aggregation" (114px min-content) against 88px of actual controls —
+ * so the overflow costs the user 21px of the RIGHTMOST column, which is the destructive Remove.
+ *
+ * `truncate` alone cannot fix that: `overflow:hidden` clips at the USED width and leaves
+ * min-content untouched. Only a `max-width` caps a table column's minimum, which is exactly what
+ * the body cell already uses.
+ *
+ * OPT-IN, and deliberately so — `ellipsis` is the caller saying the heading may be abbreviated.
+ * Nothing changes for a column that has not said it (verified: every one of the kit Table's 18
+ * call sites across both consuming repos). And the name is never LOST: an ellipsised heading
+ * carries its full text as a native `title`.
+ *
+ * Not applied when the column has an explicit/resized width — there `max-width: 0` would fight
+ * the width the caller (or the drag) chose.
+ */
+const headerMayShrink = <T,>(col: TableColumn<T>, meta: ColMeta): boolean =>
+  col.ellipsis === true && meta.width == null
+
 // ── shared header inner (sort button) ─────────────────────────────────────────
 function HeaderInner<T>({ col, meta, view, testid }: { col: TableColumn<T>; meta: ColMeta; view: TableView<T>; testid: string }) {
   const active = view.sort?.key === col.key
   const glyph = !active ? <ChevronsUpDown className="size-3.5 opacity-50" aria-hidden /> :
     view.sort!.dir === 'asc' ? <ArrowUp className="size-3.5" aria-hidden /> : <ArrowDown className="size-3.5" aria-hidden />
+  const shrink = headerMayShrink(col, meta)
+  // The full heading, for the `title` that keeps an ellipsised name readable. Only for a string
+  // title — a ReactNode has no honest text form (`[object Object]` is not a label).
+  const full = shrink && typeof col.title === 'string' ? col.title : undefined
   return (
-    <span className={cn('flex items-center gap-1', meta.numeric && 'flex-row-reverse')}>
+    // `min-w-0` only where the column opted in: a flex item's default `min-width:auto` is what
+    // hands its min-content up to the table, so relaxing it unconditionally would let EVERY
+    // heading collapse — a silent layout change for every existing table.
+    <span className={cn('flex items-center gap-1', shrink && 'min-w-0', meta.numeric && 'flex-row-reverse')}>
       {meta.sortable ? (
         <button
           type="button"
           onClick={() => view.toggleSort(col.key)}
           // min-h-6 keeps the sort control on the 24px WCAG touch-target floor
           // (the bare text+glyph line is only ~20px tall).
-          className="inline-flex min-h-6 items-center gap-1 -mx-1 px-1 rounded-sm hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          className={cn(
+            'inline-flex min-h-6 items-center gap-1 -mx-1 px-1 rounded-sm hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+            shrink && 'min-w-0',
+          )}
           data-testid={`${testid}-sort-${col.key}`}
         >
-          <span className="truncate">{col.title}</span>
+          <span className="truncate" title={full}>{col.title}</span>
           {glyph}
         </button>
       ) : (
-        <span className="truncate">{col.title}</span>
+        <span className="truncate" title={full}>{col.title}</span>
       )}
     </span>
   )
@@ -453,7 +489,7 @@ function PlainTable<T>(props: TableProps<T> & { view: TableView<T>; busy: boolea
                 key={c.key}
                 style={{ width: meta.width }}
                 aria-sort={meta.sortable ? (view.sort?.key === c.key ? (view.sort.dir === 'asc' ? 'ascending' : 'descending') : 'none') : undefined}
-                className={cn(alignCls[meta.align], meta.resizable && 'relative')}
+                className={cn(alignCls[meta.align], meta.resizable && 'relative', headerMayShrink(c, meta) && 'max-w-0')}
               >
                 <HeaderInner col={c} meta={meta} view={view} testid={testid} />
                 {meta.resizable && <ResizeHandle col={c} view={view} testid={testid} width={typeof meta.width === 'number' ? meta.width : undefined} />}
@@ -617,7 +653,7 @@ function VirtualTable<T>(props: TableProps<T> & { view: TableView<T> }) {
                   key={c.key}
                   style={colStyle(c)}
                   aria-sort={meta.sortable ? (view.sort?.key === c.key ? (view.sort.dir === 'asc' ? 'ascending' : 'descending') : 'none') : undefined}
-                  className={cn('px-4 py-2 font-semibold', justifyFor[meta.align], meta.resizable && 'relative')}
+                  className={cn('px-4 py-2 font-semibold', justifyFor[meta.align], meta.resizable && 'relative', headerMayShrink(c, meta) && 'min-w-0')}
                 >
                   <HeaderInner col={c} meta={meta} view={view} testid={testid} />
                   {meta.resizable && <ResizeHandle col={c} view={view} testid={testid} width={typeof meta.width === 'number' ? meta.width : undefined} />}

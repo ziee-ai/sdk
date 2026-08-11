@@ -2,8 +2,7 @@ import * as React from "react"
 import { Dialog as SheetPrimitive } from "@base-ui/react/dialog"
 
 import { cn } from "../lib/utils"
-import { Button } from "./button"
-import { XIcon } from "lucide-react"
+import { OverlayCloseButton } from "../internal/overlay-close"
 import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 
 function Sheet({ ...props }: SheetPrimitive.Root.Props) {
@@ -44,6 +43,7 @@ function SheetContent({
   children,
   side = "right",
   showCloseButton = true,
+  closeLabel = "Close",
   onTouchStart,
   onTouchMove,
   onTouchEnd,
@@ -52,6 +52,10 @@ function SheetContent({
 }: SheetPrimitive.Popup.Props & {
   side?: "top" | "right" | "bottom" | "left"
   showCloseButton?: boolean
+  /** Accessible name AND hover text for the corner \u00d7. Defaults to the English word this
+      component has always hardcoded in its `sr-only` span, so supplying it is optional and
+      omitting it is not a regression \u2014 but a translated app should supply it. */
+  closeLabel?: string
   /** Portal target. Defaults to the document of the window this subtree renders in. */
   container?: PortalContainerValue
 }) {
@@ -100,20 +104,7 @@ function SheetContent({
       >
         {children}
         {showCloseButton && (
-          <SheetPrimitive.Close
-            data-slot="sheet-close"
-            render={
-              <Button
-                variant="ghost"
-                className="absolute top-3 right-3"
-                size="icon-sm"
-              />
-            }
-          >
-            <XIcon
-            />
-            <span className="sr-only">Close</span>
-          </SheetPrimitive.Close>
+          <OverlayCloseButton slot="sheet-close" label={closeLabel} className="absolute top-3 right-3" />
         )}
       </SheetPrimitive.Popup>
      </PortalContainerInherit>

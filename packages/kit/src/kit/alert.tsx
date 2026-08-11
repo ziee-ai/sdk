@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { CheckCircle2, Info, AlertTriangle, XCircle, X } from 'lucide-react'
 import { Alert as Base, AlertTitle, AlertDescription } from '../shadcn/alert'
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '../shadcn/tooltip'
 import { cn } from '../lib/utils'
 
 // `neutral` is a non-semantic, muted-gray tone for informational states that
@@ -70,16 +71,29 @@ export function Alert({ tone = 'info', title, description, icon, className, chil
       {(description != null || children != null) && (
         <AlertDescription>{description}{children}</AlertDescription>
       )}
+      {/* The dismiss × is icon-only, so `closeLabel` has to reach a SIGHTED user too — an
+          aria-label is read by assistive tech and rendered by nothing. One string feeds both
+          channels, so the two can never disagree. (Ledger row `auth-link-account-error-close`
+          in the consumer's icon-button-tooltips baseline was exactly this button.) */}
       {onClose && (
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label={closeLabel}
-          data-testid={`${testid}-close`}
-          className="absolute end-2 top-2 rounded-sm p-1 text-foreground/60 hover:text-foreground hover:bg-foreground/10"
-        >
-          <X className="size-4" aria-hidden />
-        </button>
+        <TooltipProvider delay={300}>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  onClick={onClose}
+                  aria-label={closeLabel}
+                  data-testid={`${testid}-close`}
+                  className="absolute end-2 top-2 rounded-sm p-1 text-foreground/60 hover:text-foreground hover:bg-foreground/10"
+                >
+                  <X className="size-4" aria-hidden />
+                </button>
+              }
+            />
+            <TooltipContent>{closeLabel}</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       )}
     </Base>
   )
