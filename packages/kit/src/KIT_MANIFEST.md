@@ -186,7 +186,7 @@ _No always-required props._
 |---|---|---|
 | `data-testid` | `string` | Test selector — REQUIRED, forwarded onto the rendered button/anchor via {...props} (i18n-safe). |
 
-<details><summary>Optional props (10)</summary>
+<details><summary>Optional props (11)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -199,6 +199,7 @@ _No always-required props._
 | `target` | `string | undefined` |  |
 | `tooltip` | `string | number | bigint | boolean | ReactElement<unknown, string | JSXElementConstruct…` | Tooltip shown on hover AND keyboard focus. Doubles as the accessible name when a string. |
 | `tooltipSide` | `"top" | "right" | "bottom" | "left" | undefined` | Side the built-in tooltip opens toward (default 'top'). Use 'bottom' for icon buttons in a panel/header top row so the tooltip drops into… |
+| `unavailableReason` | `string | undefined` | WHY this control is unavailable. Presence means unavailable — the string IS the reason, rather than a boolean plus a separate message tha… |
 | `variant` | `"link" | "default" | "outline" | "secondary" | "ghost" | "destructive" | null | undefined` |  |
 
 </details>

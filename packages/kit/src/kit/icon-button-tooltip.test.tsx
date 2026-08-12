@@ -580,41 +580,242 @@ describe('D — the controls the KIT draws explain themselves too', () => {
 })
 
 describe('C — a natively disabled button cannot open a tooltip, and the kit says so', () => {
-  it('warns, naming the control and the two remedies', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  // These four assert the DIAGNOSTIC, so a console spy is the right oracle here (it IS the
+  // subject). Note the deliberately distinct `data-testid` per case: `inertTooltipsWarned`
+  // dedupes on `testid::label` for the life of the module, so two cases sharing an id would
+  // make the second one pass because the FIRST already consumed the message. That is the same
+  // process-wide-dedupe trap that made a console-spy oracle wrong for the BEHAVIOUR tests
+  // below — there the subject is what a user sees, and it is asserted on the DOM.
+  it('says so, naming the control and the remedy', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
     render(<Button size="icon" tooltip="No more analyses to add" icon={<Icon />} disabled data-testid="c1" />)
-    const said = warn.mock.calls.map(c => c.join(' ')).join('\n')
-    warn.mockRestore()
-    expect(said, 'the warning must name the control it is about').toContain('c1')
-    expect(said, 'and it must name the remedy, or it is just noise').toMatch(/aria-disabled/)
+    const said = err.mock.calls.map(c => c.join(' ')).join('\n')
+    err.mockRestore()
+    expect(said, 'the message must name the control it is about').toContain('c1')
+    expect(said, 'and it must name the remedy, or it is just noise').toMatch(/unavailableReason/)
   })
 
-  it('does not warn for an ENABLED tooltipped button', () => {
+  // The escalation itself, pinned. A `warn` is advisory and scrolled past while 13 live sites
+  // shipped an unreadable sentence; the consumer's only console-reading gate keys on ERROR, so
+  // downgrading this silently would re-open the whole class with every other test still green.
+  it('reports at ERROR level, because that is what the consumer gate reads', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    render(<Button size="icon" tooltip="Unreachable" icon={<Icon />} disabled data-testid="c1b" />)
+    const atError = err.mock.calls.map(c => c.join(' ')).join('\n')
+    const atWarn = warn.mock.calls.map(c => c.join(' ')).join('\n')
+    err.mockRestore()
+    warn.mockRestore()
+    expect(atError, 'a gate that reads console.error must be able to see this').toContain('c1b')
+    expect(atWarn, 'and it must not ALSO be a warn, or the gate double-counts it').not.toContain('c1b')
+  })
+
+  it('says nothing for an ENABLED tooltipped button', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
     render(<Button size="icon" tooltip="Fine" icon={<Icon />} data-testid="c2" />)
-    const said = warn.mock.calls.map(c => c.join(' ')).join('\n')
-    warn.mockRestore()
-    expect(said, 'a warning that fires on the healthy case is a warning nobody reads').not.toContain('c2')
+    const said = err.mock.calls.map(c => c.join(' ')).join('\n')
+    err.mockRestore()
+    expect(said, 'a diagnostic that fires on the healthy case is one nobody reads').not.toContain('c2')
   })
 
-  it('does not warn for a disabled button with NO tooltip', () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  it('says nothing for a disabled button with NO tooltip', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
     render(
       <Button disabled data-testid="c3">
         Save
       </Button>,
     )
-    const said = warn.mock.calls.map(c => c.join(' ')).join('\n')
-    warn.mockRestore()
+    const said = err.mock.calls.map(c => c.join(' ')).join('\n')
+    err.mockRestore()
     expect(said).not.toContain('c3')
   })
 
-  it('does not warn for `loading`, which is aria-disabled and CAN open its tooltip', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+  it('says nothing for `loading`, which is aria-disabled and CAN open its tooltip', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
     render(<Button size="icon" tooltip="Saving" icon={<Icon />} loading data-testid="c4" />)
-    const said = warn.mock.calls.map(c => c.join(' ')).join('\n')
-    warn.mockRestore()
+    const said = err.mock.calls.map(c => c.join(' ')).join('\n')
+    err.mockRestore()
     expect(said, 'loading keeps the button focusable and hoverable on purpose').not.toContain('c4')
     expect(await tooltipOf(byTestId('c4'))).toBe('Saving')
+  })
+})
+
+/**
+ * D — `unavailableReason`: the remedy the message above names, as a prop rather than as an
+ * instruction a caller has to re-implement.
+ *
+ * WHY IT IS A KIT PROP AND NOT A DOCUMENTED RECIPE. The recipe is five coupled parts —
+ * `aria-disabled`, a dropped click handler, the disabled LOOK (which `disabled:opacity-50` no
+ * longer supplies once the attribute is gone), the tooltip, and an `aria-describedby` pointing at
+ * an sr-only node whose `id` must be UNIQUE IN THE DOCUMENT. The consumer hand-rolled it once and
+ * needed a paragraph of commentary to get the id right; thirteen more call sites would each have
+ * had to get all five right, and getting the id wrong fails SILENTLY (the browser resolves the
+ * reference to whichever node came first, so one row announces another row's reason).
+ *
+ * Every assertion here reads the DOM. A console spy would be the wrong oracle twice over: the
+ * subject is what a user gets, and base-ui/the kit dedupe messages process-wide, so a spy can
+ * pass because an earlier test in the file already consumed the message.
+ */
+describe('D — `unavailableReason` makes the reachable form the easy form', () => {
+  it('opens the REASON on hover, which native `disabled` cannot do at all', async () => {
+    render(
+      <Button
+        size="icon"
+        tooltip="Undo"
+        icon={<Icon />}
+        unavailableReason="Nothing to undo"
+        data-testid="d1"
+      />,
+    )
+    expect(await tooltipOf(byTestId('d1'))).toBe('Nothing to undo')
+  })
+
+  it('keeps the NAME saying what the control IS, not why it refused', () => {
+    render(
+      <Button
+        size="icon"
+        tooltip="Undo"
+        icon={<Icon />}
+        unavailableReason="Nothing to undo"
+        data-testid="d2"
+      />,
+    )
+    // The 93167985 rule: a reason that swallows the name leaves a screen-reader user unable to
+    // tell WHICH control refused them.
+    expect(accessibleName(byTestId('d2'))).toBe('Undo')
+  })
+
+  it('an explicit aria-label still wins the name', () => {
+    render(
+      <Button
+        size="icon"
+        aria-label="Close pane"
+        icon={<Icon />}
+        unavailableReason="This is the last open pane"
+        data-testid="d3"
+      />,
+    )
+    expect(byTestId('d3').getAttribute('aria-label')).toBe('Close pane')
+  })
+
+  it('puts the reason in the accessibility tree too, via aria-describedby', () => {
+    render(
+      <Button size="icon" tooltip="Undo" icon={<Icon />} unavailableReason="Nothing to undo" data-testid="d4" />,
+    )
+    const el = byTestId('d4')
+    const ids = (el.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean)
+    expect(ids.length, 'an unavailable control must point at its reason').toBeGreaterThan(0)
+    const text = ids.map(i => document.getElementById(i)?.textContent ?? '').join(' ').trim()
+    expect(text).toBe('Nothing to undo')
+  })
+
+  it("does not discard a caller's OWN aria-describedby", () => {
+    render(
+      <>
+        <span id="d5-extra">extra context</span>
+        <Button
+          size="icon"
+          tooltip="Undo"
+          icon={<Icon />}
+          aria-describedby="d5-extra"
+          unavailableReason="Nothing to undo"
+          data-testid="d5"
+        />
+      </>,
+    )
+    const ids = (byTestId('d5').getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean)
+    const text = ids.map(i => document.getElementById(i)?.textContent ?? '').join(' ')
+    expect(text).toContain('extra context')
+    expect(text).toContain('Nothing to undo')
+  })
+
+  it('gives each instance its OWN reason node — a duplicate id would cross the wires', () => {
+    render(
+      <>
+        <Button size="icon" tooltip="Remove" icon={<Icon />} unavailableReason="Row A is locked" data-testid="d6a" />
+        <Button size="icon" tooltip="Remove" icon={<Icon />} unavailableReason="Row B is locked" data-testid="d6b" />
+      </>,
+    )
+    const read = (t: string) =>
+      (byTestId(t).getAttribute('aria-describedby') ?? '')
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(i => document.getElementById(i)?.textContent ?? '')
+        .join(' ')
+        .trim()
+    // The failure this pins is not "the ids are equal" but its CONSEQUENCE: `getElementById`
+    // returns the first match, so both rows would announce row A's reason.
+    expect(read('d6a')).toBe('Row A is locked')
+    expect(read('d6b')).toBe('Row B is locked')
+  })
+
+  it('is NOT natively disabled — which is what makes every channel above reachable', () => {
+    render(
+      <Button size="icon" tooltip="Undo" icon={<Icon />} unavailableReason="Nothing to undo" data-testid="d7" />,
+    )
+    const el = byTestId('d7')
+    expect(el.hasAttribute('disabled'), 'native disabled is pointer-events:none + no tab stop').toBe(false)
+    expect(el.getAttribute('aria-disabled')).toBe('true')
+  })
+
+  it('still refuses activation — `aria-disabled` is a claim, not an enforcement', () => {
+    let clicks = 0
+    render(
+      <Button
+        size="icon"
+        tooltip="Undo"
+        icon={<Icon />}
+        unavailableReason="Nothing to undo"
+        onClick={() => {
+          clicks += 1
+        }}
+        data-testid="d8"
+      />,
+    )
+    fireEvent.click(byTestId('d8'))
+    expect(clicks, 'an unavailable control that still fires is worse than a disabled one').toBe(0)
+  })
+
+  it('LOOKS unavailable — `disabled:opacity-50` no longer applies without the attribute', () => {
+    render(
+      <Button size="icon" tooltip="Undo" icon={<Icon />} unavailableReason="Nothing to undo" data-testid="d9" />,
+    )
+    const cls = byTestId('d9').getAttribute('class') ?? ''
+    expect(cls, 'a control that reads as live but refuses every click is a broken button').toContain('opacity-50')
+    expect(cls).toContain('cursor-not-allowed')
+  })
+
+  it('an EMPTY reason is not a reason — the control stays fully live', async () => {
+    render(<Button size="icon" tooltip="Undo" icon={<Icon />} unavailableReason="" data-testid="d10" />)
+    const el = byTestId('d10')
+    expect(el.getAttribute('aria-disabled')).toBeNull()
+    expect(await tooltipOf(el)).toBe('Undo')
+  })
+
+  it('emits no inert-tooltip diagnostic, because there is nothing inert about it', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    render(
+      <Button size="icon" tooltip="Undo" icon={<Icon />} unavailableReason="Nothing to undo" data-testid="d11" />,
+    )
+    const said = err.mock.calls.map(c => c.join(' ')).join('\n')
+    err.mockRestore()
+    expect(said).not.toContain('d11')
+  })
+
+  it('a reason OVERRIDES a native disable rather than losing to it', async () => {
+    // A caller migrating a site may leave `disabled` in place. Silently honoring it would make
+    // the reason unreachable again — with the caller believing they had fixed it.
+    render(
+      <Button
+        size="icon"
+        tooltip="Undo"
+        icon={<Icon />}
+        disabled
+        unavailableReason="Nothing to undo"
+        data-testid="d12"
+      />,
+    )
+    expect(byTestId('d12').hasAttribute('disabled')).toBe(false)
+    expect(await tooltipOf(byTestId('d12'))).toBe('Nothing to undo')
   })
 })
