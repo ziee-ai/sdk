@@ -109,13 +109,38 @@ Input.displayName = 'Input'
 // shadcn has no password input — kit addition with a keyboard-accessible show/hide toggle.
 // showLabel/hideLabel are REQUIRED (no default) so the toggle's accessible name is always
 // caller-owned and translatable.
-export type PasswordInputProps = Omit<InputProps, 'type' | 'suffix' | 'style' | 'allowStyle'> & {
+// `maxLength` IS OMITTED, AND THAT IS THE POINT.
+//
+// `maxlength` enforces a cap by silently DISCARDING the overflow — the third case in
+// `internal/clamp-notice.tsx` ("characters past a cap"), which that rule says must announce what
+// was kept and what was dropped. On a MASKED field neither response works. The user cannot read
+// what survived, so a truncation is undetectable; and announcing "kept 72, dropped 18" would be
+// announcing that the app chose a credential the user did not.
+//
+// The failure it produced is not theoretical: cytoanalyst's profile page capped BOTH the new and
+// the confirm password at 72, so a longer passphrase was cut identically in both, the two matched,
+// validation passed, the change succeeded — and the passphrase the user saved was not the one that
+// had been set. There is no signal anywhere in that sequence that anything was dropped.
+//
+// So the cap is not expressible here. A password length limit is a REFUSAL that states its limit
+// (see the app's `core/passwordPolicy`), never a rewrite. Note this omission covers `PasswordInput`
+// only — `<Input type="password">` is the same hazard through a different door, which is why the
+// app also lints for it.
+export type PasswordInputProps = Omit<
+  InputProps,
+  'type' | 'suffix' | 'style' | 'allowStyle' | 'maxLength'
+> & {
   showLabel: string
   hideLabel: string
 }
 export const PasswordInput = React.forwardRef<HTMLInputElement, PasswordInputProps>(
-  ({ showLabel, hideLabel, ...props }, ref) => {
+  ({ showLabel, hideLabel, ...rest }, ref) => {
     const [show, setShow] = React.useState(false)
+    // The type omission above stops the honest caller; this stops the one who reached the prop
+    // anyway — a spread of a wider props object, an `as never`, or plain JS. A cap that arrives
+    // here is dropped rather than forwarded, so no path through this component can truncate a
+    // secret. Deleting this line is invisible to the type system, so a test drives it.
+    const { maxLength: _bannedCap, ...props } = rest as typeof rest & { maxLength?: number }
     return (
       <Input
         {...props}
