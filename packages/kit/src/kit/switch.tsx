@@ -105,9 +105,13 @@ export const Switch = React.forwardRef<HTMLButtonElement, SwitchProps>(function 
     </Tooltip>
   ) : control
   if (label == null) return maybeTip
+  // `maybeTip`, NOT `control`. This branch used to render the bare control, so a Switch that had
+  // BOTH a `label` and a `tooltip` silently dropped the tooltip — the prop's own doc promises it
+  // unconditionally, and a label is exactly when the extra sentence is a HINT rather than a name,
+  // i.e. when it carries information the label does not. Nothing warned; the source read fine.
   return (
     <div className="flex items-center gap-2">
-      {control}
+      {maybeTip}
       <label htmlFor={ctrlId} className={cn('text-sm', s.disabled && 'opacity-60')}>{label}</label>
     </div>
   )
