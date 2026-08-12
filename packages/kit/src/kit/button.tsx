@@ -106,20 +106,24 @@ const skeletonH = (size?: BaseButtonProps['size']) =>
  * an `aria-label` or wrapped the button in a `<Tooltip>`, i.e. only when a name exists to show. It
  * was measured at zero call sites across both consuming repos at the time of writing.
  */
-function hasVisibleText(node: React.ReactNode): boolean {
-  if (node == null || typeof node === 'boolean') return false
-  if (typeof node === 'string') return node.trim() !== ''
-  if (typeof node === 'number' || typeof node === 'bigint') return true
-  if (Array.isArray(node)) return node.some(hasVisibleText)
+function visibleText(node: React.ReactNode): string {
+  if (node == null || typeof node === 'boolean') return ''
+  if (typeof node === 'string') return node
+  if (typeof node === 'number' || typeof node === 'bigint') return String(node)
+  if (Array.isArray(node)) return node.map(visibleText).join('')
   if (React.isValidElement(node)) {
     const p = node.props as { children?: React.ReactNode; 'aria-hidden'?: boolean | string }
-    if (p['aria-hidden'] === true || p['aria-hidden'] === 'true') return false
-    return hasVisibleText(p.children)
+    if (p['aria-hidden'] === true || p['aria-hidden'] === 'true') return ''
+    return visibleText(p.children)
   }
   if (typeof node === 'object' && Symbol.iterator in (node as object)) {
-    return Array.from(node as Iterable<React.ReactNode>).some(hasVisibleText)
+    return Array.from(node as Iterable<React.ReactNode>).map(visibleText).join('')
   }
-  return false
+  return ''
+}
+
+function hasVisibleText(node: React.ReactNode): boolean {
+  return visibleText(node).trim() !== ''
 }
 
 /**
@@ -201,8 +205,24 @@ export const Button = React.forwardRef<HTMLButtonElement | HTMLAnchorElement, Bu
         ? tooltipWrapMarker
         : undefined
     // a string tooltip becomes the accessible name (unless an explicit aria-label is given).
+    //
+    // THE UNAVAILABLE FALLBACK IS NOT OPTIONAL, AND IT WAS MISSING. The `sr-only` reason node
+    // below lives INSIDE the button (a sibling wrapper would change the layout of every flex rail
+    // this renders in), and the accessible name of a button with no `aria-label` is ITS TEXT
+    // CONTENT — which includes that node. So a TEXT button carrying a reason and no explicit
+    // label was named "NextFill in Alpha channel, Beta channel": the reason swallowed the name,
+    // which is the exact failure `unavailableReason` was written to prevent.
+    //
+    // It went unseen because every shipped caller happened to be an icon button (named by its
+    // string `tooltip`) or a text button that had been given an explicit `aria-label` — and
+    // because this prop's own doc asserted "aria-label is ALWAYS set when a reason is", which the
+    // kit's suite had only ever checked on the icon-only path. Found by a consumer test on the
+    // first text-button caller. The visible words are the name whenever nothing better was given.
     const ariaLabel =
-      ariaLabelProp ?? (typeof tooltip === 'string' ? tooltip : undefined) ?? wrappedLabel
+      ariaLabelProp ??
+      (typeof tooltip === 'string' ? tooltip : undefined) ??
+      wrappedLabel ??
+      (unavailable ? visibleText(children).replace(/\s+/g, ' ').trim() || undefined : undefined)
     // Icon-only buttons (an icon, no visible text) should surface their accessible
     // name as a hover/focus tooltip too. If the caller gave an aria-label but no
     // explicit tooltip, reuse it — so every icon button has a tooltip without

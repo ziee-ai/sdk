@@ -290,7 +290,8 @@ function TableToolbar<T>({ props, view }: { props: TableProps<T>; view: TableVie
     ? props.columns.filter(c => !c.rowHeader && (c.hideable ?? true))
     : []
   // Count ALL currently-visible columns (incl. rowHeader/non-hideable) so the
-  // last visible column's toggle is DISABLED (matches the hook's hide guard).
+  // last visible column's toggle refuses (matches the hook's hide guard,
+  // `canHideColumn`).
   const visibleCount = props.columns.filter(c => !view.isHidden(c.key)).length
   return (
     <div className="flex flex-wrap items-center gap-2 pb-2" data-testid={`${testid}-toolbar`}>
@@ -318,7 +319,20 @@ function TableToolbar<T>({ props, view }: { props: TableProps<T>; view: TableVie
                 <Checkbox
                   key={c.key}
                   checked={!view.isHidden(c.key)}
-                  disabled={!view.isHidden(c.key) && visibleCount <= 1}
+                  // THE RULE IS THE KIT'S OWN, SO STATING IT IS THE KIT'S JOB. `canHideColumn`
+                  // refuses to hide the last visible column, and this toggle used to be natively
+                  // `disabled` — which inside a POPOVER is a refusal with nowhere at all for a
+                  // reason to live: no tooltip can open on a disabled control, there is no room
+                  // for adjacent text, and the only strings on it are the column's NAME. The
+                  // rule was written down in two code comments and nowhere a user could reach.
+                  // It is not caller-supplied (no `TableProps` entry) precisely because it is not
+                  // the caller's rule: every kit Table enforces the same one, so every kit Table
+                  // should say the same sentence rather than 40 call sites inventing 40.
+                  unavailableReason={
+                    !view.isHidden(c.key) && visibleCount <= 1
+                      ? 'A table must show at least one column — show another before hiding this one.'
+                      : undefined
+                  }
                   onCheckedChange={() => view.toggleHidden(c.key)}
                   label={<span className="truncate">{c.title}</span>}
                   aria-label={`Toggle column ${colLabel(c)}`}
