@@ -850,6 +850,12 @@ _No always-required props._
 
 ## PasswordInput
 
+> **`maxLength` is BANNED here** (omitted from the props type *and* stripped at runtime). A cap
+> enforced by discarding the overflow is undetectable on a masked field, and a confirm field with
+> the same cap hides even the mismatch — so the app ships a credential the user never chose. State
+> a length limit and REFUSE past it; never truncate a secret. (`<Input type="password">` is the
+> same hazard through a different door — the consuming app lints for it.)
+
 **Required:**
 
 | prop | type | notes |
