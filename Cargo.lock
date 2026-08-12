@@ -8782,6 +8782,7 @@ dependencies = [
  "tauri-plugin-decorum",
  "tracing",
  "uuid",
+ "webkit2gtk",
  "ziee-auth",
  "ziee-core",
  "ziee-identity",

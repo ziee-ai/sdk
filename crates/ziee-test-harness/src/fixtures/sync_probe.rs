@@ -22,14 +22,12 @@ pub struct SyncProbe {
 }
 
 impl Drop for SyncProbe {
-
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
 impl SyncProbe {
-
     /// Open the stream for `token`. Resolves once the `connected` handshake
     /// frame arrives (so `connection_id()` is immediately usable).
     ///
@@ -111,13 +109,11 @@ impl SyncProbe {
         }
     }
 
-
     /// The server-assigned connection id (echo it back via the
     /// `X-Sync-Connection-Id` header to test self-echo suppression).
     pub fn connection_id(&self) -> Uuid {
         self.connection_id
     }
-
 
     /// Wait up to `timeout` for a `sync` frame matching `(entity, action)`,
     /// ignoring any other frames that arrive first (e.g. a dual-audience
@@ -142,7 +138,6 @@ impl SyncProbe {
         }
     }
 
-
     /// Assert NO sync frame at all arrives within `dur` (cross-user isolation
     /// / origin-skip). A closed stream also counts as silence.
     pub async fn expect_silence(&mut self, dur: Duration) {
@@ -154,7 +149,6 @@ impl SyncProbe {
             Ok(None) | Err(_) => {}
         }
     }
-
 
     /// Assert the server CLOSES the stream within `dur` (e.g. the periodic
     /// re-check tears it down after the account is deactivated or loses the
@@ -168,15 +162,40 @@ impl SyncProbe {
                 panic!("expected the sync stream to close within {dur:?}, but it stayed open");
             }
             match tokio::time::timeout(remaining, self.rx.recv()).await {
-                Ok(None) => return, // server closed the stream — success
+                Ok(None) => return,      // server closed the stream — success
                 Ok(Some(_)) => continue, // ignore data frames, keep waiting for close
-                Err(_) => panic!(
-                    "expected the sync stream to close within {dur:?}, but it stayed open"
-                ),
+                Err(_) => {
+                    panic!("expected the sync stream to close within {dur:?}, but it stayed open")
+                }
             }
         }
     }
 
+    /// [`expect_event`](Self::expect_event) narrowed to a specific row id — needed
+    /// whenever unrelated activity emits the same `(entity, action)` on the same
+    /// stream (a second job running in the background, say). Without it such a test
+    /// can match a bystander's frame and pass while the frame it cares about was
+    /// never sent.
+    pub async fn expect_event_for(
+        &mut self,
+        entity: &str,
+        action: &str,
+        id: &str,
+        timeout: Duration,
+    ) -> SyncFrame {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, self.rx.recv()).await {
+                Ok(Some(f)) if f.entity == entity && f.action == action && f.id == id => return f,
+                Ok(Some(_)) => {} // a different row / event — keep waiting
+                Ok(None) => {
+                    panic!("sync stream closed while waiting for {entity}/{action} id={id}")
+                }
+                Err(_) => panic!("timed out waiting for sync event {entity}/{action} id={id}"),
+            }
+        }
+    }
 
     /// Like `expect_event`, but matches the FIRST frame whose entity is in
     /// `entities` (and whose action matches) — for a dual-audience mutation
@@ -225,3 +244,50 @@ fn parse_sse_frame(frame: &str) -> (Option<String>, Option<String>) {
     (event, data)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Frame decoding is the probe's ONLY pure logic, and everything the probe can
+    // assert rests on it: a decoder that silently returned `None` would make
+    // `expect_silence` pass unconditionally — i.e. the failure mode is a test tool
+    // that reports success no matter what the server did. These came from
+    // CytoAnalyst's hand-rolled mirror of this file, which had them while this
+    // upstream copy did not; they travel with the code they cover.
+
+    #[test]
+    fn decodes_a_sync_frame() {
+        let raw = "event: sync\ndata: {\"entity\":\"dataset\",\"action\":\"update\",\"id\":\"00000000-0000-0000-0000-000000000001\"}\n\n";
+        let (event, data) = parse_sse_frame(raw);
+        assert_eq!(event.as_deref(), Some("sync"));
+        let v: serde_json::Value = serde_json::from_str(&data.expect("data")).expect("json");
+        assert_eq!(v["entity"], "dataset");
+        assert_eq!(v["action"], "update");
+        assert_eq!(v["id"], "00000000-0000-0000-0000-000000000001");
+    }
+
+    #[test]
+    fn a_connected_handshake_is_named_connected_not_sync() {
+        let raw = "event: connected\ndata: {\"connection_id\":\"00000000-0000-0000-0000-0000000000ff\"}\n\n";
+        let (event, data) = parse_sse_frame(raw);
+        assert_eq!(
+            event.as_deref(),
+            Some("connected"),
+            "the handshake must not be mistaken for a data frame"
+        );
+        let v: serde_json::Value = serde_json::from_str(&data.expect("data")).expect("json");
+        assert_eq!(v["connection_id"], "00000000-0000-0000-0000-0000000000ff");
+    }
+
+    #[test]
+    fn keepalive_comments_decode_to_nothing() {
+        assert_eq!(parse_sse_frame(":\n\n"), (None, None));
+    }
+
+    #[test]
+    fn multi_line_data_is_rejoined_with_newlines() {
+        // Per the SSE spec successive `data:` lines are one payload joined by "\n".
+        let (_, data) = parse_sse_frame("event: sync\ndata: {\"a\":1,\ndata: \"b\":2}\n\n");
+        assert_eq!(data.as_deref(), Some("{\"a\":1,\n\"b\":2}"));
+    }
+}
