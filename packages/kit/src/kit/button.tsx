@@ -49,6 +49,18 @@ type ButtonCommon = Omit<BaseButtonProps, 'size'> & {
    * beside its own validation summary), and for a genuinely inert region-wide state.
    */
   unavailableReason?: string
+  /**
+   * THIS BUTTON DESTROYS SOMETHING. It is not a look — `variant="destructive"` already implies it
+   * — it is a DECLARATION for the machinery that must not aim at such a control: an overlay's
+   * initial focus skips it (see `internal/initial-focus.ts`), so a dialog whose delete affordance
+   * sorts before its form cannot open with a delete one Enter away.
+   *
+   * It exists as a separate prop because the two do not coincide. The archetype is a per-row bin
+   * icon: `variant="ghost"` by house rule ("a destructive singleton is ghost + danger tone, not a
+   * filled red block"), destructive in fact. Variant alone would have missed exactly the controls
+   * most worth missing.
+   */
+  destructive?: boolean
   /** Test selector — REQUIRED, forwarded onto the rendered button/anchor via {...props} (i18n-safe). */
   'data-testid': string
 }
@@ -163,7 +175,7 @@ function warnInertTooltip(testid: string | undefined, label: unknown): void {
 }
 
 export const Button = React.forwardRef<HTMLButtonElement | HTMLAnchorElement, ButtonProps>(
-  ({ loading, disabled, unavailableReason, href, target, size: ownSize, type = 'button', tooltip, tooltipSide, icon, block, children, className: classNameProp, onClick, id, ...props }, ref) => {
+  ({ loading, disabled, unavailableReason, destructive, href, target, size: ownSize, type = 'button', tooltip, tooltipSide, icon, block, children, className: classNameProp, onClick, id, ...props }, ref) => {
     const { disabled: surfaceDisabled, loading: regionLoading, size: ambientSize } = useSurface({ disabled })
     const size = ownSize ?? ambientSize
     // An UNAVAILABLE control is aria-disabled, never natively disabled — that is the whole
@@ -174,6 +186,10 @@ export const Button = React.forwardRef<HTMLButtonElement | HTMLAnchorElement, Bu
     // call site after it would have had to get it right again.
     const unavailable = unavailableReason != null && unavailableReason !== ''
     const whyId = React.useId()
+    // `variant="destructive"` is signal enough on its own — a caller that already picked the red
+    // variant should not have to say it twice, and every one that forgot would be a hole.
+    const isDestructive =
+      destructive === true || (props as { variant?: string }).variant === 'destructive'
     const className = cn(block && 'w-full', unavailable && 'cursor-not-allowed opacity-50', classNameProp)
 
     if (regionLoading) {
@@ -263,6 +279,7 @@ export const Button = React.forwardRef<HTMLButtonElement | HTMLAnchorElement, Bu
           // shadcn/pagination.tsx's anchor case.
           nativeButton={false}
           id={id}
+          data-destructive={isDestructive ? 'true' : undefined}
           {...props}
           render={
             <a
@@ -293,6 +310,7 @@ export const Button = React.forwardRef<HTMLButtonElement | HTMLAnchorElement, Bu
             loading || unavailable ? (e) => e.preventDefault() : (onClick as React.MouseEventHandler)
           }
           id={id}
+          data-destructive={isDestructive ? 'true' : undefined}
           {...props}
           // AFTER the spread: the reason node this button points at is the kit's, and a caller's
           // own `aria-describedby` must not silently replace it. Both are kept.

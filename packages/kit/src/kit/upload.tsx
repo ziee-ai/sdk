@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { useSurface } from './surface'
 import { type KitStyleProps } from './style-guard'
+import { ClampNotice } from '../internal/clamp-notice'
 import { cn } from '../lib/utils'
 
 // legacy Upload (controlled-files subset): a drag-and-drop + click dropzone that hands raw
@@ -29,11 +30,26 @@ export const Upload = React.forwardRef<HTMLInputElement, UploadProps>(function U
   const inputRef = React.useRef<HTMLInputElement>(null)
   React.useImperativeHandle(ref, () => inputRef.current as HTMLInputElement)
   const [drag, setDrag] = React.useState(false)
+  const [notice, setNotice] = React.useState<string | null>(null)
   const locked = s.disabled
   const pick = (list: FileList | null) => {
     if (!list || locked) return
     const files = Array.from(list)
-    if (files.length) onFiles(multiple ? files : files.slice(0, 1))
+    if (!files.length) return
+    // A SINGLE-FILE DROPZONE GIVEN THREE FILES USED TO KEEP ONE AND SAY NOTHING. The `<input>`
+    // path cannot produce this (without `multiple` the browser only offers one), so the whole
+    // exposure is the DROP path — and a drop is exactly where a user is most likely to hand over
+    // a whole selection at once. What appeared was one chip, which reads as "it took my file",
+    // not as "it threw two away". See internal/clamp-notice.tsx rule 3: state what was kept AND
+    // what was dropped, with counts.
+    const kept = multiple ? files : files.slice(0, 1)
+    const dropped = files.length - kept.length
+    setNotice(
+      dropped > 0
+        ? `Only one file can be added — kept ${kept[0]?.name ?? ''}, ignored ${dropped} other${dropped === 1 ? '' : 's'}.`
+        : null,
+    )
+    onFiles(kept)
   }
   return (
     // The file <input> is a SIBLING of the role="button" dropzone (not a child):
@@ -63,6 +79,7 @@ export const Upload = React.forwardRef<HTMLInputElement, UploadProps>(function U
       )}
     >
       {children}
+      <ClampNotice message={notice} />
     </div>
       <input
         ref={inputRef}

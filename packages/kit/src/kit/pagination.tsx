@@ -5,6 +5,7 @@ import {
 } from '../shadcn/pagination'
 import { Select } from './select'
 import { Input } from './input'
+import { ClampNotice } from '../internal/clamp-notice'
 import { cn } from '../lib/utils'
 
 // Pagination (common subset): total/pageSize/current + onChange(page). All accessible names
@@ -80,6 +81,7 @@ export function Pagination({
   const safeCurrent = Math.min(Math.max(current, 1), pageCount)
   const go = (p: number) => { if (p >= 1 && p <= pageCount && p !== current) onChange(p) }
   const [jump, setJump] = React.useState('')
+  const [jumpNotice, setJumpNotice] = React.useState<string | null>(null)
   // Ensure the current pageSize is always a selectable option (else the Select trigger is blank).
   // Memoized so the derived options array is stable → the child Select's items memo isn't busted
   // on every pagination render. (Must run before the early return — Rules of Hooks.)
@@ -93,9 +95,27 @@ export function Pagination({
   const atEnd = safeCurrent >= pageCount
   const from = total === 0 ? 0 : (safeCurrent - 1) * pageSize + 1
   const to = Math.min(safeCurrent * pageSize, total)
+  // THE JUMP BOX USED TO ANSWER THREE OUTCOMES WITH THE SAME EMPTY BOX. Page 999 of 12 clamped
+  // to 12; "3.5" was discarded entirely; a valid entry worked — and `setJump('')` cleared the
+  // field in all three, so nothing on screen told them apart. A user who lands on page 12 after
+  // asking for 999 has no way to know whether they mistyped, whether the control ignored them, or
+  // whether there simply is no page 999. (internal/clamp-notice.tsx rules 2 and 3.)
   const submitJump = () => {
-    const n = Number(jump.trim())
-    if (jump.trim() !== '' && Number.isInteger(n)) go(Math.min(Math.max(n, 1), pageCount)) // clamp into range
+    const raw = jump.trim()
+    const n = Number(raw)
+    if (raw === '') { setJump(''); setJumpNotice(null); return }
+    if (!Number.isInteger(n)) {
+      setJumpNotice(`\u201c${raw}\u201d is not a page number`)
+      setJump('')
+      return
+    }
+    const target = Math.min(Math.max(n, 1), pageCount)
+    setJumpNotice(
+      target !== n
+        ? `There ${pageCount === 1 ? 'is' : 'are'} only ${pageCount} page${pageCount === 1 ? '' : 's'} \u2014 went to ${target}`
+        : null,
+    )
+    go(target)
     setJump('')
   }
   return (
@@ -167,11 +187,12 @@ export function Pagination({
           inputMode="numeric"
           aria-label={jumpLabel}
           value={jump}
-          onChange={(e) => setJump(e.target.value)}
+          onChange={(e) => { setJumpNotice(null); setJump(e.target.value) }}
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitJump() } }}
           onBlur={submitJump}
         />
       )}
+      {showQuickJumper && pageCount > 1 && <ClampNotice message={jumpNotice} />}
     </Base>
   )
 }

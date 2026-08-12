@@ -186,13 +186,14 @@ _No always-required props._
 |---|---|---|
 | `data-testid` | `string` | Test selector — REQUIRED, forwarded onto the rendered button/anchor via {...props} (i18n-safe). |
 
-<details><summary>Optional props (11)</summary>
+<details><summary>Optional props (12)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `aria-label` | `string | undefined` | Defines a string value that labels the current element. |
 | `block` | `boolean | undefined` | Full-width block button (legacy `block`). |
 | `href` | `string | undefined` | Render as an <a> styled as a button (pair with variant="link" for a text link). |
+| `destructive` | `boolean | undefined` | THIS BUTTON DESTROYS SOMETHING. Not a look (`variant="destructive"` already implies it) — a declaration, so an overlay's initial focus… |
 | `icon` | `ReactNode` | Leading icon (legacy `icon`); rendered before children, replaced by the spinner while loading. |
 | `loading` | `boolean | undefined` |  |
 | `size` | `"default" | "lg" | "icon" | undefined` |  |
@@ -313,14 +314,16 @@ _No always-required props._
 | `onConfirm` | `() => void | Promise<void>` |  |
 | `title` | `ReactNode` |  |
 
-<details><summary>Optional props (7)</summary>
+<details><summary>Optional props (9)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `children` | `ReactElement<unknown, string | JSXElementConstructor<any>> | undefined` | The trigger element. Optional when driving the dialog via `open`/`onOpenChange`. |
+| `initialFocus` | `string | RefObject<HTMLElement | null> | false | undefined` | Where focus lands when the prompt opens. Defaults to the first tabbable that is not destructive — which, for an "are you sure?", is… |
 | `danger` | `boolean | undefined` |  |
 | `description` | `ReactNode` |  |
 | `okButtonProps` | `{ danger?: boolean | undefined; disabled?: boolean | undefined; } | undefined` | Extra props forwarded to the confirm button (legacy `okButtonProps`), e.g. { danger: true }. |
+| `okUnavailableReason` | `string | undefined` | WHY the confirm cannot be pressed. Presence means unavailable; the string IS the reason. |
 | `onCancel` | `(() => void) | undefined` | Called when the user cancels/dismisses (legacy `onCancel`). |
 | `onOpenChange` | `((open: boolean) => void) | undefined` | Fires when the open state should change (pairs with `open`). |
 | `open` | `boolean | undefined` | Controlled open state. Pair with `onOpenChange`; omit `children` for trigger-less use. |
@@ -398,7 +401,7 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto the dialog content <root> (i18n-safe). |
 | `title` | `ReactNode` | Accessible name — required (Radix Dialog must be labelled). |
 
-<details><summary>Optional props (8)</summary>
+<details><summary>Optional props (9)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -406,6 +409,7 @@ _No always-required props._
 | `className` | `string | undefined` |  |
 | `description` | `ReactNode` |  |
 | `footer` | `ReactNode` |  |
+| `initialFocus` | `string | RefObject<HTMLElement | null> | false | undefined` | WHERE FOCUS LANDS when the dialog opens — a `data-testid`, a ref, or `false`. Omitting it is safe: the default skips anything marked… |
 | `onOpenChange` | `((open: boolean) => void) | undefined` |  |
 | `open` | `boolean | undefined` |  |
 | `size` | `"default" | "sm" | "lg" | "xl" | undefined` |  |
