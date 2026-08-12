@@ -34,8 +34,11 @@ use uuid::Uuid;
 // on both sides.
 pub use ziee_build_support::worktree_db;
 
-// App-neutral auth/sync test fixtures (feature-gated; heavier test-only deps).
-#[cfg(feature = "fixtures")]
+// App-neutral auth/sync test fixtures. Two independently-selectable groups —
+// `sync-probe` (the SSE reader) and `auth-mocks` (oauth/ldap/apple) — so an app
+// can take the cheap one without the docker/HTTP-mock deps of the other.
+// `fixtures` = both, which is what it always meant.
+#[cfg(any(feature = "sync-probe", feature = "auth-mocks"))]
 pub mod fixtures;
 
 /// Seam for [`fixtures::sync_probe::SyncProbe::open`]: the consuming app's thin
