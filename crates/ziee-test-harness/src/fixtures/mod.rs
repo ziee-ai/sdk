@@ -29,6 +29,26 @@
 //!   `SyncEntity` type; it is generic over the app's `TestServer` via the
 //!   [`crate::ApiUrlTarget`] seam.
 
+// `fixtures` has ALWAYS meant "every fixture", and splitting it created a way to break
+// that quietly: drop a group from the list and this crate still compiles, because
+// nothing inside it references the fixtures — the breakage surfaces later, in some
+// consumer that took `fixtures` to get the probe, as a missing module far from the
+// cause. Verified: removing `sync-probe` from `fixtures` left
+// `cargo check -p ziee-test-harness --features fixtures` green. These turn that into a
+// compile error at the definition site instead.
+#[cfg(all(feature = "fixtures", not(feature = "sync-probe")))]
+compile_error!(
+    "`fixtures` must imply `sync-probe`: it is the umbrella flag and existing consumers \
+     enable it to obtain `fixtures::sync_probe`. Keep `fixtures = [\"sync-probe\", \
+     \"auth-mocks\"]`."
+);
+#[cfg(all(feature = "fixtures", not(feature = "auth-mocks")))]
+compile_error!(
+    "`fixtures` must imply `auth-mocks`: it is the umbrella flag and existing consumers \
+     enable it to obtain the oauth/ldap/apple mocks. Keep `fixtures = [\"sync-probe\", \
+     \"auth-mocks\"]`."
+);
+
 #[cfg(feature = "auth-mocks")]
 pub mod apple_mock;
 #[cfg(feature = "auth-mocks")]

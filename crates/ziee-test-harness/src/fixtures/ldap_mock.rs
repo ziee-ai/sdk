@@ -1,7 +1,7 @@
 use testcontainers::{
-    ContainerAsync, GenericImage,
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
+    ContainerAsync, GenericImage,
 };
 
 /// LDAP mock server using rroemhild/test-openldap

@@ -1,7 +1,7 @@
 use testcontainers::{
-    ContainerAsync, GenericImage,
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
+    ContainerAsync, GenericImage,
 };
 
 /// OAuth2/OIDC mock server using navikt/mock-oauth2-server
