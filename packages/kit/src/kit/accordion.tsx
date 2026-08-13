@@ -13,9 +13,20 @@ export interface AccordionItemDef {
   extra?: React.ReactNode
 }
 
+/** Keep a CLOSED panel's children MOUNTED (hidden), instead of unmounting them.
+ *
+ *  Base UI defaults this to `false`, so by default a collapsed panel's subtree is
+ *  destroyed: its effects run their cleanups, its component state is lost, and anything
+ *  it had published to a store is retracted. That is the right default for a disclosure
+ *  whose body is inert content, and the WRONG one wherever collapse is meant to be
+ *  DISPLAY rather than reset — a panel holding live state, a published badge, or an
+ *  ordering the host reads from the mounted child. Opt in there; the default is unchanged
+ *  for every existing consumer. */
+type KeepMounted = { keepMounted?: boolean }
+
 export type AccordionProps =
-  | { items: AccordionItemDef[]; type?: 'single'; collapsible?: boolean; defaultValue?: string; value?: string; onValueChange?: (v: string) => void; ghost?: boolean; className?: string; 'data-testid': string }
-  | { items: AccordionItemDef[]; type: 'multiple'; defaultValue?: string[]; value?: string[]; onValueChange?: (v: string[]) => void; ghost?: boolean; className?: string; 'data-testid': string }
+  | ({ items: AccordionItemDef[]; type?: 'single'; collapsible?: boolean; defaultValue?: string; value?: string; onValueChange?: (v: string) => void; ghost?: boolean; className?: string; 'data-testid': string } & KeepMounted)
+  | ({ items: AccordionItemDef[]; type: 'multiple'; defaultValue?: string[]; value?: string[]; onValueChange?: (v: string[]) => void; ghost?: boolean; className?: string; 'data-testid': string } & KeepMounted)
 
 // legacy `ghost` removes item borders/background.
 const ghostCls = '[&_[data-slot=accordion-item]]:border-0'
@@ -41,6 +52,7 @@ export function Accordion(props: AccordionProps) {
   if (props.type === 'multiple') {
     return (
       <Root multiple value={props.value} defaultValue={props.defaultValue}
+        keepMounted={props.keepMounted}
         onValueChange={props.onValueChange ? (v) => props.onValueChange!(v as string[]) : undefined}
         className={cls} data-testid={testid}>
         {renderItems(items, !!s.disabled)}
@@ -49,6 +61,7 @@ export function Accordion(props: AccordionProps) {
   }
   return (
     <Root multiple={false}
+      keepMounted={props.keepMounted}
       value={props.value != null ? [props.value] : undefined}
       defaultValue={props.defaultValue != null ? [props.defaultValue] : undefined}
       onValueChange={props.onValueChange ? (v) => props.onValueChange!((v as string[])[0] ?? '') : undefined}
