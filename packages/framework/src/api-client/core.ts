@@ -182,6 +182,17 @@ export const callAsync = async <TResponse = unknown>(
      *  the transport is shared by three applications, so a caller with a reason
      *  must be able to decline without editing it. */
     noCoalesce?: boolean
+    /** Return the RAW body instead of parsing it.
+     *
+     *  `'stream'` resolves to the response's `ReadableStream<Uint8Array>` (or `null`
+     *  for a bodyless response) the moment headers arrive, so a caller can consume
+     *  bytes progressively. Every other value — and omitting it, which is every
+     *  existing call — keeps the content-type parse switch exactly as it was, so this
+     *  is additive by construction.
+     *
+     *  A stream response is NEVER joinable (see the predicate below): a body has one
+     *  reader, so two callers sharing it would starve one of them. */
+    responseType?: 'stream'
   },
 ): Promise<TResponse> => {
   // ── In-flight GET coalescing (see ./inflight.ts) ──────────────────────────
@@ -189,10 +200,20 @@ export const callAsync = async <TResponse = unknown>(
   //   - non-GET  — a mutation must never be silently collapsed into another's;
   //   - SSE      — a long-lived stream has ONE consumer wired to ONE reader, so
   //                two subscribers sharing a response body would starve one;
-  //   - FormData — an upload is a mutation and carries non-comparable payloads.
+  //   - FormData — an upload is a mutation and carries non-comparable payloads;
+  //   - stream   — same reason as SSE, and it is NOT left to the caller to remember.
+  //                A `ReadableStream` is not structured-cloneable, so `isolate` cannot
+  //                give a joiner its own copy; excluding it here is what makes that
+  //                impossible rather than merely discouraged. (`noCoalesce` remains the
+  //                caller's escape hatch for other reasons; this is not a second
+  //                mechanism, it is one more term in the same predicate.)
   const isGet = endpointUrl.startsWith('GET ')
   const joinable =
-    isGet && !callbacks?.SSE && !callbacks?.noCoalesce && !isFormData(params)
+    isGet &&
+    !callbacks?.SSE &&
+    !callbacks?.noCoalesce &&
+    callbacks?.responseType !== 'stream' &&
+    !isFormData(params)
   if (!joinable) return performCall<TResponse>(endpointUrl, params, callbacks)
 
   // The key is the endpoint template + its params (the resolved path/query is a
@@ -244,6 +265,8 @@ const performCall = async <TResponse = unknown>(
   callbacks?: {
     SSE?: SSECallback<TResponse>
     fileUploadProgress?: FileUploadProgressCallback
+    /** See `callAsync`. Returns the raw `ReadableStream` body instead of parsing. */
+    responseType?: 'stream'
   },
 ): Promise<TResponse> => {
   let bUrl = await getBaseUrl()
@@ -731,6 +754,23 @@ const performCall = async <TResponse = unknown>(
         error.error_code = errorCode
       }
       throw error
+    }
+
+    // ── RAW BODY ESCAPE HATCH (`responseType: 'stream'`) ────────────────────────
+    //
+    // Deliberately placed AFTER the `!response.ok` handling above — which consumes the
+    // body to build its error message — and BEFORE the parse switch below. A caller
+    // asking for a stream still gets a thrown error for a non-2xx, with the same
+    // message every other caller gets; only the SUCCESS path changes shape.
+    //
+    // Returned at HEADERS, not at body-complete. One consequence worth stating rather
+    // than discovering: the `netRequestStart/End` accounting in the `finally` below
+    // ends when this promise settles, so a streamed read is counted as finished while
+    // its bytes are still arriving, and the background-prefetch gate that reads those
+    // counters will under-count in-flight work. Benign today (nothing gates on it
+    // tightly) and it is the honest trade for delivering bytes progressively.
+    if (callbacks?.responseType === 'stream') {
+      return response.body as unknown as TResponse
     }
 
     //try to parse the response based on content type

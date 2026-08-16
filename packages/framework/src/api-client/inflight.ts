@@ -175,15 +175,47 @@ function isJoinable(entry: Entry, now: number): boolean {
 }
 
 /** Deep-copy a joined response so joiners never alias the issuer's object.
- *  Non-cloneable payloads (a Blob is cloneable; a Response/stream is not) fall
- *  back to the shared value rather than failing the request. */
+ *
+ *  A non-cloneable payload now THROWS rather than falling back to the shared value.
+ *  The fallback was a silent-degradation trap: a `ReadableStream` cannot be cloned, so
+ *  two joiners would receive the SAME body, the first `getReader()` would lock it and
+ *  the second would fail with an unrelated `TypeError: locked` — far from the cause,
+ *  with nothing naming it. Failing here names it exactly once, at the seam that knows.
+ *
+ *  This is unreachable on every path that exists today: the parse switch yields JSON
+ *  (cloneable), a string (primitive, returned above) or a `Blob` (cloneable), and a
+ *  `responseType: 'stream'` call is excluded from joining by the predicate in
+ *  `core.ts`. It is the backstop for the case where that exclusion is ever weakened —
+ *  a guard, not a behaviour change.
+ */
 function isolate<T>(value: T): T {
   if (value === null || typeof value !== 'object') return value
   try {
     return structuredClone(value)
-  } catch {
-    return value
+  } catch (cause) {
+    // The cause is folded into the MESSAGE rather than passed as `{ cause }`: this
+    // package's TS lib target predates the two-argument `Error` constructor, and the
+    // transport is shared by three applications — narrowing their lib floor to carry a
+    // diagnostic would be a real cost for no gain.
+    const why = cause instanceof Error ? cause.message : String(cause)
+    throw new Error(
+      'api-client: a coalesced response could not be isolated for a joined caller ' +
+        `(${why}). The value is not structured-cloneable — a ReadableStream or Response ` +
+        'body is not — and sharing it would give two callers ONE body: the first reader ' +
+        'locks it and the second fails somewhere else entirely. Mark this call ' +
+        "`responseType: 'stream'` (excluded from coalescing) or `noCoalesce: true`.",
+    )
   }
+}
+
+/** Test seam: drive {@link isolate} directly.
+ *
+ *  The hard-fail it guards is UNREACHABLE through the public paths — the parse switch
+ *  yields JSON / a string / a Blob, and a `responseType: 'stream'` call is excluded from
+ *  joining — so the only way to assert it is to call it. Without this seam the guard
+ *  would be asserted by inference, which is how a guard rots into a comment. */
+export function __isolateForTests<T>(value: T): T {
+  return isolate(value)
 }
 
 /** Test seam: drop all in-flight bookkeeping. The epoch is BUMPED, never
