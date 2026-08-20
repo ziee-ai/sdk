@@ -33,6 +33,8 @@ uuid = { version = "1.18", features = ["v4"] }
 url = "2.5"
 tempfile = "3.15"
 portpicker = "0.1"
+# `flock(2)` for the per-test data dir's liveness lock (see `data_dir.rs`).
+libc = "0.2"
 
 # --- fixture features only (app-neutral auth/sync test mocks) ----------------
 # Optional so the lean spawn/isolation core stays dep-light. Versions/features

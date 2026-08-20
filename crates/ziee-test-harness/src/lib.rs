@@ -44,6 +44,15 @@ pub use ziee_build_support::worktree_db;
 #[cfg(any(feature = "sync-probe", feature = "auth-mocks"))]
 pub mod fixtures;
 
+/// The per-test `app.data_dir`: owned, unmounted before removal, and swept at the
+/// start of the next process. See the module docs for why a bare `TempDir` leaked
+/// 176 GB and 703 mount-table entries on the happy path.
+pub mod data_dir;
+
+pub use data_dir::{
+    sweep_stale_test_data_dirs, DataDirSweepReport, PerTestDataDir, TEST_DATA_DIR_PREFIX,
+};
+
 /// Seam for [`fixtures::sync_probe::SyncProbe::open`]: the consuming app's thin
 /// `TestServer` shim implements this so the probe can build the
 /// `/sync/subscribe` URL without the fixture naming any app-side server type.
@@ -196,12 +205,15 @@ pub fn shared_test_app_data_dir(manifest_dir: &Path) -> PathBuf {
 /// `lit-cache/`) are SYMLINKED in from the shared `.ziee-cache` dir so the
 /// hundreds-of-MB extraction still happens once per `cargo test` run. Non-unix
 /// falls back to the shared dir (the CI parallel target is linux).
-pub fn make_isolated_data_dir(manifest_dir: &Path) -> tempfile::TempDir {
+///
+/// Returns a [`PerTestDataDir`], NOT a `tempfile::TempDir`: the tree routinely
+/// contains a squashfuse mount, and `TempDir`'s destructor is a `remove_dir_all`
+/// whose error is discarded — which over this tree means it deletes the symlinks
+/// below, fails with `ENOSYS` at the mount point, and silently leaves ~300 MB and a
+/// `/proc/mounts` entry behind on every green run. See [`data_dir`].
+pub fn make_isolated_data_dir(manifest_dir: &Path) -> PerTestDataDir {
     let shared = shared_test_app_data_dir(manifest_dir);
-    let td = tempfile::Builder::new()
-        .prefix("ziee-test-data-")
-        .tempdir()
-        .expect("create per-test data_dir TempDir");
+    let td = PerTestDataDir::new().expect("create per-test data_dir");
     // Symlink the read-only / content-addressed caches so they stay shared.
     // `lib` is load-bearing for the macOS sandbox: the embedded sandbox-runtime
     // bundle extracts its launcher to `bin/` and its dylibs (libkrun, …) to
@@ -450,6 +462,10 @@ async fn ensure_test_template<A: HarnessApp>(
             // timeout), BEFORE this process starts cloning its own. Self-healing:
             // it needs nothing from the run that leaked.
             sweep_stale_test_dbs_once(admin_url).await;
+            // The same half of the same problem, for the per-test DATA DIR — whose
+            // orphans cost ~300 MB and a `/proc/mounts` entry each, not a catalog
+            // row. Runs here rather than in `start` so it is once per PROCESS.
+            data_dir::sweep_stale_test_data_dirs_once();
 
             let admin = PgPoolOptions::new()
                 .max_connections(1)
@@ -527,8 +543,14 @@ pub struct SpawnedServer {
     /// Declared AFTER `process`/`temp_config_path` so it drops after them: the
     /// child's Postgres sessions are gone before the reap asks for the database.
     _db: PerTestDb,
-    /// Per-test isolated data_dir (mutable state); dropped at test end.
-    _data_tempdir: tempfile::TempDir,
+    /// Per-test isolated data_dir (mutable state), reclaimed at test end.
+    ///
+    /// Ordering is load-bearing and is provided by [`SpawnedServer::drop`]'s BODY,
+    /// which kills and `wait`s the child before any field is dropped. The server
+    /// must be dead before this field's destructor unmounts its squashfuse mounts —
+    /// a live server holding the mount makes the unmount fail and the tree
+    /// un-removable, which is the state this whole type exists to prevent.
+    _data_tempdir: PerTestDataDir,
     /// App-supplied handles (workspace/hub/sandbox-cache tempdirs) held for the
     /// server's lifetime; dropped at test end.
     _keep_alive: Vec<Box<dyn Any + Send + Sync>>,
