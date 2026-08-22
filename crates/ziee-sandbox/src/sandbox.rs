@@ -989,6 +989,43 @@ fn write_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
 // shuttle them to a fd that bwrap reads via `--seccomp <fd>`.
 // --------------------------------------------------------------------
 
+/// Outcome of shuttling the precompiled BPF program into the seccomp pipe.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeccompWriteOutcome {
+    /// All bytes delivered — bwrap loads the full filter.
+    Complete,
+    /// The reader (the bwrap child) closed the pipe before consuming the filter
+    /// (EPIPE / errno 32). The child has already exited, so the call fails at
+    /// spawn and bwrap reports the real cause. A partial filter is REJECTED by
+    /// bwrap, never loaded, so this is NOT a hardening bypass. Routine on the
+    /// MCP-in-sandbox path when a junk stdio server's bwrap child exits before
+    /// reading the fd.
+    ChildGone,
+    /// A genuine short write / unexpected EOF from a NON-EPIPE cause — the
+    /// hardening claim 'seccomp: on' really was not delivered. Stays loud.
+    Truncated,
+}
+
+/// Classify a finished seccomp-pipe write. Pure, so the EPIPE-vs-genuine split
+/// is unit-testable without spawning bwrap. The distinction is the whole point
+/// of the defect fix: a routine child-exited-early EPIPE must not be logged with
+/// security-incident wording, while a real truncation must stay loud.
+#[cfg(target_os = "linux")]
+fn classify_seccomp_write(
+    offset: usize,
+    total: usize,
+    last_err: Option<i32>,
+) -> SeccompWriteOutcome {
+    if offset >= total {
+        SeccompWriteOutcome::Complete
+    } else if last_err == Some(libc::EPIPE) {
+        SeccompWriteOutcome::ChildGone
+    } else {
+        SeccompWriteOutcome::Truncated
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) struct SeccompPipe {
     read_fd: RawFd,
@@ -1057,16 +1094,37 @@ impl SeccompPipe {
             unsafe {
                 libc::close(write_fd);
             }
-            if offset < total {
-                tracing::error!(
-                    written = offset,
-                    expected = total,
-                    errno = ?last_err,
-                    "code_sandbox: seccomp BPF write was truncated; \
-                     bwrap will reject the filter and the sandboxed \
-                     call WILL FAIL — hardening claim 'seccomp: on' \
-                     was not delivered for this call"
-                );
+            match classify_seccomp_write(offset, total, last_err) {
+                SeccompWriteOutcome::Complete => {}
+                SeccompWriteOutcome::ChildGone => {
+                    // The bwrap child closed the read end before consuming the
+                    // filter. It has already exited, so the call fails at spawn
+                    // and bwrap reports the real cause. NOT a hardening bypass
+                    // (a partial filter is rejected, never loaded). Routine on
+                    // the MCP-in-sandbox path — a junk stdio server's child
+                    // exits before reading the fd — so log quietly, not at ERROR
+                    // with security-incident wording.
+                    tracing::debug!(
+                        written = offset,
+                        expected = total,
+                        "code_sandbox: sandboxed child closed the seccomp pipe \
+                         before reading the filter (EPIPE); the child exited \
+                         early so this call fails at spawn — this is NOT a \
+                         seccomp hardening bypass (bwrap rejects a partial \
+                         filter, it never loads one)"
+                    );
+                }
+                SeccompWriteOutcome::Truncated => {
+                    tracing::error!(
+                        written = offset,
+                        expected = total,
+                        errno = ?last_err,
+                        "code_sandbox: seccomp BPF write was truncated; \
+                         bwrap will reject the filter and the sandboxed \
+                         call WILL FAIL — hardening claim 'seccomp: on' \
+                         was not delivered for this call"
+                    );
+                }
             }
         });
 
@@ -2417,5 +2475,51 @@ mod tests {
         assert!(argv[bind_idx..]
             .windows(2)
             .any(|w| w[0] == "--chdir" && w[1] == "/home/sandboxuser"));
+    }
+
+    // TEST-3 [acceptance INV-2]: the seccomp-write classifier distinguishes a
+    // routine child-exited-early EPIPE (logged quietly, not a bypass) from a
+    // genuine truncation (stays loud) — and never mislabels a genuine
+    // truncation as ChildGone (the trap the fix must not fall into).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn classify_seccomp_write_splits_epipe_from_genuine_truncation() {
+        // Full write → Complete, regardless of any stale errno.
+        assert_eq!(
+            classify_seccomp_write(560, 560, None),
+            SeccompWriteOutcome::Complete
+        );
+        assert_eq!(
+            classify_seccomp_write(560, 560, Some(libc::EPIPE)),
+            SeccompWriteOutcome::Complete
+        );
+
+        // Short write because the reader (bwrap child) went away → ChildGone.
+        // This is the ~204×/day case: written=0, expected=560, errno=32 (EPIPE).
+        assert_eq!(
+            classify_seccomp_write(0, 560, Some(libc::EPIPE)),
+            SeccompWriteOutcome::ChildGone
+        );
+        assert_eq!(
+            classify_seccomp_write(120, 560, Some(libc::EPIPE)),
+            SeccompWriteOutcome::ChildGone
+        );
+
+        // Short write from any OTHER cause → Truncated (real hardening failure,
+        // stays loud). A non-EPIPE errno and an unexpected EOF (write returned 0
+        // with no recorded errno) must BOTH be Truncated, never ChildGone.
+        assert_eq!(
+            classify_seccomp_write(300, 560, Some(libc::EIO)),
+            SeccompWriteOutcome::Truncated
+        );
+        assert_eq!(
+            classify_seccomp_write(0, 560, None),
+            SeccompWriteOutcome::Truncated
+        );
+        assert_ne!(
+            classify_seccomp_write(300, 560, Some(libc::EIO)),
+            SeccompWriteOutcome::ChildGone,
+            "a genuine (non-EPIPE) truncation must NOT be quieted as ChildGone"
+        );
     }
 }
