@@ -78,7 +78,11 @@ pub async fn execute_command(
 /// matching the configured strings covers that vector. No-op on legitimate
 /// command output — the workload's own stdout only ever references the in-sandbox
 /// paths (`/home/sandboxuser`, `/`), never these host sources.
-fn redact_host_paths(
+///
+/// `pub` so the consuming server crate can acceptance-test the no-host-path-leak
+/// invariant through the `code_sandbox::tools::execute` re-export (the same seam
+/// it uses to call `execute_command`); it is a pure, side-effect-free transform.
+pub fn redact_host_paths(
     text: &str,
     workspace_root: &std::path::Path,
     rootfs_mount_dir: &std::path::Path,

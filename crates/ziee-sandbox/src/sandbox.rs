@@ -990,9 +990,12 @@ fn write_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
 // --------------------------------------------------------------------
 
 /// Outcome of shuttling the precompiled BPF program into the seccomp pipe.
+/// `pub` (with the classifier below) so the consuming server crate can
+/// acceptance-test the EPIPE-vs-genuine-truncation split (INV-2) through the
+/// `code_sandbox::sandbox` re-export; both are pure and Linux-only.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SeccompWriteOutcome {
+pub enum SeccompWriteOutcome {
     /// All bytes delivered — bwrap loads the full filter.
     Complete,
     /// The reader (the bwrap child) closed the pipe before consuming the filter
@@ -1012,7 +1015,7 @@ enum SeccompWriteOutcome {
 /// of the defect fix: a routine child-exited-early EPIPE must not be logged with
 /// security-incident wording, while a real truncation must stay loud.
 #[cfg(target_os = "linux")]
-fn classify_seccomp_write(
+pub fn classify_seccomp_write(
     offset: usize,
     total: usize,
     last_err: Option<i32>,
