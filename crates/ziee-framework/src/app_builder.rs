@@ -188,7 +188,18 @@ pub fn apply_rate_limit_layer(
     })
 }
 
+/// The custom request headers the FRAMEWORK itself reads. They are unioned into
+/// every explicit `allow_headers` list by [`create_cors_layer`] — see
+/// [`create_cors_layer_with`] for why omission must not be expressible.
+pub const FRAMEWORK_REQUIRED_REQUEST_HEADERS: &[&str] =
+    &[crate::sync::extractor::SYNC_CONNECTION_HEADER];
+
 /// Create CORS layer from configuration.
+///
+/// Equivalent to [`create_cors_layer_with`] with only the framework's own
+/// required headers ([`FRAMEWORK_REQUIRED_REQUEST_HEADERS`]). An APP that reads
+/// its own custom request headers must call `create_cors_layer_with` and pass
+/// them, because the framework cannot know them.
 ///
 /// Closes 14-core F-04 (High) at the level of "operator visibility":
 /// any deployment booting with `Any/Any/Any` (either via wildcard
@@ -199,6 +210,40 @@ pub fn apply_rate_limit_layer(
 /// permissive CORS; the loud log is enough to catch the misconfig
 /// in `journalctl`/`docker logs` review.
 pub fn create_cors_layer(config: &ServerConfig) -> CorsLayer {
+    create_cors_layer_with(config, FRAMEWORK_REQUIRED_REQUEST_HEADERS)
+}
+
+/// Create the CORS layer, UNIONING `always_allow` into an explicit
+/// `allow_headers` list.
+///
+/// ## Why a union, and not "just list them in the config"
+///
+/// A header the API itself defines and reads is not an operator preference: a
+/// deployment in which it is refused at preflight is simply broken. Before this,
+/// every explicit `allow_headers` list — the desktop app's, `dev.example.yaml`'s,
+/// and every operator's — had to independently re-list such a header, and
+/// forgetting one was **silent**: the server logs nothing, the browser refuses
+/// the request before it is sent, and `fetch` rejects rather than returning a
+/// status.
+///
+/// That is not hypothetical. `X-Chat-Stream-Connection-Id` was missing from the
+/// desktop allowlist, so `PUT /api/chat/stream/subscription` never reached the
+/// server, every chat-stream connection stayed scoped to no conversation, and
+/// live assistant tokens were dropped at the registry while the reply persisted
+/// normally — the user saw a spinner that only a page reload resolved. Its
+/// sibling `X-Sync-Connection-Id` had already been added, with a comment
+/// describing this exact failure; the chat header simply never followed.
+///
+/// So omission is no longer expressible. The `*`-wildcard and empty-list
+/// branches already resolve to `Any` and are untouched (unioning into `Any` is a
+/// no-op); only the explicit-list branch gains the headers, and only ones the
+/// server already accepts at the handler — which grants a cross-origin caller
+/// nothing a same-origin request could not already do. Origin and method
+/// allowlisting are unaffected.
+///
+/// Duplicates are dropped case-insensitively, so a config that DOES list a
+/// required header stays byte-equivalent (`HeaderName` is lowercase-normalised).
+pub fn create_cors_layer_with(config: &ServerConfig, always_allow: &[&str]) -> CorsLayer {
     // Chunk sdk-batteries (P1): a permissive-CORS default is expected on a
     // loopback (local-dev) bind, so downgrade the loud `SECURITY:` ERROR to a
     // debug line there — it was scaring devs on every localhost boot. A public
@@ -247,11 +292,34 @@ pub fn create_cors_layer(config: &ServerConfig) -> CorsLayer {
             .filter_map(|m| m.parse().ok())
             .collect();
 
-        let headers: Vec<HeaderName> = cors_config
+        // Parse the configured list, then UNION the always-allow headers into it.
+        // `HeaderName` lowercase-normalises on parse, so `contains` is already the
+        // case-insensitive comparison we want and a config that spells a required
+        // header differently does not produce a duplicate entry.
+        let mut headers: Vec<HeaderName> = cors_config
             .allow_headers
             .iter()
             .filter_map(|h| if h == "*" { None } else { h.parse().ok() })
             .collect();
+        // Whether the CONFIGURED list alone resolves to `Any` — captured BEFORE the
+        // union. Deciding this on the merged list instead would be a real
+        // regression: an empty `allow_headers` means "permissive" today, and after
+        // a union it would silently become "only the required headers", i.e.
+        // narrower than what the operator asked for.
+        let config_headers_are_any =
+            cors_config.allow_headers.contains(&"*".to_string()) || headers.is_empty();
+        for required in always_allow {
+            match required.parse::<HeaderName>() {
+                Ok(name) if !headers.contains(&name) => headers.push(name),
+                Ok(_) => {}
+                Err(_) => tracing::error!(
+                    "CORS: required request header {:?} is not a valid header name and \
+                     was skipped — cross-origin requests carrying it will be refused \
+                     at preflight",
+                    required
+                ),
+            }
+        }
 
         let mut layer = CorsLayer::new();
 
@@ -270,8 +338,9 @@ pub fn create_cors_layer(config: &ServerConfig) -> CorsLayer {
             layer = layer.allow_methods(methods);
         }
 
-        // Set headers
-        if cors_config.allow_headers.contains(&"*".to_string()) || headers.is_empty() {
+        // Set headers. `Any` already permits every required header, so the union
+        // above is a no-op on this branch and is deliberately not consulted here.
+        if config_headers_are_any {
             layer = layer.allow_headers(Any);
         } else {
             layer = layer.allow_headers(headers);
@@ -400,5 +469,146 @@ mod order_determinism_tests {
             "if these matched, order-only sorting would already be deterministic \
              and the (order, name) tiebreak would be pointless"
         );
+    }
+}
+
+/// TEST-2 — `create_cors_layer_with` must make an omitted required header
+/// UNEXPRESSIBLE, without widening anything else.
+///
+/// Driven through the real tower service with a real `OPTIONS` preflight, not by
+/// inspecting the builder: the observable contract is what a browser is told, and
+/// a browser reads only `Access-Control-Allow-Headers`. (`CorsLayer` exposes no
+/// getters, so there is no shortcut that would still be evidence.)
+#[cfg(test)]
+mod cors_required_headers_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+        routing::put,
+        Router,
+    };
+    use tower::ServiceExt; // oneshot
+
+    const CHAT_HEADER: &str = "X-Chat-Stream-Connection-Id";
+
+    /// Minimal `ServerConfig` carrying just the CORS block under test.
+    fn config_with(allow_headers: &[&str]) -> ServerConfig {
+        serde_json::from_value(serde_json::json!({
+            "postgresql": { "use_embedded": false },
+            "server": {
+                "host": "127.0.0.1",
+                "port": 8080,
+                "api_prefix": "/api",
+                "cors": {
+                    "allow_origins": ["tauri://localhost"],
+                    "allow_methods": ["GET", "PUT", "OPTIONS"],
+                    "allow_headers": allow_headers,
+                },
+            },
+            "jwt": {
+                "secret": "test-secret-not-used-by-the-cors-layer",
+                "issuer": "ziee",
+                "audience": "ziee-api",
+                "access_token_expiry_hours": 1,
+            },
+        }))
+        .expect("minimal ServerConfig fixture must deserialize")
+    }
+
+    /// The `Access-Control-Allow-Headers` a browser would be told, for a preflight
+    /// that asks to send `requested`.
+    async fn preflight_allow_headers(layer: CorsLayer, requested: &str) -> Option<String> {
+        let app = Router::new()
+            .route("/api/chat/stream/subscription", put(|| async { StatusCode::NO_CONTENT }))
+            .layer(layer);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/chat/stream/subscription")
+                    .header("Origin", "tauri://localhost")
+                    .header("Access-Control-Request-Method", "PUT")
+                    .header("Access-Control-Request-Headers", requested)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("preflight must produce a response");
+        res.headers()
+            .get("access-control-allow-headers")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_ascii_lowercase)
+    }
+
+    /// The defect itself: a config that does NOT list the header must still allow
+    /// it. This is the assertion that goes red without the union.
+    #[tokio::test]
+    async fn union_allows_a_required_header_the_config_omits() {
+        let cfg = config_with(&["Authorization", "Content-Type"]);
+        let allowed = preflight_allow_headers(
+            create_cors_layer_with(&cfg, &[CHAT_HEADER]),
+            "content-type,x-chat-stream-connection-id",
+        )
+        .await
+        .expect("an explicit allow-list must echo an Access-Control-Allow-Headers");
+        assert!(
+            allowed.contains("x-chat-stream-connection-id"),
+            "a header the API reads must survive preflight even when the config \
+             forgets it; got {allowed:?}"
+        );
+        // …and the operator's own entries are preserved, not replaced.
+        assert!(allowed.contains("authorization"), "got {allowed:?}");
+        assert!(allowed.contains("content-type"), "got {allowed:?}");
+    }
+
+    /// A config that DOES list it (in another case) must not gain a duplicate —
+    /// `HeaderName` lowercase-normalises, so the union is a no-op there.
+    #[tokio::test]
+    async fn union_does_not_duplicate_a_differently_cased_entry() {
+        let cfg = config_with(&["Authorization", "x-chat-STREAM-connection-id"]);
+        let allowed =
+            preflight_allow_headers(create_cors_layer_with(&cfg, &[CHAT_HEADER]), CHAT_HEADER)
+                .await
+                .expect("explicit allow-list");
+        assert_eq!(
+            allowed.matches("x-chat-stream-connection-id").count(),
+            1,
+            "the union must be case-insensitive; got {allowed:?}"
+        );
+    }
+
+    /// The two permissive branches are untouched: `*` and an empty list both mean
+    /// `Any`, which already permits every required header. Deciding this on the
+    /// MERGED list would silently narrow an empty list to "only the required
+    /// headers" — a regression, not a fix.
+    #[tokio::test]
+    async fn wildcard_and_empty_list_still_mean_any() {
+        for allow in [vec!["*"], vec![]] {
+            let cfg = config_with(&allow);
+            let allowed = preflight_allow_headers(
+                create_cors_layer_with(&cfg, &[CHAT_HEADER]),
+                "x-anything-at-all",
+            )
+            .await
+            .expect("Any still answers the preflight");
+            assert!(
+                allowed.contains('*') || allowed.contains("x-anything-at-all"),
+                "allow_headers={allow:?} must stay permissive; got {allowed:?}"
+            );
+        }
+    }
+
+    /// An invalid entry is skipped with a loud log rather than panicking the boot.
+    #[tokio::test]
+    async fn an_invalid_required_header_does_not_panic_boot() {
+        let cfg = config_with(&["Authorization"]);
+        let allowed = preflight_allow_headers(
+            create_cors_layer_with(&cfg, &["not a valid header", CHAT_HEADER]),
+            CHAT_HEADER,
+        )
+        .await
+        .expect("explicit allow-list");
+        assert!(allowed.contains("x-chat-stream-connection-id"), "got {allowed:?}");
     }
 }
