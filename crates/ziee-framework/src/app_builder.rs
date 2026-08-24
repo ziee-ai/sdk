@@ -191,7 +191,7 @@ pub fn apply_rate_limit_layer(
 /// The custom request headers the FRAMEWORK itself reads. They are unioned into
 /// every explicit `allow_headers` list by [`create_cors_layer`] — see
 /// [`create_cors_layer_with`] for why omission must not be expressible.
-pub const FRAMEWORK_REQUIRED_REQUEST_HEADERS: &[&str] =
+pub const FRAMEWORK_REQUIRED_REQUEST_HEADERS: &[&'static str] =
     &[crate::sync::extractor::SYNC_CONNECTION_HEADER];
 
 /// Create CORS layer from configuration.
@@ -243,7 +243,16 @@ pub fn create_cors_layer(config: &ServerConfig) -> CorsLayer {
 ///
 /// Duplicates are dropped case-insensitively, so a config that DOES list a
 /// required header stays byte-equivalent (`HeaderName` is lowercase-normalised).
-pub fn create_cors_layer_with(config: &ServerConfig, always_allow: &[&str]) -> CorsLayer {
+///
+/// The element type is `&'static str` deliberately: it makes
+/// "these are compile-time constants the SERVER defines" a property the type
+/// system enforces — a config- or user-derived `String` cannot be passed without
+/// deliberately leaking it — so no future caller can quietly reopen the
+/// allow-list to arbitrary, externally-supplied header names.
+pub fn create_cors_layer_with(
+    config: &ServerConfig,
+    always_allow: &[&'static str],
+) -> CorsLayer {
     // Chunk sdk-batteries (P1): a permissive-CORS default is expected on a
     // loopback (local-dev) bind, so downgrade the loud `SECURITY:` ERROR to a
     // debug line there — it was scaring devs on every localhost boot. A public
