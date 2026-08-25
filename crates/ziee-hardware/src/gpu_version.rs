@@ -154,6 +154,28 @@ pub fn parse_version_token(token: &str) -> Option<MajorMinor> {
 /// `see "CUDA UMD version" instead` appears two lines ABOVE the real
 /// `CUDA UMD version : 13.3`, so a first-match-wins scan would return `None`.
 pub fn find_labeled_version(text: &str, key: &str) -> Option<MajorMinor> {
+    find_labeled_version_inner(text, key, false)
+}
+
+/// As [`find_labeled_version`], but additionally requires the key to sit in a
+/// real `label : value` position — a `:` must either end the key's last token
+/// or appear between the key and the value.
+///
+/// This is what stops a version being read out of PROSE that happens to
+/// contain the key. Driver 610 already prints
+/// `… will be removed in CUDA 14.0. Use CUDA UMD Version instead]`; if a future
+/// driver phrased that as `… removed in CUDA version 14.0.`, an unanchored
+/// match would return **14.0** on a host capped at 13.3 and hand it a
+/// `cuda14.x` artifact that cannot load. A wrong number is far worse than
+/// `None`, so the CUDA keys pay for the anchor.
+///
+/// Not applied to `nvcc`'s `release 13.3,` or ROCm's labels, which are
+/// legitimately colon-free.
+fn find_labeled_version_colon_anchored(text: &str, key: &str) -> Option<MajorMinor> {
+    find_labeled_version_inner(text, key, true)
+}
+
+fn find_labeled_version_inner(text: &str, key: &str, require_colon: bool) -> Option<MajorMinor> {
     let key_tokens: Vec<String> = key.split_whitespace().map(normalize_token).collect();
     if key_tokens.is_empty() {
         return None;
@@ -172,12 +194,31 @@ pub fn find_labeled_version(text: &str, key: &str) -> Option<MajorMinor> {
             if end > tokens.len() || normalized[start..end] != key_tokens[..] {
                 continue;
             }
+
+            // `Version:` (colon glued to the label) satisfies the anchor; so
+            // does a detached `:` token between label and value.
+            let mut saw_colon = tokens[end - 1].ends_with(':');
+
             // Step over punctuation-only tokens (a detached `:`, a table `|`).
             let mut value_at = end;
             while value_at < tokens.len() && normalized[value_at].is_empty() {
+                if tokens[value_at].contains(':') {
+                    saw_colon = true;
+                }
                 value_at += 1;
             }
-            if let Some(version) = tokens.get(value_at).and_then(|t| parse_version_token(t)) {
+
+            if require_colon && !saw_colon {
+                continue;
+            }
+
+            // Try the raw token first, then its normalised form. Without the
+            // second attempt a value glued to a table border (`12.4|`) or
+            // carrying a stray quote would be dropped, where the older
+            // substring scraper accepted it — a needless regression.
+            if let Some(version) = tokens.get(value_at).and_then(|t| {
+                parse_version_token(t).or_else(|| parse_version_token(&normalize_token(t)))
+            }) {
                 return Some(version);
             }
             // Key matched but the value was prose ("Deprecated, see …") —
@@ -209,7 +250,7 @@ pub const CUDA_VERSION_KEYS: &[&str] = &["cuda umd version", "cuda version"];
 pub fn parse_cuda_smi_version(stdout: &str) -> Option<MajorMinor> {
     CUDA_VERSION_KEYS
         .iter()
-        .find_map(|key| find_labeled_version(stdout, key))
+        .find_map(|key| find_labeled_version_colon_anchored(stdout, key))
 }
 
 /// Parse the toolkit version from `nvcc --version`
@@ -419,6 +460,29 @@ mod tests {
         // permissive token parse with a future label change.
         let q = "Product Name                     : NVIDIA H200 NVL\n";
         assert_eq!(parse_cuda_smi_version(q), None);
+    }
+
+    #[test]
+    fn prose_containing_the_key_is_not_read_as_a_version() {
+        // Hypothetical future phrasing of the deprecation notice driver 610
+        // already prints. Unanchored, this returns 14.0 on a 13.3 host and
+        // would install a cuda14 build that cannot load.
+        let prose = "CUDA Version : 13.3 [Deprecated; will be removed in CUDA version 14.0.]\n";
+        assert_eq!(parse_cuda_smi_version(prose), Some(mm(13, 3)));
+
+        // With only the prose and no real field, there must be NO version.
+        let prose_only = "Note: support will be removed in CUDA version 14.0.\n";
+        assert_eq!(parse_cuda_smi_version(prose_only), None);
+    }
+
+    #[test]
+    fn value_glued_to_a_table_border_still_parses() {
+        // The raw token is `12.4|`; `|` is not a value terminator, so this
+        // only works because the normalised token is tried as a fallback.
+        assert_eq!(
+            parse_cuda_smi_version("| NVIDIA-SMI 550.90  CUDA Version: 12.4|"),
+            Some(mm(12, 4))
+        );
     }
 
     #[test]
