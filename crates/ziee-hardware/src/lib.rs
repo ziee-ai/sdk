@@ -19,6 +19,9 @@
 //! schema keys (short idents) are byte-identical in the emitted OpenAPI.
 
 pub mod detection;
+/// Pure parsers for GPU vendor version strings, shared with ziee's
+/// `llm_local_runtime::utils::gpu_detect` so the two do not re-diverge.
+pub mod gpu_version;
 pub mod monitoring;
 pub mod permissions;
 pub mod types;
