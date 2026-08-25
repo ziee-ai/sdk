@@ -218,14 +218,20 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
 ///
 /// **Deliberately only TWO surfaces, unlike ziee's backend detection, which
 /// tries three.** Nothing in this crate has a subprocess timeout — every call
-/// here is a bare blocking `cmd.output()` — and this path is reached
-/// synchronously from `GET /hardware` and from the 2s SSE monitoring tick. A
-/// wedged `nvidia-smi` (a known failure mode with a hung driver) blocks the
-/// request for as long as it hangs, once per probe. The previous code made two
-/// `nvidia-smi` calls in total on this path, so capping the version chain at
-/// two keeps the worst-case hang exposure where it already was rather than
-/// doubling it. `--version` covers modern drivers and the bare banner covers
-/// pre-R6xx; `-q` would add a third call for no host that the first two miss.
+/// here is a bare blocking `cmd.output()` — so a wedged `nvidia-smi` (a known
+/// failure mode with a hung driver) blocks for as long as it hangs, once per
+/// probe. `--version` covers modern drivers and the bare banner covers
+/// pre-R6xx; `-q` would add a third call for no host the first two miss.
+///
+/// Being accurate about the trade rather than flattering it: the old code made
+/// **one** call for the version scrape, and this path now makes **three** in
+/// total (`--version`, the banner, and the separate `--query-gpu` below), so
+/// worst-case hang exposure went UP by roughly half — it was not held constant.
+/// Dropping `-q` limits the increase; it does not erase it.
+///
+/// Reached synchronously from `GET /hardware` → `detect_gpu_devices`, and only
+/// on the NVML-**failed** branch. It is NOT on the 2s SSE monitoring tick — that
+/// calls `get_gpu_usage_data`, which never reaches here.
 ///
 /// The missing timeout is a real pre-existing defect in this crate — ziee's
 /// `gpu_detect` has `probe_command_with_timeout` and this does not — but
@@ -949,13 +955,33 @@ mod tests {
         // the bug it exists to guard: a present, working nvidia-smi whose
         // version cannot be parsed is the reported defect, and an earlier
         // version of this test reported that as a skip.
-        if trusted_command("nvidia-smi").is_none() {
+        // Three states, not two, and the middle one is why the first attempt
+        // at this test was wrong in BOTH directions:
+        //   1. binary absent                      → skip
+        //   2. binary present, driver not working → skip (a container without
+        //      /dev/nvidia*, a GPU in reset, `nvidia-smi` exiting non-zero with
+        //      "couldn't communicate with the NVIDIA driver"). NOT a bug here.
+        //   3. binary present, driver answering, still no version → FAIL, that
+        //      is the reported defect.
+        // Skipping on 2+3 together hides the bug; failing on 2+3 together turns
+        // a healthy-but-driverless host red.
+        let Some(mut probe) = trusted_command("nvidia-smi") else {
             eprintln!("SKIP: nvidia-smi is not installed on this host");
             return;
+        };
+        let answering = probe
+            .args(["--query-gpu=name", "--format=csv,noheader"])
+            .output()
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+        if !answering {
+            eprintln!("SKIP: nvidia-smi is present but enumerated no GPU (driver not working)");
+            return;
         }
+
         let version = cuda_version_from_smi().expect(
-            "nvidia-smi is present but no CUDA version could be parsed — that is the \
-             reported bug, not a reason to skip",
+            "nvidia-smi is present and enumerating GPUs, but no CUDA version could be \
+             parsed — that is the reported bug, not a reason to skip",
         );
         // Must round-trip through the shared parser: anything the parser
         // rejects can no longer be produced here.
