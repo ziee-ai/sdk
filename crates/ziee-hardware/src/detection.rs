@@ -145,6 +145,12 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
     // Try NVML first
     match nvml_wrapper::Nvml::init() {
         Ok(nvml) => {
+            // Hoisted out of the per-device loop below: this is a
+            // driver-wide fact, and each call does its own Nvml init/shutdown.
+            // Inside the loop it was O(number of GPUs) redundant inits — eight
+            // on this class of machine.
+            let cuda_version = get_cuda_version();
+
             if let Ok(device_count) = nvml.device_count() {
                 for i in 0..device_count {
                     if let Ok(device) = nvml.device_by_index(i) {
@@ -168,7 +174,8 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
                         // Compute capability is no longer surfaced. Restoring
                         // it needs its own schema field + UI, which is a
                         // separate change.
-                        let cuda_version = get_cuda_version();
+                        //
+                        // `cuda_version` is computed once above the loop.
 
                         gpu_devices.push(GPUDevice {
                             device_id: format!("cuda:{}", i),
@@ -178,7 +185,7 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
                             driver_version,
                             compute_capabilities: GPUComputeCapabilities {
                                 cuda_support: true,
-                                cuda_version,
+                                cuda_version: cuda_version.clone(),
                                 metal_support: false,
                                 opencl_support: true,
                                 vulkan_support: Some(true),
@@ -207,10 +214,25 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
 /// renders this value verbatim.
 ///
 /// Split out from its caller purely so the parsing half is unit-testable; the
-/// impure half is the two `trusted_command` calls.
+/// impure half is the `trusted_command` calls.
+///
+/// **Deliberately only TWO surfaces, unlike ziee's backend detection, which
+/// tries three.** Nothing in this crate has a subprocess timeout — every call
+/// here is a bare blocking `cmd.output()` — and this path is reached
+/// synchronously from `GET /hardware` and from the 2s SSE monitoring tick. A
+/// wedged `nvidia-smi` (a known failure mode with a hung driver) blocks the
+/// request for as long as it hangs, once per probe. The previous code made two
+/// `nvidia-smi` calls in total on this path, so capping the version chain at
+/// two keeps the worst-case hang exposure where it already was rather than
+/// doubling it. `--version` covers modern drivers and the bare banner covers
+/// pre-R6xx; `-q` would add a third call for no host that the first two miss.
+///
+/// The missing timeout is a real pre-existing defect in this crate — ziee's
+/// `gpu_detect` has `probe_command_with_timeout` and this does not — but
+/// porting it touches every probe here and belongs in its own change.
 #[cfg(feature = "gpu-detect")]
 fn cuda_version_from_smi() -> Option<String> {
-    for args in [vec!["--version"], vec![], vec!["-q"]] {
+    for args in [vec!["--version"], vec![]] {
         if let Some(mut cmd) = trusted_command("nvidia-smi")
             && let Ok(output) = cmd.args(&args).output()
             && output.status.success()
@@ -218,7 +240,15 @@ fn cuda_version_from_smi() -> Option<String> {
                 &String::from_utf8_lossy(&output.stdout),
             )
         {
-            return Some(version.to_string());
+            // NOT `version.to_string()`: `Display` renders an unknown minor as
+            // `13.x`, which this crate's consumer (`HardwareSettings.tsx`)
+            // would render verbatim as "CUDA ✓ (13.x)". Emit the bare major
+            // instead, so the value is always a plain version string that
+            // round-trips through the parser.
+            return Some(match version.minor {
+                Some(minor) => format!("{}.{}", version.major, minor),
+                None => version.major.to_string(),
+            });
         }
     }
     None
@@ -797,6 +827,24 @@ fn get_cuda_version() -> Option<String> {
     None
 }
 
+/// macOS counterpart, so the symbol exists on every target.
+///
+/// Required because `detect_nvidia_gpus` is gated on the `gpu-detect` FEATURE
+/// with no OS gate, so it is compiled on macOS too and its body must resolve.
+/// The pre-existing caller at the top of this file sits inside a
+/// `#[cfg(not(target_os = "macos"))]` block and so never needed this; the
+/// NVML call site added for the compute-capability fix does.
+///
+/// Without it, `desktop-release.yml`'s `aarch64-apple-darwin` /
+/// `x86_64-apple-darwin` legs fail to compile — and macOS CI runs no Rust at
+/// all (it is TypeScript-only), so the break would first appear at a release
+/// tag. There is no Apple hardware for NVML to talk to anyway, so `None` is
+/// also the correct answer, not merely a compiling one.
+#[cfg(target_os = "macos")]
+fn get_cuda_version() -> Option<String> {
+    None
+}
+
 fn check_opencl_support() -> bool {
     #[cfg(feature = "gpu-detect")]
     {
@@ -896,10 +944,19 @@ mod tests {
     #[cfg(feature = "gpu-detect")]
     #[test]
     fn smi_cuda_version_is_validated_not_a_raw_token() {
-        let Some(version) = cuda_version_from_smi() else {
-            eprintln!("SKIP: nvidia-smi unavailable or reported no CUDA version");
+        // The skip condition must be "nvidia-smi is absent", NOT "no version
+        // came back". Collapsing the two makes this test skip GREEN on exactly
+        // the bug it exists to guard: a present, working nvidia-smi whose
+        // version cannot be parsed is the reported defect, and an earlier
+        // version of this test reported that as a skip.
+        if trusted_command("nvidia-smi").is_none() {
+            eprintln!("SKIP: nvidia-smi is not installed on this host");
             return;
-        };
+        }
+        let version = cuda_version_from_smi().expect(
+            "nvidia-smi is present but no CUDA version could be parsed — that is the \
+             reported bug, not a reason to skip",
+        );
         // Must round-trip through the shared parser: anything the parser
         // rejects can no longer be produced here.
         assert!(
