@@ -1396,7 +1396,7 @@ _No always-required props._
 | `clearLabel` | `string | undefined` |  |
 | `defaultValue` | `string | undefined` |  |
 | `disabled` | `boolean | undefined` |  |
-| `emptyText` | `string | undefined` | What the list reads as when the filter matches nothing. Same defaulting rationale as `searchPlaceholder`; an empty popup is indistinguish… |
+| `emptyText` | `string | undefined` | What the list reads as when there is nothing to show — either the filter matched nothing (searchable arm) or the caller passed no options… |
 | `id` | `string | undefined` |  |
 | `invalid` | `boolean | undefined` |  |
 | `labelRender` | `((option: SelectOption | undefined) => ReactNode) | undefined` | Custom content for the selected value in the trigger. Receives the selected option (undefined if none). Overrides per-option `selectedLab… |
