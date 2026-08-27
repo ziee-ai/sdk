@@ -35,11 +35,15 @@ import { resolveGalleryConfig } from './lib/gallery-config.mjs'
 
 const LITERAL = /data-testid\s*[=:]\s*["']([^"']+)["']/g
 
+/** A CO-LOCATED test/story file: `Foo.test.tsx`, `foo.spec.ts`, `Bar.stories.tsx`. */
+export const isTestSourceFile = name => /\.(test|spec|stories)\.(tsx|ts|jsx)$/.test(name)
+
 /**
  * Recursively collect `.ts/.tsx/.jsx` source files under `dir`, skipping build/vcs
- * dirs, the `tests` tree, the dev-only gallery (`src/dev`), per-module `gallery.*`
- * seed files, and any `testIds.generated.ts` (so walking a package's own output
- * never feeds it back). Pure — exported for the unit test.
+ * dirs, the `tests` tree, CO-LOCATED `*.test|spec|stories.*` files, the dev-only
+ * gallery (`src/dev`), per-module `gallery.*` seed files, and any
+ * `testIds.generated.ts` (so walking a package's own output never feeds it back).
+ * Pure — exported for the unit test.
  */
 export function collectSourceFiles(dir, acc = []) {
   if (!fs.existsSync(dir)) return acc
@@ -63,7 +67,13 @@ export function collectSourceFiles(dir, acc = []) {
       // dialog's `testid:`); they must not expand the production registry.
       e !== 'gallery.tsx' &&
       e !== 'gallery.ts' &&
-      e !== 'testIds.generated.ts'
+      e !== 'testIds.generated.ts' &&
+      // The `tests` DIRECTORY was already skipped, but an app whose unit tests sit
+      // NEXT TO the component (vitest + testing-library house style) had every
+      // throwaway id its tests invent — `data-testid="a"`, `"b"`, `"x"` — promoted
+      // into the app's typed PRODUCTION registry. Same intent as the `tests` skip,
+      // applied to the layout that actually keeps tests beside the source.
+      !isTestSourceFile(e)
     )
       acc.push(full)
   }
