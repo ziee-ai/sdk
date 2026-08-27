@@ -20,8 +20,26 @@ import type {
  * route with an `<Outlet/>`).
  */
 export interface LayoutDefinition {
-  /** The layout component that wraps route content via `children`. */
-  component: ComponentType<{ children: ReactNode }>
+  /**
+   * Optional stable identity for this layout. Used as the React key of the
+   * layout's parent `<Route>` and as the diagnostic id when the layout fails to
+   * render. Without it the router assigns an ordinal keyed on the def OBJECT —
+   * correct either way; an `id` just makes the key readable in devtools and
+   * survives a module reload that rebuilds the object. It is NEVER derived from
+   * `component.name`: a `React.lazy` layout has no name, so name-keying
+   * collapsed every lazy layout onto one key.
+   */
+  id?: string
+  /**
+   * The layout component that wraps route content via `children`. May be a
+   * plain component, a `React.lazy` exotic, or a bare
+   * `() => import('./SiteLayout')` loader — the router owns the `<Suspense>`
+   * boundary for the two lazy forms.
+   */
+  component:
+    | ComponentType<{ children: ReactNode }>
+    | LazyExoticComponent<ComponentType<{ children: ReactNode }>>
+    | (() => Promise<{ default: ComponentType<{ children: ReactNode }> }>)
 }
 
 /**
