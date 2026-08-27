@@ -9,6 +9,10 @@
     ".": "./src/index.ts",
     "./*": "./src/*"
   },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node ../../scripts/run-node-tests.mjs --min 1"
+  },
   "peerDependencies": {
     "@ziee/framework": "*",
     "@ziee/kit": "*",
