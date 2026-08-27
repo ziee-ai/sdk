@@ -13,9 +13,10 @@
  * app-specific `@/*` alias (the SDK packages resolve each other through real npm
  * workspace links, so only relative specifiers need help).
  */
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, statSync, readFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, resolve as presolve } from 'node:path'
+import { createRequire } from 'node:module'
 
 const isFile = p => existsSync(p) && statSync(p).isFile()
 
@@ -30,4 +31,41 @@ export async function resolve(spec, ctx, next) {
     }
   }
   return next(spec, ctx)
+}
+
+/**
+ * `.tsx` half of the hook.
+ *
+ * `node --experimental-strip-types` erases TYPE syntax; it does not understand JSX. So
+ * until now NOTHING under `node --test` could import a `.tsx` source, which quietly
+ * fenced off every component in the SDK — `LazyRouteRenderer`, `LazyComponentRenderer`,
+ * `slots.tsx`, `RouterComponent` — from the only test runner the packages can actually
+ * run (vitest is referenced by the `test` scripts but declared by no package; it is
+ * supplied incidentally by whichever app hoists it, and a consumer that does not have it
+ * gets `Cannot find package 'vitest'`). A renderer bug was therefore only reachable by a
+ * consuming app's e2e, which is how the lazy-loader misdetection shipped.
+ *
+ * The transform uses the `typescript` compiler each package already declares as a
+ * devDependency — no new dependency, no bundler. Types are erased by `transpileModule`
+ * for `.tsx`, so the file is handed to Node as plain ESM and Node's own stripper never
+ * sees it.
+ */
+const require = createRequire(import.meta.url)
+let ts = null
+
+export async function load(url, ctx, next) {
+  if (!url.startsWith('file:') || !url.endsWith('.tsx')) return next(url, ctx)
+  if (!ts) ts = require('typescript')
+  const source = readFileSync(fileURLToPath(url), 'utf8')
+  const { outputText } = ts.transpileModule(source, {
+    fileName: fileURLToPath(url),
+    compilerOptions: {
+      target: ts.ScriptTarget.ESNext,
+      module: ts.ModuleKind.ESNext,
+      jsx: ts.JsxEmit.ReactJSX,
+      isolatedModules: true,
+      verbatimModuleSyntax: false,
+    },
+  })
+  return { format: 'module', source: outputText, shortCircuit: true }
 }

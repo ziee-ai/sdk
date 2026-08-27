@@ -25,9 +25,10 @@ function ConditionalComponent({
       <LazyComponentRenderer
         component={registration.component}
         fallback={null}
+        debugId={`module component '${registration.id}'`}
       />
     ),
-    [registration.component],
+    [registration.component, registration.id],
   )
 
   if (!shouldMount) {
