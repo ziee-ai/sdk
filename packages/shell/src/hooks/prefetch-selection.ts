@@ -1,3 +1,5 @@
+import { classifyComponentLike } from '@ziee/framework'
+
 /**
  * WHICH route chunks the idle prefetcher is allowed to warm.
  *
@@ -77,9 +79,23 @@ export function selectPrefetchRoutes({
   hasPermission,
 }: PrefetchSelectionInput): PrefetchRoute[] {
   return routes.filter(route => {
-    // Only dynamic-import loaders are prefetchable; an already-built element or
-    // a `React.lazy` exotic is not a function and has nothing to request.
+    // Only dynamic-import loaders are prefetchable; an already-built element, a
+    // `React.lazy` exotic and a `React.memo` exotic are not functions and have
+    // nothing to request.
     if (typeof route.element !== 'function') return false
+
+    // …and not every FUNCTION is a loader. Warming a route means CALLING its
+    // element, so a plain component here is invoked outside a render and throws
+    // React's *Invalid hook call* from inside an idle callback. The renderers
+    // already have to tell these apart (`@ziee/framework/lazy-component`), so
+    // ask them rather than guessing a second time. A props-taking function and a
+    // class component are settled NOT-loaders and are skipped outright; the one
+    // residual shape — a named 0-arg function with no `import(` in its source,
+    // which is a loader and a props-less component alike — is still attempted,
+    // because skipping it would silently disable prefetch for a real loader
+    // built by a helper. The caller invokes it defensively.
+    const { kind, ambiguous } = classifyComponentLike(route.element)
+    if (kind !== 'loader' && !(kind === 'component' && ambiguous)) return false
 
     if (!isAuthed) {
       // Behind the router's auth guard — unreachable, so not worth a request.

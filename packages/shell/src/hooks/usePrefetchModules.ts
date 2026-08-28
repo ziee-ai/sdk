@@ -51,7 +51,26 @@ export function usePrefetchModules() {
           hasPermissionNow(permission as PermissionExpr),
       })
       for (const route of selected) {
-        ;(route.element as () => Promise<unknown>)()
+        // Defensive: `selectPrefetchRoutes` still admits the one shape it cannot
+        // tell apart from a props-less component. Calling one of those invokes a
+        // component outside a render, and an uncaught throw here would surface
+        // as an unhandled error from an idle callback with nothing pointing at
+        // the prefetcher.
+        try {
+          const started = (route.element as () => unknown)()
+          if (
+            started !== null &&
+            typeof started === 'object' &&
+            typeof (started as { then?: unknown; catch?: unknown }).catch ===
+              'function'
+          ) {
+            // A rejected chunk load is the network's problem, not a page error;
+            // navigation will retry it and surface it in a boundary that can.
+            ;(started as Promise<unknown>).catch(() => {})
+          }
+        } catch {
+          // Prefetch is best-effort by definition.
+        }
       }
     }
 
