@@ -59,6 +59,10 @@ const LAZY_LOADER_MARK = Symbol.for('ziee.framework.lazyLoader')
 /** React's own tag for a `React.lazy(...)` exotic component. */
 const REACT_LAZY = Symbol.for('react.lazy')
 
+/** `React.memo(...)` — an EXOTIC OBJECT, not a function. It holds the wrapped
+ *  type in `.type`, which may itself be a lazy exotic (`memo(lazy(...))`). */
+const REACT_MEMO = Symbol.for('react.memo')
+
 /**
  * `import(` as SYNTAX. Deliberately not anchored to a specific bundler's helper
  * (`__vitePreload(() => import("./x-a1b2.js"))` matches just as well as the
@@ -126,18 +130,43 @@ export function classifyComponentLike(value: unknown): Classification {
     return { kind: 'element', reason: 'isValidElement', ambiguous: false }
   }
 
-  if (
-    value !== null &&
-    typeof value === 'object' &&
-    (value as { $$typeof?: symbol }).$$typeof === REACT_LAZY
-  ) {
-    return { kind: 'react-lazy', reason: '$$typeof === react.lazy', ambiguous: false }
+  // ── React EXOTIC components are objects, not functions ────────────────────
+  // `React.memo(...)`, `React.forwardRef(...)`, `React.lazy(...)`, a context
+  // Provider — every one of them is a plain object carrying a `$$typeof`
+  // symbol, and every one of them is a legitimate element TYPE that React
+  // renders. Falling through to the `typeof value !== 'function'` arm below
+  // would classify all of them `invalid` and render NOTHING — reintroducing,
+  // for exotics, the exact silent-empty-region failure this module exists to
+  // end. (The pre-fix renderers got these right by accident: they only special-
+  // cased functions and handed everything else straight to `createElement`.)
+  const exoticTag =
+    value !== null && typeof value === 'object'
+      ? (value as { $$typeof?: symbol }).$$typeof
+      : undefined
+
+  if (typeof exoticTag === 'symbol') {
+    if (exoticTag === REACT_LAZY) {
+      return { kind: 'react-lazy', reason: '$$typeof === react.lazy', ambiguous: false }
+    }
+    // `memo(lazy(...))` still suspends, so it still needs the boundary; the
+    // wrapped type is reachable through `.type`.
+    if (
+      exoticTag === REACT_MEMO &&
+      (value as { type?: { $$typeof?: symbol } }).type?.$$typeof === REACT_LAZY
+    ) {
+      return { kind: 'react-lazy', reason: '$$typeof === react.memo wrapping react.lazy', ambiguous: false }
+    }
+    return {
+      kind: 'component',
+      reason: `React exotic component ($$typeof === ${String(exoticTag.description ?? exoticTag)})`,
+      ambiguous: false,
+    }
   }
 
   if (typeof value !== 'function') {
     return {
       kind: 'invalid',
-      reason: `not a function, element, or React.lazy (got ${value === null ? 'null' : typeof value})`,
+      reason: `not a function, element, or React component type (got ${value === null ? 'null' : typeof value})`,
       ambiguous: false,
     }
   }

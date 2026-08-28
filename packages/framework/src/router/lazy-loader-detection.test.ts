@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { Component, Suspense, createElement as h, lazy } from 'react'
+import { Component, Suspense, createElement as h, forwardRef, lazy, memo } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { LazyRouteRenderer } from './LazyRouteRenderer.tsx'
 import {
@@ -208,4 +208,81 @@ test('GAP-7: an unrenderable value names the slot instead of rendering nothing q
   } finally {
     console.error = realError
   }
+})
+
+// ── React EXOTIC component types (review follow-up to the fix above) ────────
+//
+// `React.memo(...)` / `React.forwardRef(...)` are OBJECTS carrying a `$$typeof`
+// symbol, not functions. The first cut of the shape classifier tested for
+// `react.lazy` and then fell through to `typeof value !== 'function' →
+// 'invalid'`, so a memo'd or ref-forwarding slot entry rendered NOTHING and
+// logged an "not renderable" diagnostic — the same silent-empty-region class of
+// failure this module exists to end, reintroduced for exotics. The pre-fix
+// renderers got these right by accident (they only special-cased functions).
+
+test('a React.memo component is a renderable type, not an "invalid" value', () => {
+  const Memo = memo(function Inner() {
+    return h('p', null, 'MEMO')
+  })
+  const c = classifyComponentLike(Memo)
+  assert.equal(c.kind, 'component', `memo exotic classified ${c.kind} (${c.reason})`)
+  assert.match(
+    renderToStaticMarkup(h(LazyRouteRenderer, { component: Memo as never })),
+    /MEMO/,
+  )
+})
+
+test('a React.forwardRef component is a renderable type, not an "invalid" value', () => {
+  const Fwd = forwardRef(function Inner() {
+    return h('p', null, 'FWD')
+  })
+  const c = classifyComponentLike(Fwd)
+  assert.equal(c.kind, 'component', `forwardRef exotic classified ${c.kind} (${c.reason})`)
+  assert.match(
+    renderToStaticMarkup(h(LazyRouteRenderer, { component: Fwd as never })),
+    /FWD/,
+  )
+})
+
+test('memo(lazy(...)) still suspends, so it still gets the renderer-owned boundary', () => {
+  const MemoLazy = memo(lazy(() => import('./__test-fixtures__/LazyPage.tsx')))
+  assert.equal(classifyComponentLike(MemoLazy).kind, 'react-lazy')
+  assert.equal(
+    renderToStaticMarkup(
+      h(
+        Suspense,
+        { fallback: APP_FALLBACK },
+        h(LazyRouteRenderer, { component: MemoLazy as never, fallback: ROUTE_FALLBACK }),
+      ),
+    ),
+    ROUTE_FALLBACK,
+  )
+})
+
+// ── The ambiguous-component tripwire must not merge two components' fibers ──
+
+test('two different ambiguous components never share one fiber (identity key)', () => {
+  // Both are named 0-arg functions with no `import(` in their source, so both
+  // take the `ambiguous` path through the shared tripwire component. Rendering
+  // them under one type WITHOUT a key would reconcile the second into the
+  // first's fiber and carry its hook state across.
+  function First() {
+    return h('p', null, 'FIRST')
+  }
+  function Second() {
+    return h('p', null, 'SECOND')
+  }
+  assert.equal(classifyComponentLike(First).ambiguous, true, 'precondition: ambiguous')
+  assert.equal(classifyComponentLike(Second).ambiguous, true, 'precondition: ambiguous')
+
+  const markup = renderToStaticMarkup(
+    h(
+      'div',
+      null,
+      h(LazyRouteRenderer, { component: First as never }),
+      h(LazyRouteRenderer, { component: Second as never }),
+    ),
+  )
+  assert.match(markup, /FIRST/)
+  assert.match(markup, /SECOND/)
 })
