@@ -27,7 +27,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveGalleryConfig } from './lib/gallery-config.mjs'
+import { resolveGalleryConfig, resolveVisualTier } from './lib/gallery-config.mjs'
 import {
   resolveGalleryPort,
   pickBindablePort,
@@ -171,20 +171,21 @@ async function main() {
     )
 
     // 4. visual layer (Layer A always; Layer B when VISUAL_SNAPSHOTS) ----------
+    const tier = resolveVisualTier(CFG, { snapshots: !!process.env.VISUAL_SNAPSHOTS })
     if (SKIP_VISUAL) {
       step('visual', true, 'skipped (--skip-visual)')
+    } else if (!tier.enabled) {
+      // A DECLARED-absent visual tier is a skip, not a failure. Interpolating a
+      // null `visualConfig` into the argv used to hand playwright `-c null`,
+      // which died on `<uiRoot>/null does not exist` and failed the gate for an
+      // app whose config had said, in the config's own vocabulary, that it has
+      // no pixel tier yet.
+      step('visual', true, `skipped (${tier.reason})`)
     } else {
       console.log('• visual layer (layout + axe + regression) …')
       const vis = run(
         'npx',
-        [
-          'playwright',
-          'test',
-          '-c',
-          CFG.visualConfig,
-          ...CFG.visualSpecs,
-          ...(process.env.VISUAL_SNAPSHOTS ? CFG.visualSnapshotSpecs : []),
-        ],
+        ['playwright', 'test', '-c', tier.config, ...tier.specs],
         { env: { ...process.env, GALLERY_PORT: String(PORT) } },
       )
       const passed = (vis.out.match(/(\d+) passed/) || [])[1]
