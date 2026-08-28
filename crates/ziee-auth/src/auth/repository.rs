@@ -91,9 +91,17 @@ impl AuthRepository {
             .map_err(AppError::database_error)?;
         }
 
+        // Fire the injectable user-created hook INSIDE this transaction (gap
+        // G-AUTHEVT): a consumer's co-transaction (e.g. provisioning the user's
+        // personal account) is atomic with the user row — a hook error rolls the
+        // whole creation back. No hook installed → no-op (backward compatible).
+        crate::user::hook::fire_user_created(&user, &mut tx).await?;
+
         tx.commit().await.map_err(AppError::database_error)?;
         Ok(user)
     }
+    // NOTE: `&mut tx` above coerces to `&mut PgConnection` via `DerefMut` on
+    // `Transaction`; the hook runs on the transaction's own connection.
 
     /// Find user auth link by provider and external ID
     pub async fn find_user_by_auth_link(
@@ -370,14 +378,20 @@ impl AuthRepository {
         let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
         let new_user_id = Uuid::new_v4();
 
-        sqlx::query!(
+        // RETURNING the full row so the user-created hook receives a real `User`
+        // (gap G-AUTHEVT); the public return type stays `Uuid`.
+        let user = sqlx::query_as!(
+            User,
             r#"
             INSERT INTO users (id, username, email, email_verified, display_name, is_active, is_admin, created_at, updated_at)
             VALUES ($1, $2, $3, $4, $5, true, false, NOW(), NOW())
+            RETURNING id, username, email, email_verified, password_hash, display_name,
+                      avatar_url, is_active, is_admin, permissions,
+                      created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             "#,
             new_user_id, username, email, email_verified, display_name,
         )
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(AppError::database_error)?;
 
@@ -409,6 +423,10 @@ impl AuthRepository {
             .await
             .map_err(AppError::database_error)?;
         }
+
+        // In-transaction user-created hook (gap G-AUTHEVT) — covers the OAuth
+        // first-login creation path. Hook error → rollback → no user.
+        crate::user::hook::fire_user_created(&user, &mut tx).await?;
 
         tx.commit().await.map_err(AppError::database_error)?;
         Ok(new_user_id)
@@ -515,20 +533,32 @@ impl AuthRepository {
     ) -> Result<Uuid, AppError> {
         let new_user_id = Uuid::new_v4();
 
-        sqlx::query!(
+        // A transaction (was a single pool write) so the in-transaction
+        // user-created hook (gap G-AUTHEVT) is atomic with the insert. RETURNING
+        // the full row so the hook receives a real `User`; return type stays `Uuid`.
+        let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
+
+        let user = sqlx::query_as!(
+            User,
             r#"
             INSERT INTO users (id, username, email, display_name, is_active, is_admin, created_at, updated_at)
             VALUES ($1, $2, $3, $4, true, false, NOW(), NOW())
+            RETURNING id, username, email, email_verified, password_hash, display_name,
+                      avatar_url, is_active, is_admin, permissions,
+                      created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             "#,
             new_user_id,
             username,
             email,
             display_name
         )
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(AppError::database_error)?;
 
+        crate::user::hook::fire_user_created(&user, &mut tx).await?;
+
+        tx.commit().await.map_err(AppError::database_error)?;
         Ok(new_user_id)
     }
 
@@ -549,17 +579,23 @@ impl AuthRepository {
         let user_id = Uuid::new_v4();
         let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
 
-        sqlx::query!(
+        // RETURNING the full row so the user-created hook receives a real `User`
+        // (gap G-AUTHEVT); the public return type stays `Uuid`.
+        let user = sqlx::query_as!(
+            User,
             r#"
             INSERT INTO users (id, username, email, display_name, is_active, is_admin, created_at, updated_at)
             VALUES ($1, $2, $3, $4, true, false, NOW(), NOW())
+            RETURNING id, username, email, email_verified, password_hash, display_name,
+                      avatar_url, is_active, is_admin, permissions,
+                      created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             "#,
             user_id,
             username,
             email,
             display_name
         )
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(AppError::database_error)?;
 
@@ -595,6 +631,10 @@ impl AuthRepository {
             .await
             .map_err(AppError::database_error)?;
         }
+
+        // In-transaction user-created hook (gap G-AUTHEVT) — covers the LDAP
+        // first-login creation path. Hook error → rollback → no user.
+        crate::user::hook::fire_user_created(&user, &mut tx).await?;
 
         tx.commit().await.map_err(AppError::database_error)?;
         Ok(user_id)

@@ -226,7 +226,14 @@ impl UserRepository {
         display_name: Option<String>,
         permissions: Option<Vec<String>>,
     ) -> Result<User, AppError> {
-        sqlx::query_as!(
+        // A transaction (was a single pool write) so the in-transaction
+        // user-created hook (gap G-AUTHEVT) is atomic with the insert. This is
+        // the admin-create + first-run/setup path (the app's user handlers call
+        // it), so firing here — not only in the auth handlers — is what gives the
+        // hook full creation-path coverage. Hook error → rollback → no user.
+        let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
+
+        let user = sqlx::query_as!(
             User,
             r#"
             INSERT INTO users (username, email, password_hash, display_name, permissions)
@@ -241,7 +248,7 @@ impl UserRepository {
             display_name,
             permissions.as_deref().unwrap_or(&[])
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             // A duplicate username/email racing past the handler's pre-check
@@ -252,7 +259,12 @@ impl UserRepository {
                 return AppError::conflict("Username or email");
             }
             AppError::database_error(e)
-        })
+        })?;
+
+        crate::user::hook::fire_user_created(&user, &mut tx).await?;
+
+        tx.commit().await.map_err(AppError::database_error)?;
+        Ok(user)
     }
 
     pub async fn has_admin(&self) -> Result<bool, AppError> {

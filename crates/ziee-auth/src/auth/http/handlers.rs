@@ -394,7 +394,8 @@ async fn login_with_provider(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         // Fetch the newly created user
-        ctx.user()
+        let created = ctx
+            .user()
             .get_by_id(new_user_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -403,7 +404,14 @@ async fn login_with_provider(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     AppError::internal_error("Failed to fetch newly created user"),
                 )
-            })?
+            })?;
+
+        // Emit UserCreated — the LDAP/external first-login creation path used to
+        // drop this event, firing only on local register (gap G-AUTHEVT).
+        ctx.events.emit_user(UserEvent::Created {
+            user: created.clone(),
+        });
+        created
     };
 
     // Check if user is active
@@ -1530,7 +1538,8 @@ async fn oauth_complete_inner(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let user = ctx.user()
+    let user = ctx
+        .user()
         .get_by_id(new_user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -1540,6 +1549,11 @@ async fn oauth_complete_inner(
                 AppError::internal_error("Failed to fetch newly created user"),
             )
         })?;
+
+    // Emit UserCreated — the OAuth first-login creation path used to drop this
+    // event, firing only on local register (gap G-AUTHEVT).
+    ctx.events
+        .emit_user(UserEvent::Created { user: user.clone() });
 
     let minted =
         mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)

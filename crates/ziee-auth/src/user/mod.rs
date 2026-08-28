@@ -7,6 +7,7 @@
 //! skill/file/hub cleanup) and consumes this crate via re-export shims.
 
 pub mod events;
+pub mod hook;
 pub mod permissions;
 pub mod repository;
 pub mod service;
@@ -16,5 +17,8 @@ pub mod types;
 // live at the crate root (`models.rs`); re-export them here so the app shim
 // `pub use ziee_auth::user::*` keeps `crate::modules::user::{User, Group}`.
 pub use crate::{Group, User};
+pub use hook::{
+    NoopUserCreatedHook, UserCreatedHook, install_user_created_hook, user_created_hook,
+};
 pub use repository::{GroupRepository, UserRepository};
 pub use service::UserService;
