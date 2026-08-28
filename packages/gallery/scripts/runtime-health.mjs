@@ -37,11 +37,41 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { enumerateSurfaces } from './lib/gallery-surfaces.mjs'
 import { resolveGalleryConfig } from './lib/gallery-config.mjs'
-import { resolveGalleryPort } from './lib/run-key.mjs'
+import { resolveGalleryPort, resolveWorktreeRoot } from './lib/run-key.mjs'
+import { withHostLock } from './lib/host-lock.mjs'
+import {
+  classifyAll,
+  classifyConsoleMessage,
+  errSeverity,
+} from './lib/finding-classify.mjs'
+import {
+  assessRun,
+  clearRunArtifacts,
+  newRunId,
+  originAlive,
+  watchOrigin,
+  writeRunManifest,
+} from './lib/run-validity.mjs'
 
 // Config-driven anchors (was `../src/dev/gallery` + `runtime-baseline.js` +
 // port 1420 hardcodes). Resolved from `gallery.config.json` in the app's cwd.
 const CFG = resolveGalleryConfig()
+// These scripts are SHARED by several app workspaces and are addressed by a long
+// relative path (`node ../../../sdk/packages/gallery/scripts/…`), so running them
+// from the wrong cwd is easy. Without a config file every anchor silently falls
+// back to the WEB defaults — including `portWhich`, which would point a desktop
+// run at the web gallery's port and let it be accepted as "ours". A bad PORT
+// already fails loudly two lines away; a missing config must too.
+if (!fs.existsSync(CFG.__configPath)) {
+  console.error(
+    `runtime-health: refusing to run — no gallery.config.json at ${CFG.__configPath}.\n` +
+      `  These scripts read their anchors (galleryDir, portWhich, galleryUrl, …) from the\n` +
+      `  APP's config, so cwd must be the app's ui/ directory — the one whose\n` +
+      `  gallery.config.json you mean. Running elsewhere would silently use another\n` +
+      `  app's defaults (including portWhich, i.e. another gallery's port).`,
+  )
+  process.exit(2)
+}
 const GALLERY_DIR = path.resolve(CFG.__cwd, CFG.galleryDir)
 
 // The app's baselined-findings module (content) is injected via config; default
@@ -112,88 +142,6 @@ const IGNORE_REQUEST = [
   /@vite\/client/i,
   /@react-refresh/i,
 ]
-const REACT_WARNING = [
-  /^Warning:/,
-  /unique "key" prop/i,
-  /not wrapped in act/i,
-  /is deprecated/i,
-  /Each child in a list/i,
-  /cannot appear as a descendant/i,
-  /findDOMNode/i,
-]
-
-/**
- * HARNESS-NOISE classifier — documented, NARROW patterns for console/request
- * findings that are gallery-harness / dev-server / mock-cassette artifacts, NOT
- * product defects. These are subtracted from the gating HIGH total (exactly like
- * the runtime-baseline) but STILL EMITTED to the JSONL and listed in a dedicated
- * rollup section — so the filter is fully auditable, never a silent mute.
- *
- * This is deliberately a SHORT allowlist, not a blanket. Anything that does NOT
- * match one of these — a real React hydration/DOM-nesting error, a thrown app
- * TypeError, an ErrorBoundary `crash` (which is NEVER muted here, regardless of
- * trigger), a genuine broken PRODUCT fetch — still gates.
- *
- * Rationale per class (from the R3 runtime triage — see fix/runtime-triage):
- *  • Browser "Failed to load resource: the server responded with a status of N"
- *    — the console-channel MIRROR of an HTTP status, carrying no app stack. In
- *    the gallery every /api response is the mock cassette's deliberate output
- *    (the `error` state injects 500/403 on purpose). This is the request/HTTP
- *    layer, not application logic — the console twin of `request-failed`.
- *  • "Gallery forced error" — the cassette's own reject() sentinel that
- *    `*-err` / error-state surfaces use to exercise error UI, by design.
- *  • FileStore `…text is not a function` — the gallery mock returns a plain
- *    object for a file body, so File.store's `.text()` throws; production
- *    returns a real Blob. A mock-FIXTURE shape gap, not a product bug.
- *  • Vite dev-asset request failures — a full reload aborts in-flight ESM /
- *    font imports (`/@fs/…/node_modules/katex/…woff2 — net::ERR_ABORTED`).
- *    Dev-server transport, never a product fetch (product data goes to /api,
- *    which the mock intercepts before the network).
- */
-const HARNESS_CONSOLE = [
-  /^Failed to load resource: the server responded with a status of/i,
-  /Gallery forced error/i,
-  /\[FileStore\] Failed to load file text content:.*\.text is not a function/i,
-]
-/** A failed request to a Vite-served dev asset (source module, /@-internal,
- *  node_modules font/chunk) — dev-transport noise, never a product fetch. */
-const isViteDevAsset = url =>
-  /\/@(fs|id|vite|react-refresh)\b/.test(url) ||
-  /\/node_modules\//.test(url) ||
-  /\/(src|modules|core|api-client|dev|components|hooks|widgets|stores|events|utils|assets)\/[^?]*\.(tsx?|jsx?|mjs|css)(\?|$)/.test(
-    url,
-  )
-/**
- * True when a HIGH finding is documented gallery-harness noise (subtracted from
- * gating, but kept visible). A `crash` (ErrorBoundary) is intentionally excluded
- * — a render crash gates no matter what triggered it.
- */
-function isHarnessNoise(f) {
-  const d = f.detail || ''
-  if (f.category === 'console-error' && matchesAny(d, HARNESS_CONSOLE)) return true
-  if (f.category === 'request-failed') {
-    const m = /(?:GET|POST|PUT|DELETE|PATCH|HEAD)\s+(\S+)/.exec(d)
-    return isViteDevAsset(m ? m[1] : d)
-  }
-  return false
-}
-
-// An ErrorBoundary catch is a genuine render CRASH in ANY state (the surface
-// failed to render, incl. its error UI) — always HIGH.
-const ERRORBOUNDARY = /\[AppErrorBoundary/
-
-/**
- * Severity of a raw console-error / uncaught exception, given the state it fired
- * in. The `error` state DELIBERATELY makes the mock API return 500s to exercise
- * each surface's failure handling, so a store logging / rethrowing that injected
- * failure is EXPECTED there — MEDIUM (the tracked "error-handling gap" backlog),
- * not a gating defect. An ErrorBoundary crash is HIGH regardless. In every other
- * state a console-error / pageerror is an unexpected runtime defect → HIGH.
- */
-function errSeverity(state, text) {
-  if (ERRORBOUNDARY.test(text)) return 'HIGH'
-  return state === 'error' ? 'MEDIUM' : 'HIGH'
-}
 
 const matchesAny = (s, list) => list.some(re => re.test(s))
 
@@ -438,6 +386,22 @@ function inPageAudit() {
 
 // ---------------------------------------------------------------------------
 async function main() {
+  const startedAtMs = Date.now()
+  const RUN_ID = process.env.GALLERY_RUN_ID || newRunId()
+  // Clear any PRIOR run's artifacts up front, so a crawl that dies mid-flight
+  // leaves NOTHING to inherit. (gate-ui does the same before spawning us; doing
+  // it here too covers the standalone `npm run gallery:runtime` path.)
+  clearRunArtifacts(OUT)
+
+  // The origin must be reachable BEFORE we spend ~12 minutes auditing it.
+  if (!(await originAlive(BASE))) {
+    console.error(
+      `runtime-health: refusing to run — the gallery origin ${BASE} is not answering. ` +
+        `Every request would fail and the findings would describe the harness, not the product.`,
+    )
+    process.exit(2)
+  }
+
   const browser = await chromium.launch()
 
   // 1. Enumerate EVERY surface class from the single source (browse render).
@@ -502,18 +466,12 @@ async function main() {
     typeof d === 'string'
       ? d.replace(/localhost:\d+/g, 'localhost').replace(/\?t=\d+/g, '')
       : d
+  // Findings are recorded RAW here; `baselined` / `harness` are stamped once by
+  // classifyAll() after the crawl, because the crash arm needs to know what else
+  // the same cell saw (see classifyAll).
   const record = (cell, theme, f) => {
     if (f.detail) f.detail = normalizeDetail(f.detail)
-    const finding = { ...cell, theme, ...f }
-    // A documented pre-existing item (runtime-baseline.js) is still emitted, but
-    // flagged so it does NOT count toward the gating HIGH total.
-    if (finding.severity === 'HIGH' && isRuntimeBaselined(finding))
-      finding.baselined = true
-    // Documented gallery-harness noise (mock-cassette / dev-server artifacts) —
-    // also emitted + visible, also subtracted from gating. Never masks a crash.
-    else if (finding.severity === 'HIGH' && isHarnessNoise(finding))
-      finding.harness = true
-    findings.push(finding)
+    findings.push({ ...cell, theme, ...f })
   }
 
   // Flatten to (cell, theme) jobs, then drain with a fixed-size worker pool —
@@ -529,23 +487,21 @@ async function main() {
     p.on('console', m => {
       const t = m.text()
       if (matchesAny(t, IGNORE_CONSOLE)) return
-      if (m.type() === 'error')
-        record(cell, theme, {
-          category: ERRORBOUNDARY.test(t) ? 'crash' : 'console-error',
-          severity: errSeverity(cell.state, t),
-          selector: null,
-          detail: t.replace(/\s+/g, ' ').slice(0, 300),
-        })
-      else if (
-        (m.type() === 'warning' || m.type() === 'warn') &&
-        matchesAny(t, REACT_WARNING)
-      )
-        record(cell, theme, {
-          category: 'react-warning',
-          severity: 'MEDIUM',
-          selector: null,
-          detail: t.replace(/\s+/g, ' ').slice(0, 300),
-        })
+      // Channel-INDEPENDENT classification (shared, single-sourced). React 19
+      // emits developer warnings on console.error; deciding severity from the
+      // channel recorded every React warning as a gating HIGH against the
+      // harness's own MEDIUM taxonomy.
+      const c = classifyConsoleMessage(m.type(), cell.state, t)
+      if (!c) return
+      record(cell, theme, {
+        category: c.category,
+        severity: c.severity,
+        selector: null,
+        // Chromium's transport-mirror console message does NOT name the
+        // resource in its text — the URL is only on the message's location.
+        resourceUrl: m.location?.()?.url || null,
+        detail: t.replace(/\s+/g, ' ').slice(0, 300),
+      })
     })
     p.on('pageerror', e => {
       const msg = (e.message || String(e)).replace(/\s+/g, ' ').slice(0, 300)
@@ -595,6 +551,13 @@ async function main() {
       console.log(`  … ${done}/${total} cells`)
   }
 
+  // Watch the origin FOR THE DURATION of the crawl. A server that dies partway
+  // through (a concurrent run winning a port race, a `pkill -f vite`, a crash)
+  // makes every subsequent cell fail at the transport layer — which previously
+  // read as thousands of product defects. Sampling tells that apart from the
+  // product genuinely breaking.
+  const originWatch = watchOrigin(BASE)
+
   // Fixed-size pool: N long-lived workers each pull the next job off the queue.
   let next = 0
   const worker = async () => {
@@ -606,7 +569,19 @@ async function main() {
   await Promise.all(
     Array.from({ length: Math.min(CONCURRENCY, jobs.length) }, worker),
   )
+  const origin = originWatch.stop()
   await browser.close()
+
+  // Stamp baselined/harness ONCE, now that every cell is complete.
+  classifyAll(findings, isRuntimeBaselined)
+
+  // Is this run's output allowed to be believed at all?
+  const validity = assessRun({
+    findings,
+    origin,
+    cellsPlanned: total,
+    cellsCompleted: done,
+  })
 
   // 3. Write the outputs.
   fs.mkdirSync(OUT, { recursive: true })
@@ -644,6 +619,20 @@ async function main() {
 
   const md = []
   md.push('# Runtime-health findings\n')
+  // The VOID banner goes FIRST, before any finding table. A void run's numbers
+  // describe the harness, not the product; publishing them under a
+  // "gate-failing surfaces" heading with no marker is how a contaminated run
+  // gets read as a UI regression (it cost several investigations).
+  if (validity.void) {
+    md.push('> ## ⚠️ THIS RUN IS **VOID** — do not read the findings below as product verdicts\n>')
+    for (const r of validity.reasons) md.push(`> - ${r}`)
+    md.push('>\n> Re-run once the gallery origin is stable.\n')
+  }
+  md.push(
+    `_Validity: ${done}/${total} cells · origin ${origin.everDown ? '**WENT DOWN**' : 'alive'} ` +
+      `(${origin.checks} probes) · transport artifacts ${validity.contamination.total} ` +
+      `(${validity.contamination.pct}% of findings) · runId \`${RUN_ID}\`._\n`,
+  )
   md.push(
     `Generated by \`npm run gallery:runtime\` over ${cells.length} surface/state cells × ${THEMES.length} themes (${cells.length * THEMES.length} page loads). Each cell is a full reload of \`?surface=&state=&theme=\`; the browser's own diagnostics (console/pageerror/requestfailed) plus getComputedStyle contrast + a11y-name + 4px-grid checks are captured per cell.\n`,
   )
@@ -751,6 +740,28 @@ async function main() {
   const mdPath = path.join(OUT, 'RUNTIME_FINDINGS.md')
   fs.writeFileSync(mdPath, md.join('\n'))
 
+  // The run manifest — written ATOMICALLY and only HERE, after the crawl has
+  // drained and its output is on disk. A killed run leaves no manifest, which is
+  // what lets gate-ui tell "this run produced nothing" from "a previous run
+  // produced this" (INV-4). It carries its own validity verdict so a consumer
+  // cannot roll up a VOID run's findings as product verdicts.
+  writeRunManifest(OUT, {
+    runId: RUN_ID,
+    startedAt: new Date(startedAtMs).toISOString(),
+    finishedAt: new Date().toISOString(),
+    cellsPlanned: total,
+    cellsCompleted: done,
+    complete: done === total,
+    themes: THEMES,
+    findings: findings.length,
+    gatingHigh,
+    originEverDown: origin.everDown,
+    originChecks: origin.checks,
+    contamination: validity.contamination,
+    void: validity.void,
+    voidReasons: validity.reasons,
+  })
+
   console.log(
     `\n=== runtime-health: ${findings.length} findings (HIGH ${gatingHigh} gating${harnessCount ? ` + ${harnessCount} harness-noise` : ''}${baselinedCount ? ` + ${baselinedCount} baselined` : ''} / MEDIUM ${bySev.MEDIUM} / LOW ${bySev.LOW}) ===`,
   )
@@ -758,14 +769,42 @@ async function main() {
     console.log(
       `  (harness-noise muted: ${Object.entries(harnessByCat).map(([c, n]) => `${c} ${n}`).join(', ')})`,
     )
+  // VALIDITY line — always printed, healthy or not, so "was this run even able
+  // to observe the product?" is answered in the output instead of being
+  // something a reader has to think to ask.
+  console.log(
+    `  validity: ${done}/${total} cells · origin ${origin.everDown ? 'WENT DOWN' : 'alive'} (${origin.checks} checks) · ` +
+      `transport artifacts ${validity.contamination.total} (${validity.contamination.pct}% of findings)`,
+  )
   console.log(`  ${failingSurfaces.length} surface(s) with gating HIGH findings`)
   console.log(`  → ${path.relative(process.cwd(), mdPath)}`)
   console.log(`  → ${path.relative(process.cwd(), jsonlPath)}`)
 
+  if (validity.void) {
+    // A VOID run is NOT a product verdict, and it is NOT silently downgraded to
+    // a pass either. It fails loudly, naming why, in BOTH modes — `--report-only`
+    // suppresses gating on FINDINGS, never on the run being unmeasurable.
+    console.error('\n❌ RUN VOID — these findings do not describe the product:')
+    for (const r of validity.reasons) console.error(`   · ${r}`)
+    console.error(
+      '   Re-run when the gallery origin is stable. If another gate:ui was running ' +
+        'concurrently, the host lock now serializes them — check that it is not disabled.',
+    )
+    process.exitCode = 2
+    return
+  }
+
   if (!REPORT_ONLY && gatingHigh > 0) process.exitCode = 1
 }
 
-main().catch(e => {
+// The crawl holds the HOST lock: two concurrent crawls on one machine can take
+// each other's dev server away mid-run, which is the proven cause of the mass
+// transport contamination (see lib/run-validity.mjs). A child spawned by gate-ui
+// inherits the parent's token and does not re-contend.
+withHostLock(
+  { owner: resolveWorktreeRoot(CFG.__cwd), log: m => console.log(m) },
+  () => main(),
+).catch(e => {
   console.error(e)
   process.exit(2)
 })

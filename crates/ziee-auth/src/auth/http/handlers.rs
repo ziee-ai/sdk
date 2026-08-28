@@ -837,6 +837,15 @@ pub async fn update_profile<R: IdentityResolver<User = User, Group = Group>>(
         if t.is_empty() { None } else { Some(t) }
     });
 
+    // Bound + charset gate on the trimmed value. This path previously had NO
+    // display_name validation at all, so a 256-character name overflowed the
+    // varchar(255) column and a name containing U+0000 could not be stored at
+    // all — both reached the client as a generic 500 SYSTEM_DATABASE_ERROR.
+    // Validated AFTER trimming so the bound applies to what is actually stored.
+    if let Some(ref d) = display_name {
+        crate::auth::username::validate_display_name(d).map_err(AppError::to_api_error)?;
+    }
+
     // Username uniqueness friendly pre-check: only a *different* user
     // holding the name is a conflict — re-submitting your own current
     // username is a no-op. The DB UNIQUE constraint (mapped to 409 inside
@@ -883,7 +892,9 @@ pub fn update_profile_docs(op: TransformOperation) -> TransformOperation {
         .tag("auth")
         .response::<200, Json<User>>()
         .response_with::<409, (), _>(|r| r.description("Username already taken"))
-        .response_with::<400, (), _>(|r| r.description("Username is empty"))
+        .response_with::<400, (), _>(|r| {
+            r.description("Username or display name failed validation")
+        })
 }
 
 /// POST /api/auth/password

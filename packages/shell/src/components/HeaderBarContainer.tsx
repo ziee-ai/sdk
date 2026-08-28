@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { appLayoutSeam } from '../app-store-seams'
+import { appLayoutChrome } from '../app-store-seams'
 import { cn } from '@ziee/kit/lib/utils'
 import { useHeaderLeftInset } from '../hooks/useHeaderLeftInset'
 
@@ -9,11 +9,6 @@ import { useHeaderLeftInset } from '../hooks/useHeaderLeftInset'
  * proxy, so `nativeScroll` stays reactive. Mirrors the AppLayout / DivScrollY
  * seams.
  */
-interface HeaderBarSeam {
-  nativeScroll: boolean
-  setHeaderHidden: (hidden: boolean) => void
-}
-
 interface HeaderBarContainerProps {
   children?: React.ReactNode
   className?: string
@@ -38,10 +33,7 @@ export const HeaderBarContainer = ({
   // overlay, a layout-less route). `nativeScroll` is an opt-in mobile flag, so
   // fall back to a plain (non-native-scroll) header + no-op hide rather than
   // throwing.
-  const appLayout = (appLayoutSeam.peek() as HeaderBarSeam | null) ?? {
-    nativeScroll: false,
-    setHeaderHidden: () => {},
-  }
+  const appLayout = appLayoutChrome()
   const { nativeScroll } = appLayout
   const headerLeftInset = useHeaderLeftInset()
 
