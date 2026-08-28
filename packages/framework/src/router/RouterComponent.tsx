@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom
 import { ModuleSystem } from '../stores'
 import { routesSeam } from '../app-seam'
 import { LazyRouteRenderer } from './LazyRouteRenderer'
+import { LayoutRouteElement, layoutRouteKey } from './layout-route'
 import { getRouterConfig } from './config'
 import type { LayoutDefinition, RouteConfig } from './types'
 
@@ -47,7 +48,7 @@ function renderRouteElement(route: RouteConfig): ReactNode {
 
 export function RouterComponent() {
   const { routes } = routesSeam.get() as { routes: RouteConfig[] }
-  const { loginPath, homePath } = getRouterConfig()
+  const { loginPath, homePath, fallback } = getRouterConfig()
 
   const protectedRoutes = routes.filter((r: RouteConfig) => r.requiresAuth)
   const publicRoutes = routes.filter((r: RouteConfig) => !r.requiresAuth)
@@ -77,14 +78,14 @@ export function RouterComponent() {
         ))
       }
 
-      const LayoutComponent = layoutDef.component
       return (
         <Route
-          key={layoutDef.component.name || 'layout'}
+          // Identity-derived, never `component.name`: a lazy layout is an exotic
+          // object with no name, so every one of them used to key as 'layout'
+          // and collapse into a single group. See `./layout-route.tsx`.
+          key={layoutRouteKey(layoutDef)}
           element={
-            <LayoutComponent>
-              <Outlet />
-            </LayoutComponent>
+            <LayoutRouteElement layoutDef={layoutDef} fallback={fallback} />
           }
         >
           {group.map(route => (
