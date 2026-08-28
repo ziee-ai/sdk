@@ -43,6 +43,29 @@ function getCachedLazy(loader: LazyLoader): ComponentType<any> {
 export const EMPTY_PROPS: Record<string, any> = Object.freeze({})
 
 /**
+ * A stable, distinct React key per ambiguous function.
+ *
+ * Before the tripwire existed, a named 0-arg function rendered as
+ * `<Component {...props}/>` — its own element TYPE, so swapping the field to a
+ * DIFFERENT such function changed the type and React remounted, discarding the
+ * previous instance's hook state. Routing every one of them through the single
+ * `AmbiguousComponent` type would silently reuse one fiber across that swap,
+ * carrying hook state (and hook COUNT) from one component into another. Keying
+ * the element by function identity restores the remount.
+ */
+const ambiguousKeys = new WeakMap<object, string>()
+let ambiguousSequence = 0
+
+function ambiguousKey(fn: object): string {
+  let key = ambiguousKeys.get(fn)
+  if (!key) {
+    key = `ambiguous:${++ambiguousSequence}`
+    ambiguousKeys.set(fn, key)
+  }
+  return key
+}
+
+/**
  * The runtime tripwire for the one case classification cannot settle: a NAMED
  * 0-arg function whose source shows no `import(`. Rendering it is the right
  * default (it is far more often a component), but if it returns a Promise it
@@ -107,7 +130,12 @@ export function RenderComponentLike({
         const Component = component as ComponentType<any>
         if (ambiguous) {
           return (
-            <AmbiguousComponent fn={Component} props={props} debugId={debugId} />
+            <AmbiguousComponent
+              key={ambiguousKey(Component)}
+              fn={Component}
+              props={props}
+              debugId={debugId}
+            />
           )
         }
         return <Component {...props} />
