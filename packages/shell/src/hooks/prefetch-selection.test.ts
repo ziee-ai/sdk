@@ -107,3 +107,62 @@ test('path matching handles required and optional params', () => {
   assert.ok(pathMatchesCurrent('/browse/:tag?', '/browse'))
   assert.ok(!pathMatchesCurrent('/series/:id', '/browse'))
 })
+
+// ── A function is not automatically a loader ───────────────────────────────
+//
+// Warming a route CALLS its element. The selection used to admit every function,
+// which was survivable while a signed-out visitor was excluded outright — the
+// only elements it ever reached were an authed app's loaders. Opening the guest
+// path widened it: a public route registered as a plain component would now be
+// invoked outside a render on every boot, throwing React's *Invalid hook call*
+// from inside an idle callback.
+
+test('a props-taking component is never called by the prefetcher', () => {
+  const Page = (props: { id: string }) => props.id
+  const selected = selectPrefetchRoutes({
+    routes: [{ path: '/p', element: Page }],
+    isAuthed: false,
+    pathname: '/',
+    hasPermission: () => true,
+  })
+  assert.deepEqual(paths(selected), [])
+})
+
+test('a class component is never called by the prefetcher', () => {
+  // A React class component, structurally: `prototype.isReactComponent`. Calling
+  // one without `new` throws, so it is the loudest of the not-a-loader shapes.
+  class Page {
+    render() {
+      return null
+    }
+  }
+  ;(Page.prototype as { isReactComponent?: boolean }).isReactComponent = true
+  const selected = selectPrefetchRoutes({
+    routes: [{ path: '/c', element: Page }],
+    isAuthed: false,
+    pathname: '/',
+    hasPermission: () => true,
+  })
+  assert.deepEqual(paths(selected), [])
+})
+
+test('every loader spelling is still selected', () => {
+  // Anonymous (what `lazyWithPreload` returns), authored (`() => import(...)`),
+  // and the residual named-helper shape that classification cannot settle.
+  const anonymous = [() => Promise.resolve({ default: () => null })][0]
+  const authored = { element: () => import('./prefetch-selection.ts') }
+  const namedHelper = function loadPage() {
+    return Promise.resolve({ default: () => null })
+  }
+  const selected = selectPrefetchRoutes({
+    routes: [
+      { path: '/a', element: anonymous },
+      { path: '/b', element: authored.element },
+      { path: '/c', element: namedHelper },
+    ],
+    isAuthed: false,
+    pathname: '/',
+    hasPermission: () => true,
+  })
+  assert.deepEqual(paths(selected), ['/a', '/b', '/c'])
+})
