@@ -25,13 +25,14 @@ Cross-cutting rules every agent must follow:
 | `data-testid` | `string` |  |
 | `items` | `AccordionItemDef[]` |  |
 
-<details><summary>Optional props (6)</summary>
+<details><summary>Optional props (7)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `className` | `string | undefined` |  |
 | `defaultValue` | `string | string[] | undefined` |  |
 | `ghost` | `boolean | undefined` |  |
+| `keepMounted` | `boolean | undefined` |  |
 | `onValueChange` | `((v: string) => void) | ((v: string[]) => void) | undefined` |  |
 | `type` | `"multiple" | "single" | undefined` |  |
 | `value` | `string | string[] | undefined` |  |
@@ -192,8 +193,8 @@ _No always-required props._
 |---|---|---|
 | `aria-label` | `string | undefined` | Defines a string value that labels the current element. |
 | `block` | `boolean | undefined` | Full-width block button (legacy `block`). |
+| `destructive` | `boolean | undefined` | THIS BUTTON DESTROYS SOMETHING. It is not a look — `variant="destructive"` already implies it — it is a DECLARATION for the machinery tha… |
 | `href` | `string | undefined` | Render as an <a> styled as a button (pair with variant="link" for a text link). |
-| `destructive` | `boolean | undefined` | THIS BUTTON DESTROYS SOMETHING. Not a look (`variant="destructive"` already implies it) — a declaration, so an overlay's initial focus… |
 | `icon` | `ReactNode` | Leading icon (legacy `icon`); rendered before children, replaced by the spinner while loading. |
 | `loading` | `boolean | undefined` |  |
 | `size` | `"default" | "lg" | "icon" | undefined` |  |
@@ -242,7 +243,7 @@ _No always-required props._
 |---|---|---|
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). |
 
-<details><summary>Optional props (66)</summary>
+<details><summary>Optional props (67)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -311,6 +312,7 @@ _No always-required props._
 | `onBlur` | `(() => void) | undefined` |  |
 | `onChange` | `((checked: boolean) => void) | ((checked: boolean) => void) | ((checked: boolean) => vo…` |  |
 | `onCheckedChange` | `((checked: boolean) => void) | ((checked: boolean) => void) | ((checked: boolean) => vo…` |  |
+| `unavailableReason` | `string | undefined` | WHY this checkbox is unavailable. Presence means unavailable — the string IS the reason, rather than a boolean plus a separate message th… |
 | `value` | `boolean | undefined` |  |
 
 </details>
@@ -419,10 +421,10 @@ _No always-required props._
 | prop | type | notes |
 |---|---|---|
 | `children` | `ReactElement<unknown, string | JSXElementConstructor<any>> | undefined` | The trigger element. Optional when driving the dialog via `open`/`onOpenChange`. |
-| `initialFocus` | `string | RefObject<HTMLElement | null> | false | undefined` | Where focus lands when the prompt opens. Defaults to the first tabbable that is not destructive — which, for an "are you sure?", is… |
 | `danger` | `boolean | undefined` |  |
 | `description` | `ReactNode` |  |
-| `okButtonProps` | `{ danger?: boolean | undefined; disabled?: boolean | undefined; } | undefined` | Extra props forwarded to the confirm button (legacy `okButtonProps`), e.g. { danger: true }. |
+| `initialFocus` | `InitialFocus` | Where focus lands when the prompt opens. Defaults to the first tabbable that is not destructive — which, for an "are you sure?", is Cancel. |
+| `okButtonProps` | `{ danger?: boolean | undefined; disabled?: boolean | undefined; } | undefined` | Extra props forwarded to the confirm button (legacy `okButtonProps`), e.g. { danger: true }. `disabled` here is the LAST reason-less refu… |
 | `okUnavailableReason` | `string | undefined` | WHY the confirm cannot be pressed. Presence means unavailable; the string IS the reason. |
 | `onCancel` | `(() => void) | undefined` | Called when the user cancels/dismisses (legacy `onCancel`). |
 | `onOpenChange` | `((open: boolean) => void) | undefined` | Fires when the open state should change (pairs with `open`). |
@@ -550,15 +552,16 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto the dialog content <root> (i18n-safe). |
 | `title` | `ReactNode` | Accessible name — required (Radix Dialog must be labelled). |
 
-<details><summary>Optional props (9)</summary>
+<details><summary>Optional props (10)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `children` | `ReactNode` |  |
 | `className` | `string | undefined` |  |
+| `closeLabel` | `string | undefined` | Accessible name AND hover text for the corner ×. Defaults to 'Close' — the word this component has always hardcoded — so it is optional; … |
 | `description` | `ReactNode` |  |
 | `footer` | `ReactNode` |  |
-| `initialFocus` | `string | RefObject<HTMLElement | null> | false | undefined` | WHERE FOCUS LANDS when the dialog opens — a `data-testid`, a ref, or `false`. Omitting it is safe: the default skips anything marked… |
+| `initialFocus` | `InitialFocus` | WHERE FOCUS LANDS when the dialog opens — a `data-testid`, a ref, or `false` for "leave it on the popup". OMITTING IT IS SAFE: the defaul… |
 | `onOpenChange` | `((open: boolean) => void) | undefined` |  |
 | `open` | `boolean | undefined` |  |
 | `size` | `"default" | "sm" | "lg" | "xl" | undefined` |  |
@@ -1048,12 +1051,6 @@ _No always-required props._
 
 ## PasswordInput
 
-> **`maxLength` is BANNED here** (omitted from the props type *and* stripped at runtime). A cap
-> enforced by discarding the overflow is undetectable on a masked field, and a confirm field with
-> the same cap hides even the mismatch — so the app ships a credential the user never chose. State
-> a length limit and REFUSE past it; never truncate a secret. (`<Input type="password">` is the
-> same hazard through a different door — the consuming app lints for it.)
-
 **Required:**
 
 | prop | type | notes |
@@ -1449,12 +1446,13 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto the sheet content <root> (i18n-safe). |
 | `title` | `ReactNode` | Accessible name — required (the dialog must be labelled). |
 
-<details><summary>Optional props (16)</summary>
+<details><summary>Optional props (17)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `children` | `ReactNode` |  |
 | `className` | `string | undefined` |  |
+| `closeLabel` | `string | undefined` | Accessible name AND hover text for the corner ×. Defaults to 'Close' — the word this component has always hardcoded — so it is optional; … |
 | `defaultSize` | `number | undefined` | Initial px size of the resizable axis (width for left/right, height for top/bottom). |
 | `description` | `ReactNode` |  |
 | `footer` | `ReactNode` |  |
