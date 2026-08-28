@@ -16,30 +16,70 @@ import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import fs from 'node:fs'
 
-import { parseOne } from './roots.mjs'
+import { parseMulti, parseOne } from './roots.mjs'
 
-// Parameterized over the app's tree: `--css <index.css>` (the shadcn token source
-// of truth), `--out <DESIGN_SYSTEM.md>` (where to write/check), `--app-name <name>`
-// (the contract's title). All resolved vs CWD; defaults reproduce ziee's layout.
-const CSS = path.resolve(process.cwd(), parseOne('css') ?? 'src/index.css')
+// Parameterized over the app's tree:
+//   --css <file>          the token source of truth. REPEATABLE, in cascade order:
+//                         an app that LAYERS its own sheet over a package's token
+//                         sheet passes both (`--css ../../sdk/packages/kit/src/
+//                         styles/tokens.css --css src/styles/nocturne.css`), and a
+//                         later file's declarations win, exactly as CSS resolves
+//                         them at run time.
+//   --dark-selector <sel> the selector carrying the dark palette (default `.dark`).
+//                         Matched against each comma-separated part of a block's
+//                         selector LIST, so `.dark, .app-force-dark { … }` is found.
+//   --out <file>          where to write/check the spec.
+//   --app-name <name>     the contract's title.
+// All resolved vs CWD; defaults reproduce ziee's single-`src/index.css` layout.
+const CSS_FILES = (() => {
+  const given = parseMulti('css')
+  return (given.length ? given : ['src/index.css']).map(f => path.resolve(process.cwd(), f))
+})()
 const OUT = path.resolve(process.cwd(), parseOne('out') ?? 'DESIGN_SYSTEM.md')
 const APP_NAME = parseOne('app-name') ?? 'Ziee'
+const DARK_SELECTOR = parseOne('dark-selector') ?? '.dark'
 
-const css = fs.readFileSync(CSS, 'utf-8')
+/** Exit with a message an app author can act on — not an uncaught stack trace. */
+function fail(msg) {
+  console.error(`[design-spec] ${msg}`)
+  process.exit(1)
+}
 
-// --- extract a top-level `selector { ... }` block body (first match). ------------
-function block(selector) {
-  // selector may contain regex-special chars (`@theme inline`, `:root`, `.dark`).
-  const re = new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{`, 'm')
-  const m = re.exec(css)
-  if (!m) throw new Error(`block not found: ${selector}`)
-  let depth = 0
-  let start = m.index + m[0].length - 1 // at the `{`
-  for (let i = start; i < css.length; i++) {
-    if (css[i] === '{') depth++
-    else if (css[i] === '}' && --depth === 0) return css.slice(start + 1, i)
+for (const f of CSS_FILES) if (!fs.existsSync(f)) fail(`--css ${f} does not exist`)
+// Concatenated in the order given == the order the app @imports them, so the
+// merge below reproduces the cascade rather than whichever file was named first.
+// Comments are stripped up front: a block comment can contain braces, parens and
+// semicolons, which is exactly the punctuation the selector scan below anchors on.
+const css = CSS_FILES.map(f => fs.readFileSync(f, 'utf-8'))
+  .join('\n')
+  .replace(/\/\*[\s\S]*?\*\//g, '')
+
+/**
+ * Every top-level block whose selector LIST contains `selector`, in document
+ * order. Plural on purpose: a real token sheet declares `:root` more than once
+ * (theme-independent tokens, then the palette, then the kit contract), and an app
+ * that layers sheets has several files' worth. Taking only the FIRST match read
+ * one arbitrary slice of the palette and silently dropped the rest.
+ */
+function blocks(selector) {
+  const esc = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  // The selector may be one part of a comma-separated list: `.dark, .x {`.
+  const re = new RegExp(`(?:^|[},;])\\s*((?:[^{}();]|\\([^)]*\\))*?${esc}(?:[^{}();]|\\([^)]*\\))*?)\\{`, 'gm')
+  const found = []
+  for (const m of css.matchAll(re)) {
+    const parts = m[1].split(',').map(p => p.trim()).filter(Boolean)
+    if (!parts.includes(selector)) continue
+    let depth = 0
+    const start = m.index + m[0].length - 1 // at the `{`
+    for (let i = start; i < css.length; i++) {
+      if (css[i] === '{') depth++
+      else if (css[i] === '}' && --depth === 0) {
+        found.push(css.slice(start + 1, i))
+        break
+      }
+    }
   }
-  throw new Error(`unbalanced block: ${selector}`)
+  return found
 }
 
 // `--name: value;` pairs from a block body (comments stripped).
@@ -51,9 +91,26 @@ function vars(body) {
   return out
 }
 
-const theme = vars(block('@theme inline')) // --color-X -> var(--X), --radius-Y -> calc(...)
-const root = vars(block(':root'))
-const dark = vars(block('.dark'))
+/** Merge every matching block in cascade order — later declarations win. */
+function mergedVars(selector, { required = true } = {}) {
+  const bodies = blocks(selector)
+  if (!bodies.length) {
+    if (!required) return new Map()
+    fail(
+      `no \`${selector}\` block in ${CSS_FILES.map(f => path.relative(process.cwd(), f)).join(' + ')}. ` +
+        (selector === '@theme inline'
+          ? 'An app that layers its sheet over a package token sheet must pass BOTH with repeatable --css.'
+          : `Name the app's selector with --dark-selector.`),
+    )
+  }
+  const out = new Map()
+  for (const b of bodies) for (const [k, v] of vars(b)) out.set(k, v)
+  return out
+}
+
+const theme = mergedVars('@theme inline') // --color-X -> var(--X), --radius-Y -> calc(...)
+const root = mergedVars(':root')
+const dark = mergedVars(DARK_SELECTOR)
 
 // Resolve `var(--x)` one hop into the :root / .dark palette.
 const deref = (v, palette) => {

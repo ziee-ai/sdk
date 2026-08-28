@@ -13,6 +13,7 @@ import path from 'node:path'
 import {
   collectSourceFiles,
   collectTestIds,
+  isTestSourceFile,
   renderRegistry,
 } from './gen-testid-registry.mjs'
 
@@ -63,4 +64,31 @@ test('renderRegistry is deterministic + emits the KnownTestId union', () => {
   assert.match(body, /export const isKnownTestId/)
   // 2 ids → the header count reflects the input length.
   assert.match(body, /2 static data-testid ids/)
+})
+
+test('collectSourceFiles skips CO-LOCATED test/spec/story files', () => {
+  // The `tests` DIRECTORY skip only covers apps that keep tests in one tree. An
+  // app whose vitest suites sit NEXT TO the component (testing-library house
+  // style) had every throwaway id its tests invent — `data-testid="a"` — land in
+  // the app's typed PRODUCTION registry. Observed in COMIZY: 171 ids generated,
+  // 131 real, 40 contributed by co-located suites.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'testid-'))
+  const src = path.join(root, 'src', 'components')
+  fs.mkdirSync(src, { recursive: true })
+  fs.writeFileSync(path.join(src, 'Avatar.tsx'), '<div data-testid="avatar" />')
+  fs.writeFileSync(path.join(src, 'Avatar.test.tsx'), '<Avatar data-testid="a" />')
+  fs.writeFileSync(path.join(src, 'avatar.spec.ts'), 'data-testid="b"')
+  fs.writeFileSync(path.join(src, 'Avatar.stories.tsx'), 'data-testid="story-only"')
+  const files = collectSourceFiles(src)
+  assert.deepEqual(files.map(f => path.basename(f)), ['Avatar.tsx'])
+  assert.deepEqual([...collectTestIds(files)], ['avatar'])
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('isTestSourceFile matches only the co-located suite suffixes', () => {
+  for (const n of ['A.test.tsx', 'a.test.ts', 'a.spec.ts', 'a.spec.jsx', 'A.stories.tsx'])
+    assert.equal(isTestSourceFile(n), true, n)
+  // A production file whose NAME merely contains the word is kept.
+  for (const n of ['Avatar.tsx', 'testUtils.ts', 'contest.tsx', 'spectrum.tsx', 'stories.ts'])
+    assert.equal(isTestSourceFile(n), false, n)
 })
