@@ -548,7 +548,11 @@ export function AppLayout({
             Contributed via the `appBanners` slot, so bundles that don't load a
             contributor (e.g. desktop drops server-update) render nothing. */}
         {appBanners.map((b) => (
-          <LazyComponentRenderer key={b.id} component={b.component} />
+          <LazyComponentRenderer
+            key={b.id}
+            component={b.component}
+            debugId={`appBanners:${b.id}`}
+          />
         ))}
         {/* Content — min-h-0 (desktop clamp): a flex-1 child of the flex-col `main`
             defaults to min-height:auto and REFUSES to shrink below its content, so a

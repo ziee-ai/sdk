@@ -24,7 +24,11 @@ let warnedNoGate = false
 function renderRouteElement(route: RouteConfig): ReactNode {
   const { fallback, permissionGate } = getRouterConfig()
   const inner = (
-    <LazyRouteRenderer component={route.element} fallback={fallback} />
+    <LazyRouteRenderer
+      component={route.element}
+      fallback={fallback}
+      debugId={route.path}
+    />
   )
   if (route.permission === undefined) return inner
   if (!permissionGate) {
