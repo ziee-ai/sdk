@@ -25,6 +25,12 @@ export type { CreateRouterModuleOptions } from './module'
 export { RouterComponent } from './RouterComponent'
 export { Routes, useRoutesStore } from './routes-store'
 export { LazyRouteRenderer } from './LazyRouteRenderer'
+// A layout's route identity. Exported because an app that dedupes or groups its
+// OWN routes must key a layout the same way the router does — by the definition
+// OBJECT, never by `component.name` (a lazy layout is an exotic with no name;
+// a minifier can empty a plain one). Without this, a consumer reimplements the
+// WeakMap-ordinal scheme locally and the two can disagree about identity.
+export { LayoutRouteElement, layoutRouteKey } from './layout-route'
 export {
   setRouterConfig,
   getRouterConfig,
