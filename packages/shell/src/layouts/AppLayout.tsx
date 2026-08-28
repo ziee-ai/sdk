@@ -13,7 +13,8 @@ import { cn } from '@ziee/kit/lib/utils'
 import { Sheet, SheetContent, SheetTitle } from '@ziee/kit/shadcn/sheet'
 import { useMetaThemeColor } from '../theme/themeColor'
 import 'overlayscrollbars/overlayscrollbars.css'
-import { Stores } from '@ziee/framework/stores'
+import { ModuleSystem } from '@ziee/framework/stores'
+import { appLayoutSeam } from '../app-store-seams'
 import { LazyComponentRenderer } from '../components/LazyComponentRenderer'
 
 /**
@@ -61,8 +62,7 @@ export function AppLayout({
   LeftSidebar,
   SidebarToggleButton,
 }: AppLayoutProps) {
-  const appLayout = (Stores as unknown as { AppLayout: AppLayoutSeam })
-    .AppLayout
+  const appLayout = appLayoutSeam.get() as AppLayoutSeam
   // The app shell is bg-card, but the iOS status/nav bars sample the CANVAS —
   // the <body> background — which is --background app-wide. The shell covers the
   // body, so painting the body --card changes nothing visible; it only makes the
@@ -80,7 +80,7 @@ export function AppLayout({
   }, [])
   useMetaThemeColor('--card')
   const { isSidebarCollapsed, nativeScroll } = appLayout
-  const { slots } = Stores.ModuleSystem
+  const { slots } = ModuleSystem
   const appBanners = [...(slots.get('appBanners') || [])].sort(
     (a, b) => (a.order ?? 0) - (b.order ?? 0),
   )
@@ -548,10 +548,18 @@ export function AppLayout({
             Contributed via the `appBanners` slot, so bundles that don't load a
             contributor (e.g. desktop drops server-update) render nothing. */}
         {appBanners.map((b) => (
-          <LazyComponentRenderer key={b.id} component={b.component} />
+          <LazyComponentRenderer
+            key={b.id}
+            component={b.component}
+            debugId={`appBanners:${b.id}`}
+          />
         ))}
-        {/* Content */}
-        <div className={cn('flex-1 min-w-0 relative', nativeScroll ? 'overflow-x-clip' : 'overflow-hidden')}>
+        {/* Content — min-h-0 (desktop clamp): a flex-1 child of the flex-col `main`
+            defaults to min-height:auto and REFUSES to shrink below its content, so a
+            tall page would grow past the viewport and scroll the WINDOW instead of its
+            own inner `DivScrollY`. min-h-0 lets it track the bounded `main` height, so
+            the page's `h-full` resolves to the viewport and inner overlay-scroll works. */}
+        <div className={cn('flex-1 min-w-0 relative', nativeScroll ? 'overflow-x-clip' : 'min-h-0 overflow-hidden')}>
           <section
             ref={mainContentRef}
             id="main-content"

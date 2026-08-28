@@ -87,10 +87,24 @@ impl IdentityResolver for DefaultIdentityResolver {
             )
         })?;
 
-        // Load the acting user.
-        let user = self
+        // Load the acting user AND the token-revocation epoch, in one query.
+        //
+        // The epoch read is not optional here. `jwt_extractor`'s INVARIANT names
+        // exactly two callers of `validate_access_token` that gate a route and
+        // requires BOTH to verify the epoch — and it names this one as doing so
+        // "via `get_by_id_with_token_version`, folding the read into the user
+        // load it already performs". This resolver called plain `get_by_id`, so
+        // the SDK's shipped default violated the invariant its own documentation
+        // asserts is upheld: after a logout (or a password change, or an admin
+        // revocation) the access token kept working on every `RequirePermissions`
+        // route until `exp` — 24h by default.
+        //
+        // The client-side session fan-out is not a boundary for whoever holds a
+        // stolen token; they do not run our JS. And it is free: the query below
+        // returns the epoch alongside the user the hot path was already loading.
+        let (user, token_version) = self
             .users
-            .get_by_id(user_id)
+            .get_by_id_with_token_version(user_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
             .ok_or_else(|| {
@@ -99,6 +113,12 @@ impl IdentityResolver for DefaultIdentityResolver {
                     AppError::unauthorized("USER_NOT_FOUND", "User not found"),
                 )
             })?;
+
+        // A token minted before the epoch shipped carries `ver: None`, which
+        // `verify_token_version` folds to 0 — matching the column's `DEFAULT 0`,
+        // so existing sessions keep working and the user's first logout ends
+        // them. Deploying this forces zero logouts.
+        crate::auth::http::jwt_extractor::verify_token_version(claims.ver, token_version)?;
 
         // Reject inactive accounts.
         if !user.is_active {

@@ -11,7 +11,10 @@ import { useEffect, useRef } from 'react'
 import type { Mutate, StoreApi, UseBoundStore } from 'zustand'
 import { useEventBusStore } from './events'
 import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
-import { createStoreProxy } from './stores'
+import { createStoreProxy, type StoreProxy } from './stores'
+import { onNetworkIdle } from './net-idle'
+import { createLazyDispatcher } from './lazy-dispatch'
+import { isStaleBuild } from './chunk-recovery'
 
 // ============================================================================
 // store-kit — thin authoring layer over the existing Zustand + Stores.X proxy.
@@ -68,7 +71,268 @@ export interface StoreInitCtx<State> {
   onCleanup: (fn: () => void) => void
 }
 
-export interface StoreConfig<State extends object, Actions extends object> {
+// ============================================================================
+// Lazy actions — per-action code splitting.
+//
+// Most of a store's WEIGHT is its actions (API calls + logic). `lazyActions`
+// lets each action live in its OWN file/chunk, downloaded on first call (or
+// `preload()`) instead of riding the store's eager chunk. The store's state is
+// eager + always present (so `Stores.X.field` never `undefined`), only the
+// action CODE is deferred. All lazy actions are async (they may need to `await`
+// their own chunk); trivial synchronous setters stay in `actions`.
+//
+//   // Users.ts
+//   defineStore('Users', {
+//     state: { list: [] },
+//     lazyActions: {
+//       loadUsers:  () => import('./actions/loadUsers'),
+//       deleteUser: () => import('./actions/deleteUser'),
+//     },
+//   })
+//   // actions/loadUsers.ts  →  export default (set, get) => async () => { … }
+//
+//   Users.loadUsers()            // loads only loadUsers' chunk, then runs
+//   Users.deleteUser.preload()   // warm the chunk on hover/intent
+// ============================================================================
+
+/** A lazily-loaded async action module: its default export is a factory
+ *  `(set, get) => (...args) => Promise<Ret>`. */
+export type LazyActionFactory<State, Args extends any[], Ret> = (
+  set: StoreSet<State>,
+  get: () => State,
+) => (...args: Args) => Promise<Ret>
+
+/** A thunk that dynamic-imports one action module (→ its own chunk). */
+export type LazyActionLoader<State> = () => Promise<{
+  default: LazyActionFactory<State, any[], any>
+}>
+
+export type LazyActionsConfig<State> = Record<string, LazyActionLoader<State>>
+
+/** The callable a lazy action becomes on the store: same signature as the
+ *  underlying action, plus `.preload()` to warm its chunk without invoking it. */
+export type LazyDispatcher<L> = L extends () => Promise<{
+  default: (set: any, get: any) => (...args: infer A) => infer R
+}>
+  ? ((...args: A) => R extends Promise<any> ? R : Promise<Awaited<R>>) & {
+      preload: () => Promise<void>
+    }
+  : never
+
+export type LazyDispatchers<M> = { [K in keyof M]: LazyDispatcher<M[K]> }
+
+// ============================================================================
+// Folder-convention auto-registration.
+//
+// `import.meta.glob('./actions/*.ts')` yields `{ './actions/foo.ts': loader }`.
+// A store passes THAT as `config.actions` — store-kit derives the action name
+// from each file's basename (no hand-written map). `_`-prefixed files are
+// INTERNAL helpers (shared factories imported by actions) and are NOT registered
+// as dispatched actions. Types come from a generated `actions.gen.ts` type map
+// (see `gen:store-actions`), supplied as the `AM` generic.
+// ============================================================================
+
+/** The record `import.meta.glob('./actions/*.ts')` produces (path → lazy loader).
+ *  Vite types the loaders as `() => Promise<unknown>`, so the value side is loose;
+ *  the concrete action types come from the `AM` generic (generated actions.gen.ts). */
+export type ActionGlob = Record<string, () => Promise<any>>
+
+/** Dispatcher type derived from ONE action factory (as `typeof import('./x')['default']`). */
+export type FactoryDispatcher<F> = F extends (
+  set: any,
+  get: any,
+) => (...args: infer A) => infer R
+  ? ((...args: A) => R extends Promise<any> ? R : Promise<Awaited<R>>) & {
+      preload: () => Promise<void>
+    }
+  : never
+
+/** The generated `actions.gen.ts` type map (name → factory type) → dispatchers. */
+export type DispatchersFromTypeMap<M> = { [K in keyof M]: FactoryDispatcher<M[K]> }
+
+/** EAGER glob form: `import.meta.glob('./actions/*.ts', { eager: true })` — its
+ *  values are already-loaded module namespaces (`{ default: factory }`), not the
+ *  lazy loader thunks (`() => import()`). Used by stores with SYNCHRONOUS
+ *  selectors (a `getFoo(): string` read in render), which can't be deferred
+ *  behind a dynamic import. Same folder structure, sync actions.
+ *
+ *  Typed as `Record<string, unknown>` because that is exactly what Vite infers
+ *  for an un-parameterized eager glob (the lazy glob is `Record<string, () =>
+ *  Promise<...>>`), so this is the type that DISTINGUISHES the eager overload
+ *  from the lazy one at the call site. The action SIGNATURES come from the `AM`
+ *  generic (`actions.gen.ts`), not from these values, so no precision is lost. */
+export type EagerActionGlob = Record<string, unknown>
+
+/** Eager (synchronous) factory → its resolved action, signature preserved
+ *  VERBATIM (NO Promise-wrapping, NO `.preload`) — the opposite of
+ *  `FactoryDispatcher`, so a `getFoo(): string` stays `() => string`. */
+export type EagerFactoryDispatcher<F> = F extends (
+  set: any,
+  get: any,
+) => infer A
+  ? A
+  : never
+export type EagerDispatchersFromTypeMap<M> = {
+  [K in keyof M]: EagerFactoryDispatcher<M[K]>
+}
+
+/** True when `actions` is a glob record (object) rather than the eager factory (function). */
+function isActionGlob(a: unknown): a is ActionGlob {
+  return !!a && typeof a === 'object'
+}
+
+/** An eager glob's values are loaded module objects (`{default}`), not the lazy
+ *  loader thunks. Empty glob → treated as lazy (a no-op either way). */
+function isEagerGlob(glob: ActionGlob): boolean {
+  for (const path of Object.keys(glob)) return typeof glob[path] !== 'function'
+  return false
+}
+
+/** Eager glob → a plain `actions` factory (basename→factory(set,get)), built
+ *  SYNCHRONOUSLY. Drops `_`-prefixed internal-helper files (as the lazy form does). */
+function globToEagerActions(
+  glob: ActionGlob,
+): (set: any, get: any) => Record<string, any> {
+  const factories: Record<string, (set: any, get: any) => any> = {}
+  for (const path of Object.keys(glob)) {
+    const base = path.slice(path.lastIndexOf('/') + 1).replace(/\.[tj]sx?$/, '')
+    if (!base.startsWith('_')) factories[base] = (glob[path] as any).default
+  }
+  return (set: any, get: any) => {
+    const out: Record<string, any> = {}
+    for (const name of Object.keys(factories)) out[name] = factories[name](set, get)
+    return out
+  }
+}
+
+/** Glob record → basename→loader map (the internal lazyActions form). Drops
+ *  `_`-prefixed internal-helper files. */
+function globToLazyActions(glob: ActionGlob): Record<string, LazyActionLoader<any>> {
+  const out: Record<string, LazyActionLoader<any>> = {}
+  for (const path of Object.keys(glob)) {
+    const base = path.slice(path.lastIndexOf('/') + 1).replace(/\.[tj]sx?$/, '')
+    if (!base.startsWith('_')) out[base] = glob[path] as LazyActionLoader<any>
+  }
+  return out
+}
+
+/** If `config.actions` is a glob, normalize it: an EAGER glob → a synchronous
+ *  `actions` factory (sync selectors preserved); a LAZY glob → `lazyActions`
+ *  (basename keys, deferred per-action chunks). */
+function normalizeGlobConfig<C extends { actions?: unknown; lazyActions?: unknown }>(
+  config: C,
+): C {
+  if (typeof config.actions === 'function' || !isActionGlob(config.actions)) return config
+  if (isEagerGlob(config.actions))
+    return { ...config, actions: globToEagerActions(config.actions) }
+  return { ...config, actions: undefined, lazyActions: globToLazyActions(config.actions) }
+}
+
+/** Browser-idle scheduler: run `cb` in a spare frame gap, off the render/critical
+ *  path. `{ timeout }` guarantees it still fires under a busy main thread (e.g. a
+ *  long SSE token stream keeps eating idle time). No-op off-browser (SSR/tests). */
+export function warmIdle(cb: () => void): void {
+  if (typeof window === 'undefined') return
+  if (typeof requestIdleCallback !== 'undefined') requestIdleCallback(cb, { timeout: 2000 })
+  else setTimeout(cb, 200)
+}
+
+/**
+ * Compile-time prefetch toggle. The baked-in auto-warm (preload every store's
+ * lazy action chunks on init) is ON by default. Build with
+ * `VITE_STORE_PREFETCH=off` to strip it — Vite inlines `import.meta.env.VITE_*`
+ * to a literal, so `STORE_PREFETCH_ENABLED` const-folds to `false` and the warm
+ * loop is dead-code-eliminated. Lets you measure a COLD page render with ZERO
+ * action chunks prefetched (only the code the first paint actually needs).
+ * Read as a plain `import.meta.env.VITE_*` (no `?.`) — same pattern as the
+ * framework's existing `import.meta.env.DEV` reads — so Vite const-folds it to a
+ * literal and the warm loop below dead-code-eliminates when off.
+ */
+const STORE_PREFETCH_ENABLED = ((): boolean => {
+  try {
+    return import.meta.env.VITE_STORE_PREFETCH !== 'off'
+  } catch {
+    // `import.meta.env` is injected by the BUNDLER and is undefined under a
+    // plain node runtime — so the read above throws a TypeError at MODULE
+    // SCOPE, taking down anything that merely imports this file outside a
+    // bundle. That is not hypothetical: a consuming app's `collect-actions` /
+    // `action-refs-lint` / `actions-unit` tooling esbuild-bundles app sources
+    // and runs them on `platform: 'node'`; the moment an app store reached
+    // store-kit, `npm run check` died with no useful message. Its neighbour
+    // `module-system/store.ts::isDev()` already guards the identical hazard.
+    //
+    // The try/catch does NOT defeat the dead-code elimination the plain read
+    // exists for: under Vite the expression const-folds to a literal BEFORE
+    // minification (`'off' !== 'off'` → `false`), the IIFE inlines, and the
+    // warm loop below is eliminated exactly as before. Under node there are no
+    // chunks to warm and no network-idle to wait for, so `false` is also the
+    // behaviourally correct answer rather than merely a safe one.
+    return false
+  }
+})()
+
+/** BAKED-IN PREFETCH: on init, warm every lazy-action chunk on idle so the store's
+ *  interactions are instant — with NO per-store `.preload()` wiring. Actions already
+ *  invoked in `init` (hot) are a cached no-op; the rest fetch in the background.
+ *  Gated by the `VITE_STORE_PREFETCH=off` compile-time flag (see above). */
+function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
+  if (!STORE_PREFETCH_ENABLED) return
+  const keys = Object.keys(lazyDispatchers)
+  if (!keys.length) return
+  // Wait for the page's CRITICAL api-client calls to finish (network-idle after
+  // load) BEFORE warming, so the prefetch never competes with them for the
+  // browser's connections — THEN schedule the actual preloads on a main-thread
+  // idle gap. (Fixes: on /login the drawer/onboarding chunks were prefetched
+  // while the auth/providers call was still pending.)
+  onNetworkIdle(() =>
+    warmIdle(() => {
+      for (const k of keys) {
+        // Skip warming once chunk loading is known to be broken.
+        //
+        // HONEST SCOPE, because an earlier comment here overstated it: this loop
+        // body is SYNCHRONOUS (`preload()` is invoked, not awaited) and the mark
+        // can only be set asynchronously, so it cannot flip BETWEEN iterations —
+        // the store whose chunks are failing still fires all of its own keys.
+        // What this does prevent is every store scheduled on a LATER idle tick
+        // (route entry, lazy module registration) from repeating the exercise, so
+        // one deploy-while-a-tab-is-open costs one store's keys rather than every
+        // registered store's. The on-demand dispatch is unaffected: it still
+        // tries, and reports. A successful import clears the mark, so a transient
+        // blip does not disable prefetch for the session.
+        if (isStaleBuild()) return
+        try {
+          // `.catch` is REQUIRED, not belt-and-braces: `preload()` returns a
+          // promise, so the surrounding try/catch only ever caught a synchronous
+          // throw. A chunk that fails to load therefore produced an UNHANDLED
+          // REJECTION — i.e. an uncaught page-level error — for a warm-up nobody
+          // asked for and nothing awaits. (Observed directly: blocking one action
+          // chunk in an e2e produced page errors from this loop alone.)
+          //
+          // A failed warm-up is a genuine no-op: the chunk is simply not warm, and
+          // the on-demand dispatch retries it and surfaces a real error to the
+          // caller if it still fails. So swallow it at debug volume — the
+          // `vite:preloadError` listener has already logged the load failure once
+          // and marked the build stale.
+          lazyDispatchers[k].preload?.().catch((err: unknown) => {
+            console.debug(`[store-kit] prefetch of lazy action "${k}" failed (ignored)`, err)
+          })
+        } catch (err) {
+          console.debug(`[store-kit] prefetch of lazy action "${k}" threw (ignored)`, err)
+        }
+      }
+    }),
+  )
+}
+
+export interface StoreConfig<
+  State extends object,
+  Actions extends object,
+  LA extends LazyActionsConfig<State> = {},
+> {
+  /** Per-action lazy loaders — each value dynamic-imports one action module.
+   *  The dispatchers are merged into the store's actions (typed from the import),
+   *  so `Stores.X.<name>(...)` calls stay fully typed while the code is deferred. */
+  lazyActions?: LA
   /** Draft-mutation setters (`set(d => { d.x = 1 })`). Default false → plain
    *  Zustand shallow-merge (`set(s => ({ x: 1 }))`), so merge-style stores like
    *  Chat migrate with NO change to their setters. */
@@ -91,13 +355,19 @@ export interface StoreConfig<State extends object, Actions extends object> {
   /** Runs once on first access (global) / on mount (local). Listener + cross-store
    *  wiring goes here via `on` / `watch`; all of it auto-unsubscribes on destroy.
    *  Gets the resolved `actions` so it can call them (typed). */
-  init?: (ctx: StoreInitCtx<State> & { actions: Actions }) => void
+  init?: (
+    ctx: StoreInitCtx<State> & { actions: Actions & LazyDispatchers<LA> },
+  ) => void
 }
 
 /** Internal lifecycle keys the Stores proxy already understands. */
 interface Lifecycle {
   __init__: { __store__: () => void }
-  __destroy__: () => void
+  // May be async: the callers fire-and-forget it (React cleanup ignores the
+  // return; the global ref-count teardown `.catch()`es a returned Promise), so a
+  // store whose teardown awaits a lazy action (e.g. Chat saving pane state before
+  // destroy) is supported.
+  __destroy__: () => void | Promise<void>
 }
 
 export type FullStoreState<State, Actions> = State & Actions & Lifecycle
@@ -127,11 +397,33 @@ function makeBuilder<State extends object, Actions extends object>(
 ) {
   return (set: any, get: any): FullStoreState<State, Actions> => {
     const actions = config.actions ? config.actions(set, get) : ({} as Actions)
+    // Per-action lazy dispatchers: each loads its own chunk on first call
+    // (cached thereafter) and exposes `.preload()` to warm it early.
+    const lazyDispatchers: Record<string, any> = {}
+    if (config.lazyActions) {
+      for (const key of Object.keys(config.lazyActions)) {
+        const loader = (config.lazyActions as LazyActionsConfig<State>)[key]
+        // The dispatcher (chunk memoization, `.preload()`, and the chunk-load
+        // de-dup window that keeps each action's OWN in-flight guard reachable)
+        // lives in ./lazy-dispatch.ts — see the rationale there.
+        //
+        // The two stages are passed SEPARATELY on purpose: the dispatcher must
+        // distinguish a TRANSIENT chunk-download failure (retry, never memoize —
+        // a deploy while the tab is open invalidates every hashed chunk URL)
+        // from a DETERMINISTIC action-factory throw (memoize, fail fast).
+        lazyDispatchers[key] = createLazyDispatcher(
+          () => loader(),
+          m => m.default(set, get),
+        )
+      }
+    }
     const cleanups: Unsubscribe[] = []
     const ctx: StoreInitCtx<State> & { actions: Actions } = {
       set,
       get,
-      actions,
+      // init sees eager actions AND the lazy dispatchers (so `init` can kick off
+      // a lazy loader on first access — it loads that action's chunk on demand).
+      actions: { ...actions, ...lazyDispatchers } as Actions,
       on: (event, handler) => {
         const busOn = useEventBusStore.getState().on as (
           e: string,
@@ -152,7 +444,15 @@ function makeBuilder<State extends object, Actions extends object>(
     return {
       ...(config.state as State),
       ...actions,
-      __init__: { __store__: () => config.init?.(ctx) },
+      ...lazyDispatchers,
+      __init__: {
+        __store__: () => {
+          config.init?.(ctx)
+          // Auto-warm this store's lazy-action chunks on idle — every store's
+          // interactions become instant with ZERO per-store preload boilerplate.
+          autoWarmLazyActions(lazyDispatchers)
+        },
+      },
       __destroy__: () => {
         cleanups.splice(0).forEach(off => {
           try {
@@ -183,19 +483,65 @@ function applyMiddleware<State extends object, Actions extends object>(
   return subscribeWithSelector(withPersist as any)
 }
 
+/** The folder-glob store config: `actions` is `import.meta.glob('./actions/*.ts')`;
+ *  `AM` is the generated `actions.gen.ts` type map (name → factory type). */
+export interface GlobStoreConfig<State extends object, AM> {
+  actions: ActionGlob
+  immer?: boolean
+  persist?: PersistOptions<State, any>
+  state: State
+  init?: (
+    ctx: StoreInitCtx<State> & { actions: DispatchersFromTypeMap<AM> },
+  ) => void
+}
+
+/** The EAGER folder-glob config: `actions: import.meta.glob('./actions/*.ts',
+ *  { eager: true })` — same folder structure as `GlobStoreConfig`, but actions
+ *  load synchronously so a store with a synchronous selector keeps its sync
+ *  signature. `AM` is still the generated `actions.gen.ts` type map. */
+export interface EagerGlobStoreConfig<State extends object, AM> {
+  actions: EagerActionGlob
+  immer?: boolean
+  persist?: PersistOptions<State, any>
+  state: State
+  init?: (
+    ctx: StoreInitCtx<State> & { actions: EagerDispatchersFromTypeMap<AM> },
+  ) => void
+}
+
 /**
  * Global singleton store. Register it on a module via
  * `createModule({ stores: [MyStore] })` — the name is written ONCE here, and
  * consumers read it through `Stores.<name>` exactly as before.
+ *
+ * Two forms:
+ *  1. Explicit `actions`/`lazyActions` (legacy).
+ *  2. Folder-glob auto-registration: `actions: import.meta.glob('./actions/*.ts')`
+ *     — store-kit registers each file by basename; types come from the `AM`
+ *     generic (the generated `actions.gen.ts` map).
  */
-export function defineStore<State extends object, Actions extends object>(
+export function defineStore<
+  State extends object,
+  Actions extends object = {},
+  LA extends LazyActionsConfig<State> = {},
+>(
   name: string,
-  config: StoreConfig<State, Actions>,
-): StoreHandle<FullStoreState<State, Actions>> {
-  const builder = makeBuilder(name, config)
-  const store = create<FullStoreState<State, Actions>>()(
-    applyMiddleware(builder, config) as any,
-  ) as BoundStore<FullStoreState<State, Actions>>
+  config: StoreConfig<State, Actions, LA>,
+): StoreHandle<FullStoreState<State, Actions & LazyDispatchers<LA>>>
+export function defineStore<State extends object, AM extends Record<string, any>>(
+  name: string,
+  config: GlobStoreConfig<State, AM>,
+): StoreHandle<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineStore<State extends object, AM extends Record<string, any>>(
+  name: string,
+  config: EagerGlobStoreConfig<State, AM>,
+): StoreHandle<FullStoreState<State, EagerDispatchersFromTypeMap<AM>>>
+export function defineStore(name: string, config: any): any {
+  const normalized = normalizeGlobConfig(config) as StoreConfig<any, any>
+  const builder = makeBuilder(name, normalized)
+  const store = create<any>()(
+    applyMiddleware(builder as any, normalized) as any,
+  ) as BoundStore<any>
   return { name, store }
 }
 
@@ -223,14 +569,31 @@ export function defineStore<State extends object, Actions extends object>(
 // ============================================================================
 export function defineExtensionStore<State extends object, Actions extends object>(
   config: StoreConfig<State, Actions>,
-) {
+): () => StoreProxy<FullStoreState<State, Actions>>
+export function defineExtensionStore<
+  State extends object,
+  AM extends Record<string, any>,
+>(
+  config: GlobStoreConfig<State, AM>,
+): () => StoreProxy<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineExtensionStore<
+  State extends object,
+  AM extends Record<string, any>,
+>(
+  config: EagerGlobStoreConfig<State, AM>,
+): () => StoreProxy<FullStoreState<State, EagerDispatchersFromTypeMap<AM>>>
+export function defineExtensionStore(configArg: any): any {
+  // Accept the folder-glob form (`actions: import.meta.glob('./actions/*.ts')`)
+  // identically to defineStore/defineLocalStore — normalize it to lazyActions
+  // before building so extension stores share the ONE authoring pattern.
+  const config = normalizeGlobConfig(configArg) as StoreConfig<any, any>
   let counter = 0
   return () => {
     const group = `chat-ext:${counter++}`
     const builder = makeBuilder(group, config)
-    const store = create<FullStoreState<State, Actions>>()(
+    const store = create<FullStoreState<any, any>>()(
       applyMiddleware(builder, config) as any,
-    ) as BoundStore<FullStoreState<State, Actions>>
+    ) as BoundStore<FullStoreState<any, any>>
     return createStoreProxy(store)
   }
 }
@@ -288,29 +651,50 @@ function createLocalProxy<S extends object>(
   })
 }
 
-export function defineLocalStore<State extends object, Actions extends object>(
-  config: StoreConfig<State, Actions>,
-): LocalStoreDef<FullStoreState<State, Actions>> {
+export function defineLocalStore<
+  State extends object,
+  Actions extends object = {},
+  LA extends LazyActionsConfig<State> = {},
+>(
+  config: StoreConfig<State, Actions, LA>,
+): LocalStoreDef<FullStoreState<State, Actions & LazyDispatchers<LA>>>
+export function defineLocalStore<
+  State extends object,
+  AM extends Record<string, any>,
+>(
+  config: GlobStoreConfig<State, AM>,
+): LocalStoreDef<FullStoreState<State, DispatchersFromTypeMap<AM>>>
+export function defineLocalStore<
+  State extends object,
+  AM extends Record<string, any>,
+>(
+  config: EagerGlobStoreConfig<State, AM>,
+): LocalStoreDef<FullStoreState<State, EagerDispatchersFromTypeMap<AM>>>
+export function defineLocalStore(configArg: any): any {
   // A distinct EventBus group per live instance so instances don't clobber each
   // other's listeners (defineStore's global variant can key by the store name;
-  // locals can't).
+  // locals can't). The runtime `makeBuilder` already spreads the lazy-action
+  // dispatchers into state; the LA/AM generic just surfaces them in the TYPE (so
+  // a per-pane store — e.g. Chat — exposes its lazy actions to consumers).
+  const config = normalizeGlobConfig(configArg) as StoreConfig<any, any>
+  type Full = any
   let counter = 0
   return {
-    use: (initial) => {
+    use: (initial: any) => {
       const ref = useRef<{
-        api: StoreApi<FullStoreState<State, Actions>>
-        proxy: LocalStoreInstance<FullStoreState<State, Actions>>
+        api: StoreApi<Full>
+        proxy: LocalStoreInstance<Full>
       } | null>(null)
 
       if (ref.current === null) {
         const group = `local:${counter++}`
-        const merged: StoreConfig<State, Actions> = initial
-          ? { ...config, state: { ...config.state, ...initial } as State }
+        const merged = initial
+          ? { ...config, state: { ...config.state, ...initial } }
           : config
-        const builder = makeBuilder(group, merged)
-        const api = createStore<FullStoreState<State, Actions>>()(
-          applyMiddleware(builder, merged) as any,
-        ) as StoreApi<FullStoreState<State, Actions>>
+        const builder = makeBuilder(group, merged as StoreConfig<any, any>)
+        const api = createStore<Full>()(
+          applyMiddleware(builder as any, merged as StoreConfig<any, any>) as any,
+        ) as StoreApi<Full>
         ref.current = { api, proxy: createLocalProxy(api) }
       }
 
@@ -318,10 +702,17 @@ export function defineLocalStore<State extends object, Actions extends object>(
       // init on mount, teardown on unmount — lifecycle rides the component.
       useEffect(() => {
         api.getState().__init__.__store__()
-        return () => api.getState().__destroy__()
+        // `__destroy__` may be async (a store whose teardown awaits a lazy
+        // action); the React cleanup fires-and-forgets it (must return void).
+        return () => {
+          void api.getState().__destroy__()
+        }
         // eslint-disable-next-line react-hooks/exhaustive-deps
       }, [])
       return proxy
     },
   }
 }
+
+// Whole-store-lazy registration (defined in ./stores; re-exported for co-location with defineStore).
+export { registerLazyStore } from './stores'

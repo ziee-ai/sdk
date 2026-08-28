@@ -49,16 +49,41 @@ pub struct PermissionDetail {
 ///         .summary("List all users with pagination")
 /// }
 /// ```
+/// OpenAPI extension key carrying the operation's required permissions.
+///
+/// This is the ONLY clobber-proof record of them. The human-readable copy lives
+/// in the operation's `description`, which any later `.description("…")` in the
+/// same `_docs` builder REPLACES; the machine-readable copy in the 403 example
+/// is likewise lost when a builder attaches its own `.response_with::<403, …>`.
+/// Measured on the shipped spec, those two losses left 201 and then 18
+/// permission-gated operations with no recoverable permission — which the
+/// control MCP catalog reads as "no permission declared → anyone may run it".
+/// An `x-` extension is written by nobody else and survives both.
+pub const X_REQUIRED_PERMISSIONS: &str = "x-required-permissions";
+
 pub fn with_permission<Perms: PermissionList>(op: TransformOperation) -> TransformOperation {
     // Add description with permission info
     let permission_desc = Perms::format_description();
 
-    let op = op.description(&permission_desc);
+    let mut op = op.description(&permission_desc);
 
     // Add standard 403 Forbidden response with JSON body
     let names = Perms::names();
     let permissions = Perms::permissions();
     let descriptions = Perms::descriptions();
+
+    // Stamp the machine-readable, unclobberable record. ALL permissions, in
+    // declaration order — the extractor requires every one of them.
+    op.inner_mut().extensions.insert(
+        X_REQUIRED_PERMISSIONS.to_string(),
+        serde_json::Value::Array(
+            permissions
+                .iter()
+                .map(|p| serde_json::Value::String((*p).to_string()))
+                .collect(),
+        ),
+    );
+    let op = op;
 
     // Create example with permissions
     let error_msg = if permissions.len() == 1 {
@@ -139,6 +164,63 @@ mod with_permission_tests {
             json["description"].as_str().unwrap_or("").contains("users::read"),
             "with_permission must name the permission in the description: {}",
             json["description"]
+        );
+        // …and the unclobberable extension carries it too.
+        assert_eq!(
+            json[X_REQUIRED_PERMISSIONS],
+            serde_json::json!(["users::read"]),
+            "with_permission must stamp {X_REQUIRED_PERMISSIONS}: {json}"
+        );
+    }
+
+    struct TestPerm2;
+    impl PermissionCheck for TestPerm2 {
+        const NAME: &'static str = "UsersEdit";
+        const PERMISSION: &'static str = "users::edit";
+        const DESCRIPTION: &'static str = "Edit users";
+        const MODULE: &'static str = "users";
+    }
+
+    /// The extension carries EVERY permission of an ALL-of operation, in
+    /// declaration order — the description's multi-permission heading is not
+    /// even parseable by the catalog, and taking only the first would under-gate.
+    #[test]
+    fn extension_carries_all_permissions_of_an_all_of_operation() {
+        let mut op = aide::openapi::Operation::default();
+        {
+            let t = TransformOperation::new(&mut op);
+            let _ = with_permission::<(TestPerm, TestPerm2)>(t);
+        }
+        let json = serde_json::to_value(&op).expect("serialize operation");
+        assert_eq!(
+            json[X_REQUIRED_PERMISSIONS],
+            serde_json::json!(["users::read", "users::edit"]),
+            "got {json}"
+        );
+    }
+
+    /// The extension survives a handler `_docs` builder that REPLACES both the
+    /// description and the 403 response — the exact shape that lost the
+    /// permission on 201 + 18 operations.
+    #[test]
+    fn extension_survives_a_description_and_403_override() {
+        let mut op = aide::openapi::Operation::default();
+        {
+            let t = TransformOperation::new(&mut op);
+            let t = with_permission::<(TestPerm,)>(t);
+            // What a real handler does afterwards:
+            let t = t.description("Create a personal chat project.");
+            let _ = t.response_with::<403, (), _>(|r| r.description("Not the owner"));
+        }
+        let json = serde_json::to_value(&op).expect("serialize operation");
+        assert!(
+            !json["description"].as_str().unwrap_or("").contains("users::read"),
+            "precondition: the description must have been clobbered: {json}"
+        );
+        assert_eq!(
+            json[X_REQUIRED_PERMISSIONS],
+            serde_json::json!(["users::read"]),
+            "the extension must survive: {json}"
         );
     }
 }

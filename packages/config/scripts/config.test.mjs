@@ -53,3 +53,111 @@ test('a parameterized lint scans an arbitrary --root: clean passes, violation fa
   assert.ok((r.stdout + r.stderr).includes('bg-blue-500'))
   fs.rmSync(dir, { recursive: true, force: true })
 })
+
+// ── design-spec: an app that LAYERS its token sheet over a package's ───────────
+//
+// The gate assumed ziee's layout — ONE app CSS carrying `@theme inline` + `:root`
+// + `.dark`. An app that imports a package token sheet and then overrides it
+// (COMIZY's `@ziee/kit/styles/tokens.css` + `src/styles/nocturne.css`, whose dark
+// block is the selector LIST `.dark, .nc-force-dark`) could not be pointed at its
+// own tokens at all: a single `--css` saw only half the palette, and the sheet
+// carrying the overrides has no `@theme inline`, so the script threw
+// `Error: block not found: @theme inline` — an uncaught stack trace, not a
+// message an app author could act on.
+const designSpec = path.join(PKG, 'src', 'lint', 'design-spec.mjs')
+
+/** A throwaway app root with the given files; returns its path. */
+function cssFixture(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'design-spec-'))
+  for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body)
+  return dir
+}
+
+const BASE_SHEET = `
+/* a comment carrying braces { } and a semicolon ; and parens ( ) */
+@theme inline {
+  --color-primary: var(--primary);
+  --radius-lg: var(--radius);
+}
+:root { --primary: #base; --radius: 10px; }
+.dark { --primary: #basedark; }
+`
+
+test('design-spec: repeatable --css layers sheets in cascade order', () => {
+  const dir = cssFixture({
+    'base.css': BASE_SHEET,
+    'over.css': ':root { --primary: #light; }\n.dark, .force-dark { --primary: #dark; }\n',
+  })
+  const r = spawnSync(node, [designSpec, '--css', 'base.css', '--css', 'over.css', '--out', 'D.md'], {
+    cwd: dir,
+    encoding: 'utf8',
+  })
+  assert.equal(r.status, 0, r.stderr)
+  const md = fs.readFileSync(path.join(dir, 'D.md'), 'utf-8')
+  // The LAYERED sheet wins in both themes — and the dark block was found even
+  // though its selector is a comma LIST, not the bare `.dark` the scan matched.
+  assert.match(md, /\| `--primary` \| `#light` \| `#dark` \|/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('design-spec: --dark-selector names an app-specific dark scope', () => {
+  const dir = cssFixture({
+    'base.css': BASE_SHEET,
+    'over.css': ':root { --primary: #light; }\n[data-theme="night"] { --primary: #night; }\n',
+  })
+  const r = spawnSync(
+    node,
+    [designSpec, '--css', 'base.css', '--css', 'over.css', '--dark-selector', '[data-theme="night"]', '--out', 'D.md'],
+    { cwd: dir, encoding: 'utf8' },
+  )
+  assert.equal(r.status, 0, r.stderr)
+  assert.match(fs.readFileSync(path.join(dir, 'D.md'), 'utf-8'), /\| `--primary` \| `#light` \| `#night` \|/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('design-spec: a missing block exits 1 with an actionable message, not a stack trace', () => {
+  const dir = cssFixture({ 'only-overrides.css': ':root { --primary: #light; }\n' })
+  const r = spawnSync(node, [designSpec, '--css', 'only-overrides.css', '--out', 'D.md'], {
+    cwd: dir,
+    encoding: 'utf8',
+  })
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /\[design-spec\] no `@theme inline` block/)
+  assert.match(r.stderr, /repeatable --css/)
+  assert.ok(!/^\s+at /m.test(r.stderr), `expected no stack trace, got:\n${r.stderr}`)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('design-spec: a --css file that does not exist is NAMED, not an ENOENT throw', () => {
+  const dir = cssFixture({})
+  const r = spawnSync(node, [designSpec, '--css', 'nope.css', '--out', 'D.md'], {
+    cwd: dir,
+    encoding: 'utf8',
+  })
+  assert.equal(r.status, 1)
+  assert.match(r.stderr, /\[design-spec\] --css .*nope\.css does not exist/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('design-spec: every :root block merges — not just the first', () => {
+  // A real token sheet declares `:root` several times (theme-independent tokens,
+  // then the palette, then the kit contract). Reading only the FIRST match took
+  // one arbitrary slice and silently dropped the rest.
+  const dir = cssFixture({
+    'sheet.css': `
+@theme inline { --color-primary: var(--primary); --color-border: var(--border); }
+:root { --primary: #p; }
+.dark { --primary: #pd; --border: #bd; }
+:root { --border: #b; }
+`,
+  })
+  const r = spawnSync(node, [designSpec, '--css', 'sheet.css', '--out', 'D.md'], {
+    cwd: dir,
+    encoding: 'utf8',
+  })
+  assert.equal(r.status, 0, r.stderr)
+  const md = fs.readFileSync(path.join(dir, 'D.md'), 'utf-8')
+  assert.match(md, /\| `--primary` \| `#p` \| `#pd` \|/)
+  assert.match(md, /\| `--border` \| `#b` \| `#bd` \|/)
+  fs.rmSync(dir, { recursive: true, force: true })
+})

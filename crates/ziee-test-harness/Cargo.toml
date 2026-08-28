@@ -33,30 +33,43 @@ uuid = { version = "1.18", features = ["v4"] }
 url = "2.5"
 tempfile = "3.15"
 portpicker = "0.1"
+# `flock(2)` for the per-test data dir's liveness lock (see `data_dir.rs`).
+libc = "0.2"
 
-# --- `fixtures` feature only (app-neutral auth/sync test mocks) --------------
+# --- fixture features only (app-neutral auth/sync test mocks) ----------------
 # Optional so the lean spawn/isolation core stays dep-light. Versions/features
 # mirror the ziee server catalog so the single Cargo.lock unifies them.
-serde_json = { version = "1", optional = true }
-tokio-stream = { version = "0.1", optional = true }
-testcontainers = { version = "0.27.3", optional = true }
-wiremock = { version = "0.6", optional = true }
-jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"], optional = true }
-base64 = { version = "0.22", optional = true }
-rsa = { version = "0.9", features = ["pem"], optional = true }
+serde_json = { version = "1", optional = true }        # both fixture groups
+tokio-stream = { version = "0.1", optional = true }    # sync-probe only
+testcontainers = { version = "0.27.3", optional = true }              # auth-mocks
+wiremock = { version = "0.6", optional = true }                       # auth-mocks
+jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"], optional = true } # auth-mocks
+base64 = { version = "0.22", optional = true }                        # auth-mocks
+rsa = { version = "0.9", features = ["pem"], optional = true }        # auth-mocks
 
 [features]
-# Compiles the `fixtures` module (oauth/ldap/apple mocks + the SSE sync probe).
-# Pulls the heavier test-only deps + reqwest's `stream` (sync_probe's
-# `bytes_stream()`) + tokio's `macros` (the fixtures' `#[cfg(test)]` self-tests).
-fixtures = [
+# The SSE sync probe ALONE. Split out of `fixtures` because the probe is the
+# cheap half and the flag was the expensive half: an app that wants an SSE reader
+# — the one tool that makes a two-user AUDIENCE bug observable, since
+# `connection_id()` is what lets a test assert the acting connection was SKIPPED —
+# had to accept `testcontainers` (a docker client) and `wiremock` (an HTTP mock
+# server) into its `Cargo.lock` to get it. Cost is not neutral for a diagnostic:
+# whatever raises the price of the tool raises the odds the next audience bug
+# ships unseen. These three are exactly what `sync_probe.rs` names.
+sync-probe = ["dep:serde_json", "dep:tokio-stream", "reqwest/stream"]
+
+# The OAuth/LDAP/Apple mocks. `tokio/macros` is theirs alone (their `#[tokio::test]`
+# self-tests); `sync_probe` has none, which is why it does not pull it.
+auth-mocks = [
     "dep:serde_json",
-    "dep:tokio-stream",
     "dep:testcontainers",
     "dep:wiremock",
     "dep:jsonwebtoken",
     "dep:base64",
     "dep:rsa",
-    "reqwest/stream",
     "tokio/macros",
 ]
+
+# Everything — the pre-split meaning of this flag, preserved exactly so no
+# existing consumer changes behaviour.
+fixtures = ["sync-probe", "auth-mocks"]

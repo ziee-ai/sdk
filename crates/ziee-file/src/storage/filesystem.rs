@@ -226,7 +226,15 @@ impl FileStorage for FilesystemStorage {
         fs::read(&path)
             .await
             .map_err(|e| {
-                tracing::warn!(error = %e, "load_original failed");
+                tracing::warn!(
+                    error = %e,
+                    base = %self.base_path.display(),
+                    path = %path.display(),
+                    %user_id,
+                    %file_id,
+                    extension,
+                    "load_original failed"
+                );
                 AppError::not_found("File")
             })
     }

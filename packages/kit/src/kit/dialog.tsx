@@ -4,6 +4,7 @@ import {
   HOST_FOCUS_TRAP_SELECTOR,
 } from '../shadcn/dialog'
 import { DivScrollY } from '../internal/div-scroll-y'
+import { useInitialFocus, type InitialFocus } from '../internal/initial-focus'
 import { cn } from '../lib/utils'
 
 const widths = { sm: 'sm:max-w-sm', default: 'sm:max-w-lg', lg: 'sm:max-w-2xl', xl: 'sm:max-w-4xl' } as const
@@ -17,13 +18,25 @@ export interface DialogProps {
   footer?: React.ReactNode
   size?: keyof typeof widths
   trigger?: React.ReactElement
+  /** Accessible name AND hover text for the corner ×. Defaults to 'Close' — the word this
+   *  component has always hardcoded — so it is optional; supply it in a translated app. */
+  closeLabel?: string
   className?: string
   children?: React.ReactNode
+  /**
+   * WHERE FOCUS LANDS when the dialog opens — a `data-testid`, a ref, or `false` for "leave it on
+   * the popup". OMITTING IT IS SAFE: the default is the first tabbable control, SKIPPING anything
+   * marked `data-destructive` (the kit `Button` stamps that for `variant="destructive"`, and takes
+   * a `destructive` prop for the ones styled quietly). See `internal/initial-focus.ts` for why the
+   * guarded default exists — a dialog whose delete affordance sorts before its form otherwise
+   * opens with a destructive control focused, decided by layout rather than by intent.
+   */
+  initialFocus?: InitialFocus
   /** Test selector — forwarded onto the dialog content <root> (i18n-safe). */
   'data-testid': string
 }
 
-export function Dialog({ open, onOpenChange, title, description, footer, size = 'default', trigger, className, children, 'data-testid': testid }: DialogProps) {
+export function Dialog({ open, onOpenChange, title, description, footer, size = 'default', trigger, closeLabel, className, children, initialFocus, 'data-testid': testid }: DialogProps) {
   // If this Dialog lives inside a host focus-trap (a vaul Drawer), portal the
   // popup INTO that trap so its focus scope doesn't steal focus from — and
   // silence onChange on — inputs in the popup. Resolved from an always-mounted
@@ -35,6 +48,8 @@ export function Dialog({ open, onOpenChange, title, description, footer, size = 
   React.useLayoutEffect(() => {
     setContainer(anchorRef.current?.closest<HTMLElement>(HOST_FOCUS_TRAP_SELECTOR) ?? null)
   }, [open])
+  const popupRef = React.useRef<HTMLDivElement>(null)
+  const resolveInitialFocus = useInitialFocus(popupRef, initialFocus)
   return (
     <Root open={open} onOpenChange={onOpenChange}>
       <span ref={anchorRef} aria-hidden className="hidden" />
@@ -47,9 +62,12 @@ export function Dialog({ open, onOpenChange, title, description, footer, size = 
           `container` portals into the host focus trap so inputs stay typable in a
           Dialog-inside-Drawer (from batchfix/kit-dialog-input). */}
       <DialogContent
+        ref={popupRef}
+        initialFocus={resolveInitialFocus}
         container={container ?? undefined}
         className={cn('max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto]', widths[size], className)}
         data-testid={testid}
+        {...(closeLabel != null ? { closeLabel } : {})}
         {...(description == null ? { 'aria-describedby': undefined } : {})}
       >
         <DialogHeader>

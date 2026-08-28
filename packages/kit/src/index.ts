@@ -8,6 +8,12 @@
 export { KitSurfaceProvider, useSurface, Loading } from './kit/surface'
 export type { KitSurface } from './kit/surface'
 export { useControllableState } from './kit/use-controllable-state'
+// cross-window portal targeting — every kit overlay resolves its portal document through this.
+export {
+  PortalContainerProvider, PortalContainerInherit, usePortalContainer, usePortalContainerElement,
+  resolvePortalContainer,
+} from './kit/portal-container'
+export type { PortalContainerSource, PortalContainerValue } from './kit/portal-container'
 
 // multi-level menu primitives (composable; for nav flyouts / app menubars / right-click menus)
 export {
@@ -27,6 +33,14 @@ export {
 } from './shadcn/context-menu'
 export { ScrollArea } from './kit/scroll-area'
 export type { ScrollAreaProps } from './kit/scroll-area'
+
+// resizable panels (IDE dock frame) + collapsible + slider — vendored primitives,
+// already token-clean (data-slot + kit tokens); re-exported directly per the
+// menubar/context-menu precedent. `useIsMobile` = the responsive breakpoint hook.
+export { ResizablePanelGroup, ResizablePanel, ResizableHandle } from './shadcn/resizable'
+export { Collapsible, CollapsibleTrigger, CollapsibleContent } from './shadcn/collapsible'
+export { Slider } from './shadcn/slider'
+export { useIsMobile } from './hooks/use-mobile'
 
 // sidebar (composite — provider + collapsible rail + mobile sheet + menu parts)
 export {
@@ -66,7 +80,7 @@ export { Input, PasswordInput } from './kit/input'
 export type { InputProps, PasswordInputProps } from './kit/input'
 export { Textarea } from './kit/textarea'
 export type { TextareaProps } from './kit/textarea'
-export { Select } from './kit/select'
+export { Select, SELECT_SEARCH_THRESHOLD } from './kit/select'
 export type { SelectProps, SelectOption, SelectOptionGroup } from './kit/select'
 export {
   SelectTrigger, SelectValue, SelectContent, SelectItem, SelectGroup, SelectLabel, SelectSeparator,
@@ -157,8 +171,8 @@ export { Separator } from './kit/separator'
 export type { SeparatorProps } from './kit/separator'
 export { Spinner, Spin } from './kit/spinner'
 export type { SpinnerProps, SpinProps } from './kit/spinner'
-export { Card } from './kit/card'
-export type { CardProps } from './kit/card'
+export { Card, CardActions } from './kit/card'
+export type { CardProps, CardActionsProps } from './kit/card'
 export { SectionHeader } from './kit/section-header'
 export type { SectionHeaderProps } from './kit/section-header'
 export { Text, Title, Paragraph, Link } from './kit/typography'

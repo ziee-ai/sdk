@@ -2,6 +2,7 @@ import { NavigationMenu as NavigationMenuPrimitive } from "@base-ui/react/naviga
 import { cva } from "class-variance-authority"
 
 import { cn } from "../lib/utils"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 import { ChevronDownIcon } from "lucide-react"
 
 function NavigationMenu({
@@ -98,10 +99,16 @@ function NavigationMenuPositioner({
   sideOffset = 8,
   align = "start",
   alignOffset = 0,
+  container,
   ...props
-}: NavigationMenuPrimitive.Positioner.Props) {
+}: NavigationMenuPrimitive.Positioner.Props & {
+    /** Portal target. Defaults to the document of the window this subtree renders in. */
+    container?: PortalContainerValue
+}) {
+  const portalContainer = usePortalContainer(container)
   return (
-    <NavigationMenuPrimitive.Portal>
+    <NavigationMenuPrimitive.Portal container={portalContainer}>
+     <PortalContainerInherit>
       <NavigationMenuPrimitive.Positioner
         side={side}
         sideOffset={sideOffset}
@@ -117,6 +124,7 @@ function NavigationMenuPositioner({
           <NavigationMenuPrimitive.Viewport className="relative size-full overflow-hidden" />
         </NavigationMenuPrimitive.Popup>
       </NavigationMenuPrimitive.Positioner>
+     </PortalContainerInherit>
     </NavigationMenuPrimitive.Portal>
   )
 }

@@ -114,6 +114,7 @@ async fn provision_external_user_links_identity_and_is_findable() {
         .provision_external_user_atomic(
             "carol",
             Some("carol@corp.com"),
+            true,
             "Carol",
             pid,
             "ext-123",
@@ -141,6 +142,272 @@ async fn provision_external_user_links_identity_and_is_findable() {
             .await
             .unwrap(),
         None
+    );
+
+    drop_db(&db).await;
+}
+
+/// Read `users.email_verified` for a user id.
+async fn email_verified_of(pool: &sqlx::PgPool, uid: Uuid) -> bool {
+    let row: (bool,) = sqlx::query_as("SELECT email_verified FROM users WHERE id = $1")
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+/// The OAuth/Gmail defect: provisioning used to omit `email_verified`
+/// from its INSERT, so every social-login user landed on the column
+/// default `false` even though the callback had already proven the
+/// provider asserted the address verified.
+#[tokio::test]
+async fn provision_external_user_persists_email_verified() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+    let pid = provider_id();
+
+    let uid = repo
+        .provision_external_user_atomic(
+            "gina",
+            Some("gina@gmail.com"),
+            true,
+            "Gina",
+            pid,
+            "ext-gina",
+            None,
+        )
+        .await
+        .expect("provision external user");
+
+    assert!(
+        email_verified_of(&pool, uid).await,
+        "a provider-verified email must persist email_verified = true"
+    );
+
+    drop_db(&db).await;
+}
+
+/// The flag is THREADED from the caller, not hardcoded `true`: the same
+/// call with `false` must leave the row unverified. Without this, the
+/// fix would silently mark every future provisioning path verified.
+#[tokio::test]
+async fn provision_external_user_honors_unverified_email() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+    let pid = provider_id();
+
+    let uid = repo
+        .provision_external_user_atomic(
+            "hank",
+            Some("hank@corp.com"),
+            false,
+            "Hank",
+            pid,
+            "ext-hank",
+            None,
+        )
+        .await
+        .expect("provision external user");
+
+    assert!(
+        !email_verified_of(&pool, uid).await,
+        "an unverified email must NOT be recorded as verified"
+    );
+
+    drop_db(&db).await;
+}
+
+/// Regression guard for the password path: a local signup's email is
+/// genuinely unverified, so it must stay `false`. This is the boundary
+/// the OAuth fix must not cross.
+#[tokio::test]
+async fn local_signup_email_is_not_verified() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+
+    let user = repo
+        .create_local_user_with_default_group("ivy", "ivy@corp.com", None, None)
+        .await
+        .unwrap();
+
+    assert!(!user.email_verified, "returned row must be unverified");
+    assert!(
+        !email_verified_of(&pool, user.id).await,
+        "a password signup must not be email-verified"
+    );
+
+    drop_db(&db).await;
+}
+
+/// First-Broker-Login: binding a provider-verified identity to an
+/// existing local account upgrades that account's `email_verified`,
+/// atomically with the link row. Case-insensitive, because
+/// `find_user_by_email_for_linking` matched case-insensitively.
+#[tokio::test]
+async fn linking_a_verified_identity_verifies_the_matching_email() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+    let pid = provider_id();
+
+    let user = repo
+        .create_local_user_with_default_group("jane", "Jane@Corp.com", None, None)
+        .await
+        .unwrap();
+    assert!(!user.email_verified, "starts unverified (local signup)");
+
+    let flipped = repo
+        .link_verified_external_identity(user.id, pid, "ext-jane", Some("jane@corp.com"), None)
+        .await
+        .expect("link verified identity");
+
+    assert!(flipped, "the method reports the flip it made");
+    assert!(
+        email_verified_of(&pool, user.id).await,
+        "a provider-verified matching email must verify the local account"
+    );
+    // The link row was written in the SAME transaction.
+    assert_eq!(
+        repo.find_user_by_auth_link(pid, "ext-jane").await.unwrap(),
+        Some(user.id)
+    );
+
+    drop_db(&db).await;
+}
+
+/// The write-side guard: an external email that is NOT this user's
+/// address (or is absent entirely) links the identity but must never
+/// vouch for the row's email.
+#[tokio::test]
+async fn linking_does_not_verify_a_mismatched_email() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+    let pid = provider_id();
+
+    let mismatched = repo
+        .create_local_user_with_default_group("kyle", "kyle@corp.com", None, None)
+        .await
+        .unwrap();
+    let flipped = repo
+        .link_verified_external_identity(
+            mismatched.id,
+            pid,
+            "ext-kyle",
+            Some("someone-else@corp.com"),
+            None,
+        )
+        .await
+        .expect("link identity");
+    assert!(!flipped, "a mismatched address must not report a flip");
+    assert!(
+        !email_verified_of(&pool, mismatched.id).await,
+        "a different address must not verify this user's email"
+    );
+    // The identity is still linked — only the verification is withheld.
+    assert_eq!(
+        repo.find_user_by_auth_link(pid, "ext-kyle").await.unwrap(),
+        Some(mismatched.id)
+    );
+
+    let absent = repo
+        .create_local_user_with_default_group("lena", "lena@corp.com", None, None)
+        .await
+        .unwrap();
+    let flipped_absent = repo
+        .link_verified_external_identity(absent.id, pid, "ext-lena", None, None)
+        .await
+        .expect("link identity without an external email");
+    assert!(!flipped_absent, "no external email → nothing to verify");
+    assert!(
+        !email_verified_of(&pool, absent.id).await,
+        "a missing external email must not verify the account"
+    );
+
+    drop_db(&db).await;
+}
+
+/// The return value is the DELTA, not the resulting state: linking a SECOND
+/// verified identity to an already-verified user reports `false` (nothing to
+/// upgrade) while still creating the link. Without the `AND email_verified =
+/// false` clause this would report `true` and the handler would "correct" a
+/// field that was never stale.
+#[tokio::test]
+async fn linking_an_already_verified_user_reports_no_upgrade() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+    let pid = provider_id();
+
+    let uid = repo
+        .provision_external_user_atomic(
+            "mo",
+            Some("mo@corp.com"),
+            true,
+            "Mo",
+            pid,
+            "ext-mo-1",
+            None,
+        )
+        .await
+        .expect("provision verified external user");
+    assert!(email_verified_of(&pool, uid).await, "starts verified");
+
+    let flipped = repo
+        .link_verified_external_identity(uid, pid, "ext-mo-2", Some("mo@corp.com"), None)
+        .await
+        .expect("link a second identity");
+
+    assert!(!flipped, "already verified → no upgrade to report");
+    assert!(
+        email_verified_of(&pool, uid).await,
+        "and it stays verified"
+    );
+    assert_eq!(
+        repo.find_user_by_auth_link(pid, "ext-mo-2").await.unwrap(),
+        Some(uid),
+        "the link is still created"
+    );
+
+    drop_db(&db).await;
+}
+
+/// A link that cannot be created must not verify anyone: a duplicate
+/// `(provider_id, external_id)` fails the INSERT, and the caller's email stays
+/// unverified.
+///
+/// Note what this does and does NOT prove. The INSERT runs first and its `?`
+/// returns early, so the UPDATE never executes on this path — the assertion
+/// would also hold for two separate non-transactional statements. It pins the
+/// ORDERING guarantee (no verification without a link), not the transaction.
+/// Proving rollback would need the UPDATE to fail after a successful INSERT,
+/// which no reachable input produces.
+#[tokio::test]
+async fn a_failed_link_verifies_nobody() {
+    let (pool, db) = fresh_db().await;
+    let repo = AuthRepository::new(pool.clone());
+    let pid = provider_id();
+
+    // Take the (provider_id, external_id) slot with a DIFFERENT user.
+    let squatter = repo
+        .create_local_user_with_default_group("nina", "nina@corp.com", None, None)
+        .await
+        .unwrap();
+    repo.link_verified_external_identity(squatter.id, pid, "ext-taken", None, None)
+        .await
+        .expect("first link");
+
+    let victim = repo
+        .create_local_user_with_default_group("omar", "omar@corp.com", None, None)
+        .await
+        .unwrap();
+    // Same external id → unique violation on the INSERT, which aborts before
+    // the verification UPDATE can run.
+    let err = repo
+        .link_verified_external_identity(victim.id, pid, "ext-taken", Some("omar@corp.com"), None)
+        .await;
+    assert!(err.is_err(), "duplicate external identity must fail");
+    assert!(
+        !email_verified_of(&pool, victim.id).await,
+        "a link that failed must not leave the user verified"
     );
 
     drop_db(&db).await;

@@ -16,6 +16,9 @@ type SheetBase = {
   trigger?: React.ReactElement
   /** Allow closing by clicking the backdrop (legacy `maskClosable`). Default true. */
   maskClosable?: boolean
+  /** Accessible name AND hover text for the corner ×. Defaults to 'Close' — the word this
+   *  component has always hardcoded — so it is optional; supply it in a translated app. */
+  closeLabel?: string
   className?: string
   children?: React.ReactNode
   /** Test selector — forwarded onto the sheet content <root> (i18n-safe). */
@@ -40,7 +43,7 @@ export type SheetProps =
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), hi)
 
-export function Sheet({ open, onOpenChange, title, description, footer, side = 'right', trigger, maskClosable = true, loading, loadingLabel, className, children, 'data-testid': testid, ...rest }: SheetProps) {
+export function Sheet({ open, onOpenChange, title, description, footer, side = 'right', trigger, maskClosable = true, loading, loadingLabel, closeLabel, className, children, 'data-testid': testid, ...rest }: SheetProps) {
   const resizable = (rest as { resizable?: boolean }).resizable
   const resizeLabel = (rest as { resizeLabel?: string }).resizeLabel
   const minSize = (rest as { minSize?: number }).minSize ?? 280
@@ -94,12 +97,21 @@ export function Sheet({ open, onOpenChange, title, description, footer, side = '
         className={cn(resizable && 'max-w-none', className)}
         style={resizable ? (horizontal ? { width: size } : { height: size }) : undefined}
         data-testid={testid}
+        {...(closeLabel != null ? { closeLabel } : {})}
         {...(description == null ? { 'aria-describedby': undefined } : {})}
       >
         <SheetHeader>
           <SheetTitle>{title}</SheetTitle>
           {description != null && <SheetDescription>{description}</SheetDescription>}
         </SheetHeader>
+        {/* No `min-h-0` here, and that is a measured decision rather than an oversight — the
+            obvious companion to the `max-h-[85svh]` cap in `shadcn/sheet.tsx`, and it would do
+            nothing. A flex item's automatic minimum size is its min-content size only while its
+            computed `overflow` is `visible`; this element is the scroll container itself
+            (`overflow-y-auto`), so its automatic minimum is already 0 and it shrinks without
+            help. Measured on a 390×800 phone with 3000px of content and no `min-h-0`: body
+            height 607, scrollHeight 3220 — a real track. Adding the class changed nothing, and a
+            class the layout does not depend on is one more thing a test would certify falsely. */}
         <div className="flex-1 overflow-y-auto px-4">
           {/* min-h centers reliably even though SheetContent isn't a flex column. */}
           {loading

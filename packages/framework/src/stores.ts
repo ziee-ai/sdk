@@ -2,6 +2,7 @@ import type { StoreApi, UseBoundStore } from 'zustand'
 import { useShallow } from 'zustand/react/shallow'
 import { useEffect } from 'react'
 import { useModuleSystemStore } from './module-system'
+import { useEventBusStore } from './events'
 
 // ============================================================================
 // Store Proxy - Creates typed store accessors with IntelliSense
@@ -138,8 +139,13 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
     scheduleDestroy: () => {
       const state = useStore.getState()
 
-      // Only schedule if store has __destroy__ method
-      if (!state.__destroy__ || typeof state.__destroy__ !== 'function') {
+      // Only schedule if the store still exists and has a __destroy__ method.
+      // `state` can be undefined for a per-instance (local) store whose Zustand
+      // store was already disposed before this ref-count-triggered teardown ran
+      // (rapid mount/unmount, e.g. split-chat panes). An unguarded
+      // `state.__destroy__` there throws → escapes to the router error boundary →
+      // blank page.
+      if (!state || !state.__destroy__ || typeof state.__destroy__ !== 'function') {
         return
       }
 
@@ -166,6 +172,15 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
 
     executeDestroy: () => {
       const state = useStore.getState()
+
+      // The store may have been disposed between scheduling and this timeout
+      // firing (a local store's Zustand instance torn down on unmount), leaving
+      // `getState()` undefined — nothing left to destroy.
+      if (!state || typeof (state as any).__destroy__ !== 'function') {
+        refTracker.destroyed = true
+        refTracker.destroyTimeoutId = null
+        return
+      }
 
       if (import.meta.env.DEV) {
         console.log('🗑️ Executing store destruction (delay expired)')
@@ -319,15 +334,65 @@ export interface RegisteredStores {
   // }
 }
 
-// Dynamic store proxy that gets populated by modules at runtime
-// But typed via RegisteredStores interface for IntelliSense
-export const Stores = new Proxy({} as RegisteredStores, {
-  get: (_, prop) => {
-    const moduleSystemState = useModuleSystemStore.getState()
-    const store = moduleSystemState.stores[prop as string]
-    return store
-  },
-})
+// NOTE: the global `Stores` proxy has been REMOVED. Every store is now consumed
+// via its direct handle (`import { X } from '.../X.store'`, the proxy returned
+// by `registerLazyStore` / `defineStore`) — so a page only pulls the stores it
+// actually uses (O(page-stores) boot instead of O(all-stores)). The module-system
+// registry below still tracks stores for lifecycle (init/destroy on module
+// load/unload + ref-counting); it simply no longer backs a global `.X` facade.
+
+/**
+ * WHOLE-STORE-LAZY registration. A store file calls this at module scope:
+ *
+ *   export const Users = registerLazyStore(defineStore('Users', { … }))
+ *
+ * It builds the lifecycle proxy ONCE (via `createStoreProxy`) and self-registers
+ * it, then RETURNS that proxy as the importable handle. So:
+ *   - `import { Users } from './Users.store'` → the reactive/lifecycle proxy
+ *     (the store's code rides THIS chunk, loaded only where imported → lazy).
+ *   - `Stores.Users` (compat shim) → the SAME proxy instance (single ref-count).
+ *
+ * The proxy is the sole owner of init-on-first-access + ref-counted destroy, so
+ * whether you reach it via the import or the shim, the lifecycle is identical.
+ * `defineStore`'s existing `{ name, store }` return is unchanged — this wraps it,
+ * so the 89 un-migrated modules that use `stores: [...]` are untouched.
+ */
+export function registerLazyStore<
+  H extends { name: string; store: UseBoundStore<StoreApi<any>> },
+>(handle: H): StoreProxy<ExtractZustandState<H['store']>> {
+  const proxy = createStoreProxy(handle.store)
+  useModuleSystemStore.getState().registerStore(handle.name, proxy as any)
+  return proxy as StoreProxy<ExtractZustandState<H['store']>>
+}
 
 // Type helper for accessing store state
 export type StoresType = RegisteredStores
+
+/**
+ * Direct handles for the framework-infra stores (were `Stores.EventBus` /
+ * `Stores.ModuleSystem`). Import these instead of going through a global.
+ *
+ * LAZY on purpose: `stores.ts` and `./module-system` (which provides
+ * `useModuleSystemStore` + imports `createStoreProxy` from here) form an import
+ * cycle. Whichever module the bundler evaluates first, the other's exports can
+ * still be in the temporal dead zone when this file's top-level runs — so an
+ * eager `createStoreProxy(useModuleSystemStore)` would capture `undefined` and
+ * every `ModuleSystem.<field>` read would throw `getState of undefined`. Building
+ * the inner proxy on FIRST ACCESS (by which point both modules are fully
+ * evaluated) resolves the cycle — this is the same laziness the removed global
+ * `Stores.X` proxy relied on.
+ */
+function lazyStoreProxy<T extends UseBoundStore<StoreApi<any>>>(
+  getStore: () => T,
+): Readonly<ExtractZustandState<T>> {
+  let inner: Readonly<ExtractZustandState<T>> | null = null
+  return new Proxy({} as Readonly<ExtractZustandState<T>>, {
+    get: (_t, prop) => {
+      if (inner == null) inner = createStoreProxy(getStore())
+      return (inner as Record<string | symbol, unknown>)[prop]
+    },
+  })
+}
+
+export const EventBus = lazyStoreProxy(() => useEventBusStore)
+export const ModuleSystem = lazyStoreProxy(() => useModuleSystemStore)

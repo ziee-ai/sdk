@@ -6,6 +6,7 @@ import { Tooltip } from './tooltip'
 import { useSurface } from './surface'
 import { cn } from '../lib/utils'
 import type { CheckedBinding } from './value-binding'
+import type { NoUndeclaredAria } from './aria-passthrough'
 
 interface SwitchBase {
   onBlur?: () => void
@@ -24,16 +25,21 @@ interface SwitchBase {
   'aria-label'?: string
   'aria-labelledby'?: string
   'aria-describedby'?: string
+  /** Marks the control required for assistive tech. `FormField required` INJECTS this (via
+   *  cloneElement, untyped), so a control that neither declares nor forwards it drops it
+   *  silently — the same silent-drop class `aria-passthrough.ts` exists for, and one the type
+   *  ban cannot see because the injection is untyped. */
+  'aria-required'?: boolean
   invalid?: boolean
   /** Test selector — forwarded onto <root> (i18n-safe). */
   'data-testid': string
 }
 // Controlled `checked` requires a change handler (see CheckedBinding); FormField stays valid.
-export type SwitchProps = SwitchBase & CheckedBinding
+export type SwitchProps = SwitchBase & NoUndeclaredAria<SwitchBase> & CheckedBinding
 
 export const Switch = React.forwardRef<HTMLButtonElement, SwitchProps>(function Switch(
   { checked, value, defaultChecked, onCheckedChange, onChange, onBlur, disabled, loading, size, name, id, label, tooltip, className,
-    'aria-label': ariaLabel, 'aria-labelledby': ariaLabelledby, 'aria-describedby': ariaDescribedby, invalid,
+    'aria-label': ariaLabel, 'aria-labelledby': ariaLabelledby, 'aria-describedby': ariaDescribedby, 'aria-required': ariaRequired, invalid,
     'data-testid': testid },
   ref,
 ) {
@@ -69,6 +75,7 @@ export const Switch = React.forwardRef<HTMLButtonElement, SwitchProps>(function 
       aria-labelledby={ariaLabelledby}
       aria-describedby={ariaDescribedby}
       aria-invalid={invalid || undefined}
+      aria-required={ariaRequired || undefined}
       aria-busy={loading || undefined}
       data-testid={testid}
       size={size}
@@ -98,9 +105,13 @@ export const Switch = React.forwardRef<HTMLButtonElement, SwitchProps>(function 
     </Tooltip>
   ) : control
   if (label == null) return maybeTip
+  // `maybeTip`, NOT `control`. This branch used to render the bare control, so a Switch that had
+  // BOTH a `label` and a `tooltip` silently dropped the tooltip — the prop's own doc promises it
+  // unconditionally, and a label is exactly when the extra sentence is a HINT rather than a name,
+  // i.e. when it carries information the label does not. Nothing warned; the source read fine.
   return (
     <div className="flex items-center gap-2">
-      {control}
+      {maybeTip}
       <label htmlFor={ctrlId} className={cn('text-sm', s.disabled && 'opacity-60')}>{label}</label>
     </div>
   )

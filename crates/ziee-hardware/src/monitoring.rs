@@ -84,7 +84,19 @@ pub async fn start_hardware_monitoring() {
 
     tokio::spawn(async {
         let mut interval = interval(Duration::from_secs(2)); // Update every 2 seconds
-        let mut sys = System::new_all();
+        // On a loaded/large host one refresh cycle can exceed the 2s period.
+        // With the DEFAULT `Burst` behaviour `tick()` would then resolve
+        // IMMEDIATELY every iteration, so this task would never return
+        // `Poll::Pending` — it would occupy one runtime worker forever and
+        // spin at 100% CPU. `Delay` re-bases the schedule after a slow tick so
+        // there is always a real await between cycles.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `System` is created on the blocking pool for the same reason the
+        // per-tick refresh is: `new_all()` walks all of /proc and takes
+        // seconds on a many-core host.
+        let mut sys = tokio::task::spawn_blocking(System::new_all)
+            .await
+            .unwrap_or_else(|_| System::new_all());
 
         loop {
             interval.tick().await;
@@ -124,11 +136,42 @@ pub async fn start_hardware_monitoring() {
                 break;
             }
 
-            // Refresh system information
-            sys.refresh_all();
-
-            // Collect usage data
-            let usage_update = collect_hardware_usage(&mut sys);
+            // Refresh + collect on the BLOCKING pool.
+            //
+            // `sysinfo::System::refresh_all()` (a full /proc walk) and
+            // `collect_hardware_usage` (which re-inits NVML and queries every
+            // GPU) are synchronous, CPU/syscall-bound calls with NO await
+            // points. On a 192-core host they take ~2.4s per cycle. Running
+            // them inline on a runtime worker meant this task held that worker
+            // for the whole cycle and — paired with the always-ready `Burst`
+            // tick above — never yielded at all. Any task woken by our own
+            // `broadcast_usage_update` (i.e. every subscriber's SSE body
+            // future, which tokio parks in the waking worker's non-stealable
+            // LIFO slot) was then never polled, so `update` frames were queued
+            // into each client's channel and NEVER written to the wire: the
+            // stream delivered `connected` and nothing else, forever.
+            // `spawn_blocking` moves the work off the runtime worker and makes
+            // this loop yield on every cycle.
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut sys = sys;
+                sys.refresh_all();
+                let update = collect_hardware_usage(&mut sys);
+                (sys, update)
+            });
+            let usage_update = match handle.await {
+                Ok((returned_sys, update)) => {
+                    sys = returned_sys;
+                    update
+                }
+                Err(e) => {
+                    // Clear the flag on the way out so a later subscribe can
+                    // start a fresh loop (a bare `break` would strand
+                    // MONITORING_ACTIVE=true and disable monitoring forever).
+                    tracing::error!("hardware monitoring refresh task failed: {e}");
+                    MONITORING_ACTIVE.store(false, Ordering::SeqCst);
+                    break;
+                }
+            };
 
             // Send update to all connected clients
             broadcast_usage_update(usage_update).await;
@@ -485,11 +528,70 @@ mod tests {
     }
 
 
+    /// END-TO-END loop delivery: a client registered BEFORE
+    /// `start_hardware_monitoring` must actually receive an `update` frame on
+    /// its channel.
+    ///
+    /// Regression guard for the starvation bug: the loop used to run
+    /// `System::refresh_all()` + `collect_hardware_usage()` (both blocking,
+    /// no await points) INLINE on a runtime worker, with the default `Burst`
+    /// missed-tick behaviour. On a host where one cycle exceeds the 2s period
+    /// (a many-core box: ~2.4s), `interval.tick()` resolved immediately every
+    /// iteration, so the task never returned `Poll::Pending` and never
+    /// released its worker. Everything it woke — including each subscriber's
+    /// SSE body future, which tokio parks in the waking worker's
+    /// non-stealable LIFO slot — was then never polled, so `update` frames
+    /// piled up in the channel and NEVER reached the wire (the stream
+    /// delivered `connected` and nothing else, indefinitely).
+    #[tokio::test]
+    #[serial(hw_monitoring)]
+    async fn monitoring_loop_delivers_an_update_to_a_registered_client() {
+        // Deliberately does NOT `clear()` the process-global registry: the
+        // non-`#[serial]` cap tests fill it concurrently, and wiping it
+        // mid-fill breaks them. Just claim one slot (retrying if a parallel
+        // cap test has it momentarily saturated).
+        let id = Uuid::new_v4();
+        let mut rx = {
+            let mut got = None;
+            for _ in 0..100 {
+                if let Some(rx) = add_client(id) {
+                    got = Some(rx);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            got.expect("a registry slot became available within 10s")
+        };
+
+        MONITORING_ACTIVE.store(false, Ordering::SeqCst);
+        start_hardware_monitoring().await;
+
+        // Generous bound: one cycle is ~1-3s even on a loaded 192-core host.
+        let got = tokio::time::timeout(Duration::from_secs(60), rx.recv()).await;
+
+        // Hygiene BEFORE asserting so a failure doesn't strand the globals.
+        remove_client(id);
+        stop_hardware_monitoring();
+
+        assert!(
+            matches!(got, Ok(Some(Ok(_)))),
+            "the monitoring loop must deliver an update frame to a registered \
+             client (got {:?})",
+            got.map(|o| o.map(|r| r.is_ok()))
+        );
+    }
+
     /// add_client registers a client + returns its receiver; remove_client
     /// drops it from the SSE pool. The monitoring loop (start_hardware_monitoring)
     /// keys entirely off this pool, so its registration lifecycle is the unit
     /// under test. Unique ids keep this safe under parallel test execution.
+    // `#[serial(hw_monitoring)]`: this test FILLS the process-global registry
+    // to MAX_SSE_CLIENTS. Run in parallel with the other pool-filling tests it
+    // stole their slots, so their `add_client(...).is_some()` assertions failed
+    // intermittently (a long-standing flake). Every registry-MUTATING test in
+    // this module is now in the same serial group.
     #[test]
+    #[serial(hw_monitoring)]
     fn add_then_remove_client_updates_the_sse_pool() {
         let id = Uuid::new_v4();
         assert!(
@@ -567,7 +669,10 @@ mod tests {
 
     /// stop_hardware_monitoring clears the active flag so the spawned loop exits
     /// within one tick (graceful shutdown path).
+    // Serialized with the rest: it flips the process-global MONITORING_ACTIVE,
+    // which the loop-lifecycle tests depend on.
     #[test]
+    #[serial(hw_monitoring)]
     fn stop_hardware_monitoring_clears_the_active_flag() {
         MONITORING_ACTIVE.store(true, Ordering::SeqCst);
         stop_hardware_monitoring();
@@ -583,7 +688,10 @@ mod tests {
     /// slot via `remove_client` lets a new client in again. Robust to any
     /// baseline count: we add until the first rejection, prove rejection
     /// happened, then prove a removal re-opens a slot, and clean up after.
+    // `#[serial(hw_monitoring)]` — fills the process-global registry to the
+    // cap; see the note on `add_then_remove_client_updates_the_sse_pool`.
     #[test]
+    #[serial(hw_monitoring)]
     fn add_client_enforces_cap_and_remove_frees_a_slot() {
         let mut accepted: Vec<Uuid> = Vec::new();
         let mut rejected = false;

@@ -81,9 +81,34 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
 
     /// Register a new connection. Returns a 429 `AppError` when a global
     /// or per-user connection cap is hit.
+    ///
+    /// A cap is only ever charged for connections that are still ALIVE: before
+    /// each cap check the corresponding set is swept of connections whose
+    /// stream is gone (`prune_closed_locked`). Without that sweep a user whose
+    /// slots leaked would be refused forever. The primary release path is the
+    /// subscribe handler's connection guard (`unregister` on drop), which since
+    /// the guard was hoisted out of the stream generator covers EVERY
+    /// termination including a never-polled stream; this sweep is the backstop
+    /// for any future path that loses the guard. The remaining reapers
+    /// (`deliver`'s and `deliver_session_to_users`' send-failure prunes) need an
+    /// event to deliver, so they reclaim nothing on a quiescent deployment.
+    ///
+    /// The sweep is deliberately on-demand rather than a background reaper: a
+    /// stale slot's user-visible effect is a cap refusal, and the caps are
+    /// evaluated exclusively here (DEC-4).
+    ///
+    /// **Cap-check ORDER is part of the contract**: global first, then
+    /// per-user, so a saturated deployment reports `SYNC_GLOBAL_LIMIT` (a
+    /// capacity incident) rather than masking it as `SYNC_USER_LIMIT` (a
+    /// per-account problem) for a user who happens to also be at their own cap.
+    /// Each cap sweeps its own scope only when it would otherwise trip, so the
+    /// common path does no extra work at all.
     pub fn register(&self, conn_id: ConnId, conn: ClientConn<P>) -> Result<(), AppError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
+        if inner.clients.len() >= GLOBAL_MAX_CONNECTIONS {
+            prune_closed_locked(&mut inner);
+        }
         if inner.clients.len() >= GLOBAL_MAX_CONNECTIONS {
             return Err(AppError::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -91,7 +116,12 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
                 "Realtime sync is at capacity; retry shortly",
             ));
         }
-        let user_count = inner.by_user.get(&conn.user_id).map_or(0, |s| s.len());
+
+        let mut user_count = inner.by_user.get(&conn.user_id).map_or(0, |s| s.len());
+        if user_count >= PER_USER_MAX_CONNECTIONS {
+            prune_closed_for_user_locked(&mut inner, conn.user_id);
+            user_count = inner.by_user.get(&conn.user_id).map_or(0, |s| s.len());
+        }
         if user_count >= PER_USER_MAX_CONNECTIONS {
             return Err(AppError::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -103,6 +133,46 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
         inner.by_user.entry(conn.user_id).or_default().insert(conn_id);
         inner.clients.insert(conn_id, conn);
         Ok(())
+    }
+
+    /// Sweep every connection whose stream is gone, returning how many were
+    /// freed.
+    ///
+    /// The liveness signal is `sender.is_closed()`, and it is the ONLY one used
+    /// deliberately. Each connection's `Receiver` is owned solely by its own SSE
+    /// stream, so a closed sender means exactly "that stream no longer exists" —
+    /// there is nothing left to bound. An idle-but-live stream (the normal state
+    /// of a sync connection on a quiet deployment) is never touched.
+    ///
+    /// This is the BACKSTOP. The primary, deterministic release is the
+    /// subscribe handler's connection guard, which is constructed at
+    /// registration and moved into the stream so it is dropped even if the
+    /// stream is never polled.
+    ///
+    /// **Load-bearing invariant**: the registry holds the SOLE surviving
+    /// `Sender` clone (the handler's own `tx` drops when the handler returns,
+    /// and `rx` lives inside the stream). That is what makes `remove_conn`
+    /// terminate the stream rather than orphan it — dropping the sender closes
+    /// the channel, `rx.recv()` yields `None` and the loop breaks. Do not
+    /// introduce a second long-lived `Sender` clone.
+    #[cfg(test)]
+    pub fn prune_closed(&self) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        prune_closed_locked(&mut inner)
+    }
+
+    /// Sweep only `user_id`'s dead connections (same signal as
+    /// [`Self::prune_closed`]), returning how many were freed. Other users'
+    /// connections are never inspected or touched.
+    ///
+    /// `#[cfg(test)]` like its sibling: on the production path the sweep runs
+    /// inside `register`, which already holds the lock and therefore calls
+    /// `prune_closed_for_user_locked` directly. Shipping a lock-taking wrapper
+    /// with no production caller would be dead API (§15).
+    #[cfg(test)]
+    pub fn prune_closed_for_user(&self, user_id: Uuid) -> usize {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        prune_closed_for_user_locked(&mut inner, user_id)
     }
 
     /// Remove a connection (called on stream termination).
@@ -236,6 +306,106 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
             .clients
             .len()
     }
+}
+
+/// Sweep every connection whose stream is gone. Caller holds the lock.
+///
+/// **Liveness signal — `sender.is_closed()`, and deliberately only that.** Each
+/// connection's `Receiver` is owned solely by its own SSE stream, so a closed
+/// sender means exactly "that stream no longer exists": there is nothing left to
+/// bound. An idle-but-live stream (the normal state of a connection on a quiet
+/// deployment) is never touched.
+///
+/// **Deliberately NOT reclaimed: a connection that is merely OLD.** An earlier
+/// revision also reaped connections past their token's `exp`, to cover a peer
+/// that vanished without the socket ever erroring. That is wrong: in exactly
+/// that case the stream future is not being polled (which is *why* it outlived
+/// its own deadline), so dropping the registry entry frees the accounting slot
+/// while the stream future, its channel, its tokio task and its socket all
+/// survive. The cap would then bound bookkeeping rather than real resources,
+/// letting a client accumulate server-side connections *past* the cap — trading
+/// a fail-closed bound for unbounded growth. A backpressured-but-healthy stream
+/// (suspended at `yield`, or inside the periodic re-check's DB await) is also
+/// past its deadline and would be reaped. That case stays bounded the honest
+/// way: axum's keep-alive writes eventually fail on a dead peer, hyper drops the
+/// body, and the connection guard fires.
+///
+/// **Load-bearing invariant**: the registry holds the SOLE surviving `Sender`
+/// clone (the handler's own `tx` drops when the handler returns, and `rx` lives
+/// inside the stream). That is what makes `remove_conn` TERMINATE the stream
+/// rather than orphan it — dropping the sender closes the channel, `rx.recv()`
+/// yields `None`, and the loop breaks. Do not introduce a second long-lived
+/// `Sender` clone.
+///
+/// Collect-then-remove so the two-index invariant is maintained by the single
+/// `remove_conn` helper.
+fn prune_closed_locked<P: Principal>(inner: &mut RegistryInner<P>) -> usize {
+    let dead: Vec<ConnId> = inner
+        .clients
+        .iter()
+        .filter(|(_, c)| c.sender.is_closed())
+        .map(|(id, _)| *id)
+        .collect();
+    let n = dead.len();
+    for cid in dead {
+        remove_conn(inner, cid);
+    }
+    if n > 0 {
+        tracing::debug!("sync registry: reclaimed {n} dead connection(s)");
+    }
+    n
+}
+
+/// Sweep only `user_id`'s dead connections. Caller holds the lock.
+///
+/// An id present in `by_user` but MISSING from `clients` is treated as dead too.
+/// `register` and `remove_conn` keep the two indexes in lockstep under one lock,
+/// so that desync should be unreachable — but `user_count` is derived from
+/// `by_user`, so an orphan would count against the per-user cap forever and
+/// NEITHER sweep could clear it (this one would filter it out, the global one
+/// iterates `clients`). That is the permanently-429'd account this module exists
+/// to prevent, so the sweep repairs it rather than skipping it.
+fn prune_closed_for_user_locked<P: Principal>(
+    inner: &mut RegistryInner<P>,
+    user_id: Uuid,
+) -> usize {
+    let Some(set) = inner.by_user.get(&user_id) else {
+        return 0;
+    };
+    let dead: Vec<ConnId> = set
+        .iter()
+        .filter(|cid| {
+            // Missing from `clients` => an orphaned index entry; see the doc
+            // comment. `is_none_or` makes the sweep repair it.
+            inner.clients.get(*cid).is_none_or(|c| c.sender.is_closed())
+        })
+        .copied()
+        .collect();
+    let n = dead.len();
+    for cid in dead {
+        // `remove_conn` is keyed off `clients`: it no-ops entirely when the row
+        // is missing (an orphan), and when `clients[cid].user_id` disagrees with
+        // `user_id` it would clean the OTHER user's index. So drop THIS user's
+        // index entry unconditionally as well — that is what guarantees the id
+        // stops counting against `user_id`'s cap for every shape that REACHES
+        // this loop (normal-dead, orphan, cross-user-dead). One shape cannot
+        // reach it: an id in `by_user[user_id]` whose `clients` row is a LIVE
+        // connection of a DIFFERENT user is filtered out of `dead` by design
+        // (nothing live is ever swept), so it would keep counting. That desync
+        // is unreachable — `register` and `remove_conn` are the only writers and
+        // both move the two indexes together under one lock.
+        remove_conn(inner, cid);
+        if let Some(set) = inner.by_user.get_mut(&user_id) {
+            set.remove(&cid);
+            if set.is_empty() {
+                inner.by_user.remove(&user_id);
+            }
+        }
+    }
+    if n > 0 {
+        tracing::debug!("sync registry: reclaimed {n} dead connection(s) for one user");
+    }
+    n
 }
 
 /// Remove a connection from both indexes (shared by unregister + deliver's
@@ -448,15 +618,22 @@ mod tests {
     fn per_user_cap_rejects_excess_connections() {
         let reg = empty_registry();
         let uid = Uuid::new_v4();
+        // The receivers must be HELD: a cap is charged for live connections
+        // only, so a per-iteration `_rx` binding (dropped at the end of each
+        // iteration) would register connections whose streams are already gone
+        // and `register`'s sweep would rightly reclaim them.
+        let mut alive = Vec::new();
         for _ in 0..PER_USER_MAX_CONNECTIONS {
-            let (c, _rx) = conn(uid, principal(false, vec![]));
+            let (c, rx) = conn(uid, principal(false, vec![]));
             reg.register(Uuid::new_v4(), c).unwrap();
+            alive.push(rx);
         }
         let (overflow, _rx) = conn(uid, principal(false, vec![]));
         assert!(
             reg.register(Uuid::new_v4(), overflow).is_err(),
             "the (cap+1)th connection for one user must be refused (429)"
         );
+        drop(alive);
     }
 
     #[test]
@@ -490,9 +667,13 @@ mod tests {
         // Fill the registry to GLOBAL_MAX_CONNECTIONS with one connection per
         // distinct user, so the GLOBAL cap (not the per-user cap) is what trips.
         let reg = empty_registry();
+        // Receivers HELD — see `per_user_cap_rejects_excess_connections`: the
+        // cap counts live connections only.
+        let mut alive = Vec::new();
         for _ in 0..GLOBAL_MAX_CONNECTIONS {
-            let (c, _rx) = conn(Uuid::new_v4(), principal(false, vec![]));
+            let (c, rx) = conn(Uuid::new_v4(), principal(false, vec![]));
             reg.register(Uuid::new_v4(), c).unwrap();
+            alive.push(rx);
         }
         assert_eq!(reg.connection_count(), GLOBAL_MAX_CONNECTIONS);
 
@@ -503,6 +684,7 @@ mod tests {
             .register(Uuid::new_v4(), overflow)
             .expect_err("global cap must reject the 513th connection");
         assert_eq!(err.status_code(), 429, "global cap must surface 429");
+        drop(alive);
     }
 
     #[test]
@@ -627,6 +809,218 @@ mod tests {
             0,
             "a connection whose bounded queue is full must be pruned"
         );
+    }
+
+    // ---- slot reclamation (sse-slot-leak) --------------------------------
+    //
+    // COVERAGE NOTE: the `prune_*` tests below drive the sweep helpers in
+    // isolation — they do NOT prove the sweep is wired into production. What
+    // proves the wiring is the cap tests (`*_cap_counts_live_connections_only`),
+    // which go through `register` and fail if its sweep calls are removed.
+    //
+    // The registry's ONLY pre-existing reaper was `deliver`'s send-failure
+    // prune, which requires an event to deliver — so on a quiescent deployment
+    // a connection whose stream is gone held its slot forever, and each
+    // reconnect burned one until the account was permanently 429'd.
+
+    /// TEST-1 — a connection whose receiver has been dropped is reclaimed from
+    /// BOTH indexes by `prune_closed`, and the emptied `by_user` entry is
+    /// cleaned up too (so a later Owner delivery is a harmless no-op).
+    #[test]
+    fn prune_closed_reclaims_a_connection_whose_stream_is_gone() {
+        let reg = empty_registry();
+        let uid = Uuid::new_v4();
+        let (c, rx) = conn(uid, principal(false, vec![]));
+        reg.register(Uuid::new_v4(), c).unwrap();
+        assert_eq!(reg.connection_count(), 1);
+
+        // The stream went away: its receiver is dropped.
+        drop(rx);
+
+        assert_eq!(reg.prune_closed(), 1, "the dead connection must be reclaimed");
+        assert_eq!(reg.connection_count(), 0);
+        // by_user was cleaned up as well — an Owner delivery finds nothing and
+        // must not panic.
+        reg.deliver(Audience::Owner(uid), dummy_event(), None);
+        assert_eq!(reg.prune_closed(), 0, "a second sweep reclaims nothing");
+    }
+
+    /// TEST-2 [acceptance INV-3] — the cap is charged for LIVE connections only.
+    /// Two halves in ONE test so a regression in either direction fails:
+    /// raising/removing the cap fails the first half; removing the sweep fails
+    /// the second.
+    #[test]
+    fn per_user_cap_counts_live_connections_only() {
+        // (a) cap value unchanged: with every receiver ALIVE the (cap+1)th
+        //     registration is still refused with 429.
+        let reg = empty_registry();
+        let uid = Uuid::new_v4();
+        let mut alive = Vec::new();
+        for _ in 0..PER_USER_MAX_CONNECTIONS {
+            let (c, rx) = conn(uid, principal(false, vec![]));
+            reg.register(Uuid::new_v4(), c).unwrap();
+            alive.push(rx); // hold the stream open
+        }
+        let (overflow, _rx) = conn(uid, principal(false, vec![]));
+        let err = reg
+            .register(Uuid::new_v4(), overflow)
+            .expect_err("the cap must still refuse a (cap+1)th LIVE connection");
+        assert_eq!(err.status_code(), 429, "the per-user cap still surfaces 429");
+        assert_eq!(reg.connection_count(), PER_USER_MAX_CONNECTIONS);
+
+        // (b) the same user's streams all go away → the next registration
+        //     succeeds, and the registry holds exactly the one new connection.
+        drop(alive);
+        let (fresh, _rx) = conn(uid, principal(false, vec![]));
+        reg.register(Uuid::new_v4(), fresh)
+            .expect("a user whose streams are gone must be able to reconnect");
+        assert_eq!(
+            reg.connection_count(),
+            1,
+            "all {PER_USER_MAX_CONNECTIONS} dead slots must be reclaimed, leaving only the new one",
+        );
+    }
+
+    /// TEST-2b [acceptance INV-3] — the GLOBAL cap likewise counts live
+    /// connections only: a full registry of dead connections does not lock the
+    /// whole deployment out, while a full registry of LIVE ones still 429s.
+    #[test]
+    fn global_cap_counts_live_connections_only() {
+        let reg = empty_registry();
+        let mut alive = Vec::new();
+        for _ in 0..GLOBAL_MAX_CONNECTIONS {
+            let (c, rx) = conn(Uuid::new_v4(), principal(false, vec![]));
+            reg.register(Uuid::new_v4(), c).unwrap();
+            alive.push(rx);
+        }
+        let (overflow, _rx) = conn(Uuid::new_v4(), principal(false, vec![]));
+        assert_eq!(
+            reg.register(Uuid::new_v4(), overflow)
+                .expect_err("a FULL registry of live connections still 429s")
+                .status_code(),
+            429,
+        );
+
+        drop(alive);
+        let (fresh, _rx) = conn(Uuid::new_v4(), principal(false, vec![]));
+        reg.register(Uuid::new_v4(), fresh)
+            .expect("a registry full of DEAD connections must not lock everyone out");
+        assert_eq!(reg.connection_count(), 1);
+    }
+
+    /// TEST-3 — a user-scoped sweep touches ONLY that user: another user's dead
+    /// connection survives it (it is reclaimed by that user's own next
+    /// registration, or a global sweep), and the target user's LIVE connection
+    /// survives it too.
+    #[test]
+    fn prune_closed_for_user_is_scoped_to_that_user() {
+        let reg = empty_registry();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        let (a_dead, a_rx_dead) = conn(a, principal(false, vec![]));
+        let (a_live, _a_rx_live) = conn(a, principal(false, vec![]));
+        let (b_dead, b_rx_dead) = conn(b, principal(false, vec![]));
+        reg.register(Uuid::new_v4(), a_dead).unwrap();
+        reg.register(Uuid::new_v4(), a_live).unwrap();
+        reg.register(Uuid::new_v4(), b_dead).unwrap();
+        drop(a_rx_dead);
+        drop(b_rx_dead);
+        assert_eq!(reg.connection_count(), 3);
+
+        assert_eq!(
+            reg.prune_closed_for_user(a),
+            1,
+            "only user A's ONE dead connection is reclaimed"
+        );
+        assert_eq!(
+            reg.connection_count(),
+            2,
+            "A's live connection and B's dead connection both survive an A-scoped sweep"
+        );
+
+        // A global sweep then reclaims B's.
+        assert_eq!(reg.prune_closed(), 1);
+        assert_eq!(reg.connection_count(), 1);
+    }
+
+    /// TEST-21 — the user-scoped sweep REPAIRS an orphaned index entry (an id
+    /// in `by_user` with no row in `clients`) rather than skipping it.
+    ///
+    /// `user_count` is derived from `by_user`, so an orphan would count against
+    /// the per-user cap forever and neither sweep could clear it — this sweep
+    /// would filter it out, and the global sweep iterates `clients`, where it
+    /// does not exist. That is precisely the permanently-429'd account this
+    /// module exists to prevent. The desync is unreachable today (both indexes
+    /// move together under one lock), which is exactly why it needs a test: the
+    /// repair is defensive code with no natural trigger.
+    #[test]
+    fn prune_closed_for_user_repairs_an_orphaned_index_entry() {
+        let reg = empty_registry();
+        let uid = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+
+        // Forge the desync: an id in `by_user` with no `clients` row.
+        {
+            let mut inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.by_user.entry(uid).or_default().insert(orphan);
+        }
+
+        assert_eq!(
+            reg.prune_closed_for_user(uid),
+            1,
+            "the orphaned index entry must be counted as reclaimed"
+        );
+        {
+            let inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                inner.by_user.get(&uid).is_none(),
+                "the orphan must actually be REMOVED from by_user (an emptied \
+                 user entry is dropped), otherwise it counts against the cap \
+                 forever"
+            );
+        }
+
+        // The other branch: an orphan ALONGSIDE a live connection. The user's
+        // index entry must SHRINK (not vanish), the live connection must be
+        // untouched, and `clients` must be left alone.
+        let (live, _live_rx) = conn(uid, principal(false, vec![]));
+        let live_id = Uuid::new_v4();
+        reg.register(live_id, live).unwrap();
+        let orphan2 = Uuid::new_v4();
+        {
+            let mut inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.by_user.entry(uid).or_default().insert(orphan2);
+        }
+
+        assert_eq!(reg.prune_closed_for_user(uid), 1, "only the orphan is freed");
+        let inner = reg.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let set = inner
+            .by_user
+            .get(&uid)
+            .expect("the user entry survives because a LIVE connection remains");
+        assert_eq!(set.len(), 1, "the index shrank to just the live connection");
+        assert!(set.contains(&live_id));
+        assert_eq!(inner.clients.len(), 1, "`clients` is left untouched");
+    }
+
+    /// TEST-9 — a sweep NEVER reclaims a live connection. Asserted on both the
+    /// count AND on the connection still being functional afterwards (a
+    /// connection left in the map but broken would pass a count-only check).
+    #[test]
+    fn prune_closed_never_removes_a_live_connection() {
+        let reg = empty_registry();
+        let uid = Uuid::new_v4();
+        let (c, mut rx) = conn(uid, principal(false, vec![]));
+        reg.register(Uuid::new_v4(), c).unwrap();
+
+        assert_eq!(reg.prune_closed(), 0, "a live connection is never reclaimed");
+        assert_eq!(reg.prune_closed_for_user(uid), 0);
+        assert_eq!(reg.connection_count(), 1);
+
+        // Still functional, not merely still counted.
+        reg.deliver(Audience::Owner(uid), dummy_event(), None);
+        assert!(got(&mut rx), "the surviving connection still receives events");
     }
 
     /// Sanity: `check_permissions_array` (the evaluator behind `has_permission`)

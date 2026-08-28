@@ -113,6 +113,27 @@ export interface TableProps<T> {
   /** View-relative index to scroll into view (virtual: scrollToIndex; plain:
    *  scrollIntoView). Change the value to trigger a scroll. */
   scrollToIndex?: number | null
+  /**
+   * PER-ROW DETAIL — a full-width band rendered as its own row directly BENEATH the row it
+   * belongs to. Return `null`/`undefined` for a row that has no detail; that row renders
+   * exactly as it does today.
+   *
+   * This is the one placement a columns-only grid cannot express. A value that belongs to a
+   * row but needs the whole width — a range control over two of that row's own bounds, a
+   * message, a preview — could previously only be squeezed into a column of its own, which
+   * makes it narrow and puts it BESIDE the fields it is about rather than under them.
+   *
+   * The pair reads as ONE unit, which is the whole point of putting it under rather than
+   * beside: the separator between them is suppressed so the rule falls after the BAND (i.e.
+   * between records, never between a record and its own detail), the band follows its row's
+   * hover, and DOM order is row → its band → next row, so keyboard order is too.
+   *
+   * NOT available on the virtualized path, and not silently so: the virtualizer measures ONE
+   * `<tr>` per index and positions it absolutely, so a second row per index has nowhere to be
+   * measured. Supplying this takes the plain path (see `showVirtual`), which is correct but
+   * unwindowed — a caller with 100k rows should not want a detail band on each of them.
+   */
+  renderRowDetail?: (record: T, index: number) => React.ReactNode
   /** Test selector — forwarded onto <root>. Rows derive `${testid}-row-${rowKey}`. */
   'data-testid': string
 }
@@ -152,27 +173,63 @@ function colMeta<T>(col: TableColumn<T>, props: TableProps<T>, view: TableView<T
   return { align, numeric, sortable, resizable, width: view.widths[col.key] ?? col.width }
 }
 
+/**
+ * Whether this column's HEADING is allowed to give way.
+ *
+ * `ellipsis` says "this column may be narrowed": it already puts `truncate max-w-0` on the BODY
+ * cell. It did not touch the heading, and a heading is `whitespace-nowrap` — so in an auto-layout
+ * table the column's minimum stayed the heading's full text and the grid was floored by its own
+ * chrome even where the caller had explicitly allowed narrowing. Measured on the consumer's QC
+ * metrics form at its default pane: grid 305px inside a 284px box, columns [60, 60, 138, 48],
+ * where the 138 is the word "Aggregation" (114px min-content) against 88px of actual controls —
+ * so the overflow costs the user 21px of the RIGHTMOST column, which is the destructive Remove.
+ *
+ * `truncate` alone cannot fix that: `overflow:hidden` clips at the USED width and leaves
+ * min-content untouched. Only a `max-width` caps a table column's minimum, which is exactly what
+ * the body cell already uses.
+ *
+ * OPT-IN, and deliberately so — `ellipsis` is the caller saying the heading may be abbreviated.
+ * Nothing changes for a column that has not said it (verified: every one of the kit Table's 18
+ * call sites across both consuming repos). And the name is never LOST: an ellipsised heading
+ * carries its full text as a native `title`.
+ *
+ * Not applied when the column has an explicit/resized width — there `max-width: 0` would fight
+ * the width the caller (or the drag) chose.
+ */
+const headerMayShrink = <T,>(col: TableColumn<T>, meta: ColMeta): boolean =>
+  col.ellipsis === true && meta.width == null
+
 // ── shared header inner (sort button) ─────────────────────────────────────────
 function HeaderInner<T>({ col, meta, view, testid }: { col: TableColumn<T>; meta: ColMeta; view: TableView<T>; testid: string }) {
   const active = view.sort?.key === col.key
   const glyph = !active ? <ChevronsUpDown className="size-3.5 opacity-50" aria-hidden /> :
     view.sort!.dir === 'asc' ? <ArrowUp className="size-3.5" aria-hidden /> : <ArrowDown className="size-3.5" aria-hidden />
+  const shrink = headerMayShrink(col, meta)
+  // The full heading, for the `title` that keeps an ellipsised name readable. Only for a string
+  // title — a ReactNode has no honest text form (`[object Object]` is not a label).
+  const full = shrink && typeof col.title === 'string' ? col.title : undefined
   return (
-    <span className={cn('flex items-center gap-1', meta.numeric && 'flex-row-reverse')}>
+    // `min-w-0` only where the column opted in: a flex item's default `min-width:auto` is what
+    // hands its min-content up to the table, so relaxing it unconditionally would let EVERY
+    // heading collapse — a silent layout change for every existing table.
+    <span className={cn('flex items-center gap-1', shrink && 'min-w-0', meta.numeric && 'flex-row-reverse')}>
       {meta.sortable ? (
         <button
           type="button"
           onClick={() => view.toggleSort(col.key)}
           // min-h-6 keeps the sort control on the 24px WCAG touch-target floor
           // (the bare text+glyph line is only ~20px tall).
-          className="inline-flex min-h-6 items-center gap-1 -mx-1 px-1 rounded-sm hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          className={cn(
+            'inline-flex min-h-6 items-center gap-1 -mx-1 px-1 rounded-sm hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+            shrink && 'min-w-0',
+          )}
           data-testid={`${testid}-sort-${col.key}`}
         >
-          <span className="truncate">{col.title}</span>
+          <span className="truncate" title={full}>{col.title}</span>
           {glyph}
         </button>
       ) : (
-        <span className="truncate">{col.title}</span>
+        <span className="truncate" title={full}>{col.title}</span>
       )}
     </span>
   )
@@ -185,15 +242,19 @@ function ResizeHandle<T>({ col, view, testid, width }: { col: TableColumn<T>; vi
     e.preventDefault()
     e.stopPropagation()
     const th = (e.currentTarget.closest('th') ?? e.currentTarget.parentElement) as HTMLElement | null
+    // The drag must be tracked on the window this handle actually lives in — in a popped-out pane
+    // that is NOT the ambient `window`, and listeners there would never fire. Mirrors
+    // `@ziee/dock`'s useGripDrag, which resolves its window the same way.
+    const win = e.currentTarget.ownerDocument?.defaultView ?? window
     const startX = e.clientX
     const startW = th ? th.getBoundingClientRect().width : 120
     const move = (ev: PointerEvent) => view.setWidth(col.key, startW + (ev.clientX - startX))
     const up = () => {
-      window.removeEventListener('pointermove', move)
-      window.removeEventListener('pointerup', up)
+      win.removeEventListener('pointermove', move)
+      win.removeEventListener('pointerup', up)
     }
-    window.addEventListener('pointermove', move)
-    window.addEventListener('pointerup', up)
+    win.addEventListener('pointermove', move)
+    win.addEventListener('pointerup', up)
   }
   const onKeyDown = (e: React.KeyboardEvent<HTMLSpanElement>) => {
     const th = (e.currentTarget.closest('th') ?? e.currentTarget.parentElement) as HTMLElement | null
@@ -229,7 +290,8 @@ function TableToolbar<T>({ props, view }: { props: TableProps<T>; view: TableVie
     ? props.columns.filter(c => !c.rowHeader && (c.hideable ?? true))
     : []
   // Count ALL currently-visible columns (incl. rowHeader/non-hideable) so the
-  // last visible column's toggle is DISABLED (matches the hook's hide guard).
+  // last visible column's toggle refuses (matches the hook's hide guard,
+  // `canHideColumn`).
   const visibleCount = props.columns.filter(c => !view.isHidden(c.key)).length
   return (
     <div className="flex flex-wrap items-center gap-2 pb-2" data-testid={`${testid}-toolbar`}>
@@ -257,7 +319,20 @@ function TableToolbar<T>({ props, view }: { props: TableProps<T>; view: TableVie
                 <Checkbox
                   key={c.key}
                   checked={!view.isHidden(c.key)}
-                  disabled={!view.isHidden(c.key) && visibleCount <= 1}
+                  // THE RULE IS THE KIT'S OWN, SO STATING IT IS THE KIT'S JOB. `canHideColumn`
+                  // refuses to hide the last visible column, and this toggle used to be natively
+                  // `disabled` — which inside a POPOVER is a refusal with nowhere at all for a
+                  // reason to live: no tooltip can open on a disabled control, there is no room
+                  // for adjacent text, and the only strings on it are the column's NAME. The
+                  // rule was written down in two code comments and nowhere a user could reach.
+                  // It is not caller-supplied (no `TableProps` entry) precisely because it is not
+                  // the caller's rule: every kit Table enforces the same one, so every kit Table
+                  // should say the same sentence rather than 40 call sites inventing 40.
+                  unavailableReason={
+                    !view.isHidden(c.key) && visibleCount <= 1
+                      ? 'A table must show at least one column — show another before hiding this one.'
+                      : undefined
+                  }
                   onCheckedChange={() => view.toggleHidden(c.key)}
                   label={<span className="truncate">{c.title}</span>}
                   aria-label={`Toggle column ${colLabel(c)}`}
@@ -340,7 +415,13 @@ export function Table<T>(props: TableProps<T>) {
 
   // Virtualize only when there's real data to window — loading/empty states use
   // the plain path (their skeleton/empty rows don't need a virtualizer).
-  const showVirtual = props.virtualized && !busy && view.viewData.length > 0
+  //
+  // …and never when the caller renders a per-row detail band: the virtualizer measures ONE
+  // `<tr>` per index and absolutely-positions it, so a second row per index has no slot to be
+  // measured in and would overlap the next record. Falling back to the plain path renders the
+  // detail CORRECTLY at the cost of windowing, which is the honest trade — dropping the band
+  // instead would make a declared control silently absent.
+  const showVirtual = props.virtualized && !busy && !props.renderRowDetail && view.viewData.length > 0
   const hasToolbar = !!(props.filterable || props.columnChooser || props.toolbarExtra)
 
   const body = showVirtual
@@ -422,7 +503,7 @@ function PlainTable<T>(props: TableProps<T> & { view: TableView<T>; busy: boolea
                 key={c.key}
                 style={{ width: meta.width }}
                 aria-sort={meta.sortable ? (view.sort?.key === c.key ? (view.sort.dir === 'asc' ? 'ascending' : 'descending') : 'none') : undefined}
-                className={cn(alignCls[meta.align], meta.resizable && 'relative')}
+                className={cn(alignCls[meta.align], meta.resizable && 'relative', headerMayShrink(c, meta) && 'max-w-0')}
               >
                 <HeaderInner col={c} meta={meta} view={view} testid={testid} />
                 {meta.resizable && <ResizeHandle col={c} view={view} testid={testid} width={typeof meta.width === 'number' ? meta.width : undefined} />}
@@ -445,46 +526,79 @@ function PlainTable<T>(props: TableProps<T> & { view: TableView<T>; busy: boolea
             <TableCell colSpan={cols.length} className="h-24">{empty ?? <Empty data-testid={`${testid}-empty`} />}</TableCell>
           </TableRow>
         ) : (
-          rows.map((record, i) => (
-            <TableRow
-              key={keyOf(record, i)}
-              data-testid={testid ? `${testid}-row-${keyOf(record, i)}` : undefined}
-              tabIndex={onRowClick ? 0 : undefined}
-              onClick={onRowClick ? () => onRowClick(record, i) : undefined}
-              onKeyDown={
-                onRowClick
-                  ? (e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault()
-                        onRowClick(record, i)
-                      }
-                    }
-                  : undefined
-              }
-              className={onRowClick ? 'cursor-pointer focus-visible:outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50' : undefined}
-            >
-              {cols.map((c) => {
-                const meta = metas.get(c.key)!
-                const pres = cellPresentation(c, meta, record)
-                const sel = cellSelected(props, view, i, c)
-                const selectable = selectionActive(props, c)
-                return (
-                  <TableCell
-                    key={c.key}
-                    title={pres.title}
-                    data-selected={sel || undefined}
-                    // Focusable in selection mode so a keyboard user can select +
-                    // the Ctrl/Cmd+C keydown bubbles to the wrapper's handler.
-                    tabIndex={selectable ? 0 : undefined}
-                    onClick={selectionHandler(props, view, i, c)}
-                    className={cn(pres.className, sel && 'ring-2 ring-inset ring-ring/60', selectable && 'cursor-cell focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50')}
+          rows.map((record, i) => {
+            const rk = keyOf(record, i)
+            // Evaluated ONCE per record: whether this row HAS a band decides the row's own
+            // separator, so asking twice could disagree with itself.
+            const detail = props.renderRowDetail?.(record, i)
+            const banded = detail != null && detail !== false
+            return (
+              <React.Fragment key={rk}>
+                <TableRow
+                  data-testid={testid ? `${testid}-row-${rk}` : undefined}
+                  tabIndex={onRowClick ? 0 : undefined}
+                  onClick={onRowClick ? () => onRowClick(record, i) : undefined}
+                  onKeyDown={
+                    onRowClick
+                      ? (e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            onRowClick(record, i)
+                          }
+                        }
+                      : undefined
+                  }
+                  className={cn(
+                    onRowClick && 'cursor-pointer focus-visible:outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50',
+                    // A rule between a record and its OWN band would split the unit the band
+                    // exists to be part of, so the rule falls after the band instead.
+                    //
+                    // Row-hover is suppressed on BOTH halves rather than made to follow: a
+                    // highlight that covers only the top half splits the pair visually, and
+                    // the CSS that would couple them (`peer-hover`) is the GENERAL sibling
+                    // combinator — hovering row 0 would light every later band. A banded row
+                    // is a form unit, not a selectable record; the separator is what says
+                    // where it ends.
+                    banded && 'border-b-0 hover:bg-transparent',
+                  )}
+                >
+                  {cols.map((c) => {
+                    const meta = metas.get(c.key)!
+                    const pres = cellPresentation(c, meta, record)
+                    const sel = cellSelected(props, view, i, c)
+                    const selectable = selectionActive(props, c)
+                    return (
+                      <TableCell
+                        key={c.key}
+                        title={pres.title}
+                        data-selected={sel || undefined}
+                        // Focusable in selection mode so a keyboard user can select +
+                        // the Ctrl/Cmd+C keydown bubbles to the wrapper's handler.
+                        tabIndex={selectable ? 0 : undefined}
+                        onClick={selectionHandler(props, view, i, c)}
+                        className={cn(pres.className, sel && 'ring-2 ring-inset ring-ring/60', selectable && 'cursor-cell focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/50')}
+                      >
+                        {c.render ? c.render(record, i) : defaultCell((record as Record<string, unknown>)[c.dataIndex ?? c.key])}
+                      </TableCell>
+                    )
+                  })}
+                </TableRow>
+                {banded && (
+                  <TableRow
+                    data-testid={testid ? `${testid}-row-${rk}-detail` : undefined}
+                    className="hover:bg-transparent"
                   >
-                    {c.render ? c.render(record, i) : defaultCell((record as Record<string, unknown>)[c.dataIndex ?? c.key])}
-                  </TableCell>
-                )
-              })}
-            </TableRow>
-          ))
+                    {/* `whitespace-normal` undoes the data-cell default: a band is content,
+                        not a value, and a value's no-wrap rule would force the table wider
+                        than the viewport instead of letting the band use the width it has. */}
+                    <TableCell colSpan={cols.length} className="pt-0 pb-3 align-top whitespace-normal">
+                      {detail}
+                    </TableCell>
+                  </TableRow>
+                )}
+              </React.Fragment>
+            )
+          })
         )}
       </TableBody>
     </Base>
@@ -553,7 +667,7 @@ function VirtualTable<T>(props: TableProps<T> & { view: TableView<T> }) {
                   key={c.key}
                   style={colStyle(c)}
                   aria-sort={meta.sortable ? (view.sort?.key === c.key ? (view.sort.dir === 'asc' ? 'ascending' : 'descending') : 'none') : undefined}
-                  className={cn('px-4 py-2 font-semibold', justifyFor[meta.align], meta.resizable && 'relative')}
+                  className={cn('px-4 py-2 font-semibold', justifyFor[meta.align], meta.resizable && 'relative', headerMayShrink(c, meta) && 'min-w-0')}
                 >
                   <HeaderInner col={c} meta={meta} view={view} testid={testid} />
                   {meta.resizable && <ResizeHandle col={c} view={view} testid={testid} width={typeof meta.width === 'number' ? meta.width : undefined} />}

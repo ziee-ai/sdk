@@ -14,7 +14,7 @@ Cross-cutting rules every agent must follow:
   the container's testid — give the CONTAINER a testid and the rows are covered.
 - Never import `antd`, never use raw `<button>/<input>/<select>/<textarea>` (Biome blocks both).
 
-67 components documented.
+68 components documented.
 
 ## Accordion _(discriminated union — see source for variant-specific props)_
 
@@ -186,19 +186,21 @@ _No always-required props._
 |---|---|---|
 | `data-testid` | `string` | Test selector — REQUIRED, forwarded onto the rendered button/anchor via {...props} (i18n-safe). |
 
-<details><summary>Optional props (10)</summary>
+<details><summary>Optional props (12)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `aria-label` | `string | undefined` | Defines a string value that labels the current element. |
 | `block` | `boolean | undefined` | Full-width block button (legacy `block`). |
 | `href` | `string | undefined` | Render as an <a> styled as a button (pair with variant="link" for a text link). |
+| `destructive` | `boolean | undefined` | THIS BUTTON DESTROYS SOMETHING. Not a look (`variant="destructive"` already implies it) — a declaration, so an overlay's initial focus… |
 | `icon` | `ReactNode` | Leading icon (legacy `icon`); rendered before children, replaced by the spinner while loading. |
 | `loading` | `boolean | undefined` |  |
 | `size` | `"default" | "lg" | "icon" | undefined` |  |
 | `target` | `string | undefined` |  |
 | `tooltip` | `string | number | bigint | boolean | ReactElement<unknown, string | JSXElementConstruct…` | Tooltip shown on hover AND keyboard focus. Doubles as the accessible name when a string. |
 | `tooltipSide` | `"top" | "right" | "bottom" | "left" | undefined` | Side the built-in tooltip opens toward (default 'top'). Use 'bottom' for icon buttons in a panel/header top row so the tooltip drops into… |
+| `unavailableReason` | `string | undefined` | WHY this control is unavailable. Presence means unavailable — the string IS the reason, rather than a boolean plus a separate message tha… |
 | `variant` | `"link" | "default" | "outline" | "secondary" | "ghost" | "destructive" | null | undefined` |  |
 
 </details>
@@ -227,6 +229,10 @@ _No always-required props._
 | `title` | `ReactNode` |  |
 
 </details>
+
+## CardActions
+
+_No always-required props._
 
 ## Checkbox _(discriminated union — see source for variant-specific props)_
 
@@ -308,14 +314,16 @@ _No always-required props._
 | `onConfirm` | `() => void | Promise<void>` |  |
 | `title` | `ReactNode` |  |
 
-<details><summary>Optional props (7)</summary>
+<details><summary>Optional props (9)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `children` | `ReactElement<unknown, string | JSXElementConstructor<any>> | undefined` | The trigger element. Optional when driving the dialog via `open`/`onOpenChange`. |
+| `initialFocus` | `string | RefObject<HTMLElement | null> | false | undefined` | Where focus lands when the prompt opens. Defaults to the first tabbable that is not destructive — which, for an "are you sure?", is… |
 | `danger` | `boolean | undefined` |  |
 | `description` | `ReactNode` |  |
 | `okButtonProps` | `{ danger?: boolean | undefined; disabled?: boolean | undefined; } | undefined` | Extra props forwarded to the confirm button (legacy `okButtonProps`), e.g. { danger: true }. |
+| `okUnavailableReason` | `string | undefined` | WHY the confirm cannot be pressed. Presence means unavailable; the string IS the reason. |
 | `onCancel` | `(() => void) | undefined` | Called when the user cancels/dismisses (legacy `onCancel`). |
 | `onOpenChange` | `((open: boolean) => void) | undefined` | Fires when the open state should change (pairs with `open`). |
 | `open` | `boolean | undefined` | Controlled open state. Pair with `onOpenChange`; omit `children` for trigger-less use. |
@@ -393,7 +401,7 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto the dialog content <root> (i18n-safe). |
 | `title` | `ReactNode` | Accessible name — required (Radix Dialog must be labelled). |
 
-<details><summary>Optional props (8)</summary>
+<details><summary>Optional props (9)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -401,6 +409,7 @@ _No always-required props._
 | `className` | `string | undefined` |  |
 | `description` | `ReactNode` |  |
 | `footer` | `ReactNode` |  |
+| `initialFocus` | `string | RefObject<HTMLElement | null> | false | undefined` | WHERE FOCUS LANDS when the dialog opens — a `data-testid`, a ref, or `false`. Omitting it is safe: the default skips anything marked… |
 | `onOpenChange` | `((open: boolean) => void) | undefined` |  |
 | `open` | `boolean | undefined` |  |
 | `size` | `"default" | "sm" | "lg" | "xl" | undefined` |  |
@@ -841,6 +850,12 @@ _No always-required props._
 
 ## PasswordInput
 
+> **`maxLength` is BANNED here** (omitted from the props type *and* stripped at runtime). A cap
+> enforced by discarding the overflow is undetectable on a masked field, and a confirm field with
+> the same cap hides even the mismatch — so the app ships a credential the user never chose. State
+> a length limit and REFUSE past it; never truncate a secret. (`<Input type="password">` is the
+> same hazard through a different door — the consuming app lints for it.)
+
 **Required:**
 
 | prop | type | notes |
@@ -1031,7 +1046,7 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). Options derive `${testid}-opt-${value}`. |
 | `options` | `(SelectOption | SelectOptionGroup)[]` |  |
 
-<details><summary>Optional props (22)</summary>
+<details><summary>Optional props (24)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -1044,6 +1059,7 @@ _No always-required props._
 | `clearLabel` | `string | undefined` |  |
 | `defaultValue` | `string | undefined` |  |
 | `disabled` | `boolean | undefined` |  |
+| `emptyText` | `string | undefined` | What the list reads as when the filter matches nothing. Same defaulting rationale as `searchPlaceholder`; an empty popup is indistinguish… |
 | `id` | `string | undefined` |  |
 | `invalid` | `boolean | undefined` |  |
 | `labelRender` | `((option: SelectOption | undefined) => ReactNode) | undefined` | Custom content for the selected value in the trigger. Receives the selected option (undefined if none). Overrides per-option `selectedLab… |
@@ -1054,7 +1070,8 @@ _No always-required props._
 | `onValueChange` | `((value: string) => void) | ((value: string) => void) | ((value: string) => void) | und…` |  |
 | `optionRender` | `((option: SelectOption) => ReactNode) | undefined` | Custom content for each dropdown row. Receives the option. |
 | `placeholder` | `string | undefined` |  |
-| `popupMatchSelectWidth` | `boolean | undefined` | Constrain the dropdown to the trigger's width (legacy `popupMatchSelectWidth`). Default true (exact match); false lets the dropdown grow … |
+| `searchPlaceholder` | `string | undefined` | Placeholder for the search field. Optional with a default, unlike `MultiSelect`'s, because `'auto'` can turn search on for a caller that … |
+| `showSearch` | `boolean | "auto" | undefined` | Search inside the popup. `'auto'` (the default) turns it on once the option count reaches {@link SELECT_SEARCH_THRESHOLD}; `true` / `fals… |
 | `size` | `"default" | "sm" | "lg" | undefined` |  |
 | `value` | `string | undefined` |  |
 
@@ -1248,7 +1265,7 @@ _No always-required props._
 | `dataSource` | `T[]` |  |
 | `rowKey` | `(keyof T & string) | ((record: T, index: number) => string)` | Row key: a record field name (legacy string form) or a function. |
 
-<details><summary>Optional props (23)</summary>
+<details><summary>Optional props (24)</summary>
 
 | prop | type | notes |
 |---|---|---|
@@ -1268,6 +1285,7 @@ _No always-required props._
 | `onRowClick` | `((record: T, index: number) => void) | undefined` |  |
 | `onSelectionChange` | `((tsv: string) => void) | undefined` | Called (from an effect) with the current selection serialised to TSV (empty string when nothing is selected) — lets an external "Copy" bu… |
 | `onViewChange` | `((view: T[], meta: { visibleColumns: string[]; }) => void) | undefined` | Called (from an effect) with the current filtered+sorted view whenever it changes, plus the currently-visible (non-gutter) column keys — … |
+| `renderRowDetail` | `((record: T, index: number) => ReactNode) | undefined` | PER-ROW DETAIL — a full-width band rendered as its own row directly BENEATH the row it belongs to. Return `null`/`undefined` for a row th… |
 | `resizable` | `boolean | undefined` | Column-drag resize handles + a `<colgroup>`/fixed layout in the plain path. |
 | `sanitizeClipboard` | `boolean | undefined` | Neutralize spreadsheet formulas (=,+,-,@) in copied/serialised TSV so an untrusted cell can't execute when pasted into Excel/Sheets. |
 | `scrollToIndex` | `number | null | undefined` | View-relative index to scroll into view (virtual: scrollToIndex; plain: scrollIntoView). Change the value to trigger a scroll. |

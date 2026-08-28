@@ -12,6 +12,7 @@ import { useSurface } from './surface'
 import { useControllableState } from './use-controllable-state'
 import { type KitStyleProps } from './style-guard'
 import type { ValueBinding } from './value-binding'
+import type { NoUndeclaredAria } from './aria-passthrough'
 import { cn } from '../lib/utils'
 
 export interface ComboboxOption {
@@ -46,17 +47,25 @@ interface ComboboxBase {
   'aria-describedby'?: string
   'aria-label'?: string
   'aria-labelledby'?: string
+  /** Marks the control required for assistive tech. `FormField required` INJECTS this (via
+   *  cloneElement, untyped), so a control that neither declares nor forwards it drops it
+   *  silently — the same silent-drop class `aria-passthrough.ts` exists for, and one the type
+   *  ban cannot see because the injection is untyped. */
+  'aria-required'?: boolean
   /** Test selector — forwarded onto the field (i18n-safe). Options derive `${testid}-opt-${value}`. */
   'data-testid': string
 }
 // Controlled `value` requires a change handler (see ValueBinding); FormField stays valid.
-export type ComboboxProps = ComboboxBase & ValueBinding<string> & KitStyleProps
+export type ComboboxProps = ComboboxBase &
+  NoUndeclaredAria<ComboboxBase> &
+  ValueBinding<string> &
+  KitStyleProps
 
 export const Combobox = React.forwardRef<HTMLInputElement, ComboboxProps>(function Combobox(
   {
     options, value, defaultValue, onValueChange, onChange, onBlur, placeholder, emptyText,
     disabled, loading, invalid, size, name, id, className, style, allowStyle: _a,
-    'aria-describedby': ariaDescribedby, 'aria-label': ariaLabel, 'aria-labelledby': ariaLabelledby,
+    'aria-describedby': ariaDescribedby, 'aria-label': ariaLabel, 'aria-labelledby': ariaLabelledby, 'aria-required': ariaRequired,
     'data-testid': testid,
     // accepted for API compatibility, not needed by the base combobox:
     searchPlaceholder: _sp, virtual: _v,
@@ -94,6 +103,7 @@ export const Combobox = React.forwardRef<HTMLInputElement, ComboboxProps>(functi
         aria-describedby={ariaDescribedby}
         aria-label={ariaLabel}
         aria-labelledby={ariaLabelledby}
+        aria-required={ariaRequired || undefined}
         data-testid={testid}
         style={style}
         className={cn('w-full', className)}

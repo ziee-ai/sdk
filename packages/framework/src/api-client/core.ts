@@ -1,6 +1,8 @@
 import type { SSECallback } from './sse-types'
 import { createSSEHandler } from './sse-types'
 import { getSyncConnectionId } from '../sync/connection'
+import { netRequestEnd, netRequestStart } from '../net-idle'
+import { bumpFetchEpoch, coalesce, inflightKey } from './inflight'
 
 // ─────────────────────── Base-URL resolver (injected) ───────────────────────
 //
@@ -162,12 +164,109 @@ export interface FileUploadProgressCallback {
 // framework transport only needs the URL as a string and the response as a
 // type parameter. `endpointUrl` stays a plain string here; the app's factory
 // supplies the exact `"NS.method"` → URL values.
+// STAYS `async`: an async function body turns a synchronous throw into a
+// REJECTION, which is the contract every caller relies on
+// (`ApiClient.X.y(...).catch(...)`). The pre-flight work below can genuinely
+// throw — an app-injected token provider that throws, a `localStorage` read
+// refused in a sandboxed iframe — so it must run inside the async body.
 export const callAsync = async <TResponse = unknown>(
   endpointUrl: string,
   params: any,
   callbacks?: {
     SSE?: SSECallback<TResponse>
     fileUploadProgress?: FileUploadProgressCallback
+    /** Opt OUT of in-flight GET coalescing for this one call. For a read that
+     *  must genuinely reach the server every time (a one-shot nonce, a poll whose
+     *  point is the round-trip, a GET with a server-side side effect). Coalescing
+     *  is otherwise on for every plain GET, and this is the only escape hatch —
+     *  the transport is shared by three applications, so a caller with a reason
+     *  must be able to decline without editing it. */
+    noCoalesce?: boolean
+    /** Return the RAW body instead of parsing it.
+     *
+     *  `'stream'` resolves to the response's `ReadableStream<Uint8Array>` (or `null`
+     *  for a bodyless response) the moment headers arrive, so a caller can consume
+     *  bytes progressively. Every other value — and omitting it, which is every
+     *  existing call — keeps the content-type parse switch exactly as it was, so this
+     *  is additive by construction.
+     *
+     *  A stream response is NEVER joinable (see the predicate below): a body has one
+     *  reader, so two callers sharing it would starve one of them. */
+    responseType?: 'stream'
+  },
+): Promise<TResponse> => {
+  // ── In-flight GET coalescing (see ./inflight.ts) ──────────────────────────
+  // Only plain reads are joinable. Excluded, deliberately:
+  //   - non-GET  — a mutation must never be silently collapsed into another's;
+  //   - SSE      — a long-lived stream has ONE consumer wired to ONE reader, so
+  //                two subscribers sharing a response body would starve one;
+  //   - FormData — an upload is a mutation and carries non-comparable payloads;
+  //   - stream   — same reason as SSE, and it is NOT left to the caller to remember.
+  //                A `ReadableStream` is not structured-cloneable, so `isolate` cannot
+  //                give a joiner its own copy; excluding it here is what makes that
+  //                impossible rather than merely discouraged. (`noCoalesce` remains the
+  //                caller's escape hatch for other reasons; this is not a second
+  //                mechanism, it is one more term in the same predicate.)
+  const isGet = endpointUrl.startsWith('GET ')
+  const joinable =
+    isGet &&
+    !callbacks?.SSE &&
+    !callbacks?.noCoalesce &&
+    callbacks?.responseType !== 'stream' &&
+    !isFormData(params)
+  if (!joinable) return performCall<TResponse>(endpointUrl, params, callbacks)
+
+  // The key is the endpoint template + its params (the resolved path/query is a
+  // pure function of those) + the caller's identity. The resolved ORIGIN is NOT
+  // in the key, deliberately: both `getBaseURL` implementations memoize it in a
+  // module-scoped promise for the page's lifetime, so it cannot change mid-session
+  // and adding it would only cost every joinable GET an extra resolver await
+  // before the in-flight map is consulted.
+  const key = inflightKey(
+    'GET',
+    `${endpointUrl}|${stableParams(params)}`,
+    getAuthToken(),
+  )
+  return coalesce(key, () => performCall<TResponse>(endpointUrl, params, callbacks))
+}
+
+/** `params instanceof FormData` throws where `FormData` is not defined (SSR /
+ *  node). Guard it so the check itself can never be the failure. */
+const isFormData = (params: any): boolean =>
+  typeof FormData !== 'undefined' && params instanceof FormData
+
+/**
+ * Deterministic serialization of a params object for the coalescing key. TOP-
+ * LEVEL keys are sorted so literal ordering does not matter; a NESTED object
+ * keeps its literal key order, so two semantically-identical calls that build a
+ * nested param differently produce different keys and simply do not coalesce.
+ * That is the safe direction — a missed join costs one duplicate request, a
+ * false join would cost correctness — and every param shape the generated
+ * ApiClient produces is flat.
+ */
+const stableParams = (params: any): string => {
+  if (params === undefined || params === null) return ''
+  if (typeof params !== 'object') return String(params)
+  try {
+    const entries = Object.entries(params)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    return JSON.stringify(entries)
+  } catch {
+    // Non-serializable params (a cyclic object) — fall back to a key that never
+    // matches another call, so such a request is simply never coalesced.
+    return `nokey:${Math.random()}`
+  }
+}
+
+const performCall = async <TResponse = unknown>(
+  endpointUrl: string,
+  params: any,
+  callbacks?: {
+    SSE?: SSECallback<TResponse>
+    fileUploadProgress?: FileUploadProgressCallback
+    /** See `callAsync`. Returns the raw `ReadableStream` body instead of parsing. */
+    responseType?: 'stream'
   },
 ): Promise<TResponse> => {
   let bUrl = await getBaseUrl()
@@ -184,14 +283,20 @@ export const callAsync = async <TResponse = unknown>(
     }
   }
 
+  // Track in-flight NON-SSE requests so the background action-chunk prefetch can
+  // wait for the page's critical loads to finish (SSE streams are long-lived).
+  const counted = !sseFunction
+  if (counted) netRequestStart()
+
   try {
-    // Check if params is FormData for file uploads
-    const isFormData = params instanceof FormData
+    // Check if params is FormData for file uploads. Uses the guarded predicate —
+    // a bare `instanceof` throws where `FormData` is not defined (SSR / node).
+    const isFormDataBody = isFormData(params)
 
     let headers: Record<string, string> = {}
 
     // Don't set Content-Type for FormData - let browser set it with boundary
-    if (!isFormData) {
+    if (!isFormDataBody) {
       headers['Content-Type'] = 'application/json'
     }
 
@@ -231,7 +336,7 @@ export const callAsync = async <TResponse = unknown>(
     )
 
     // For FormData, we need to handle path parameters differently
-    if (isFormData) {
+    if (isFormDataBody) {
       // Replace {capture} with actual values from FormData entries
       captureMatches.forEach(capture => {
         const value = (params as FormData).get(capture.trim())
@@ -278,7 +383,7 @@ export const callAsync = async <TResponse = unknown>(
     // in the 2026-05 security pass), which return 422.
     let body: any = undefined
     if (['POST', 'PUT', 'PATCH'].includes(method) && params !== undefined) {
-      if (isFormData) {
+      if (isFormDataBody) {
         body = params as FormData
       } else if (captureMatches.length > 0 && typeof params === 'object') {
         const bodyParams: Record<string, unknown> = {}
@@ -297,7 +402,7 @@ export const callAsync = async <TResponse = unknown>(
     let abortController: AbortController | undefined = undefined
 
     // Use XMLHttpRequest for FormData uploads with progress tracking
-    if (isFormData && fileUploadProgress && body) {
+    if (isFormDataBody && fileUploadProgress && body) {
       response = await new Promise<Response>((resolve, reject) => {
         const xhr = new XMLHttpRequest()
 
@@ -651,6 +756,23 @@ export const callAsync = async <TResponse = unknown>(
       throw error
     }
 
+    // ── RAW BODY ESCAPE HATCH (`responseType: 'stream'`) ────────────────────────
+    //
+    // Deliberately placed AFTER the `!response.ok` handling above — which consumes the
+    // body to build its error message — and BEFORE the parse switch below. A caller
+    // asking for a stream still gets a thrown error for a non-2xx, with the same
+    // message every other caller gets; only the SUCCESS path changes shape.
+    //
+    // Returned at HEADERS, not at body-complete. One consequence worth stating rather
+    // than discovering: the `netRequestStart/End` accounting in the `finally` below
+    // ends when this promise settles, so a streamed read is counted as finished while
+    // its bytes are still arriving, and the background-prefetch gate that reads those
+    // counters will under-count in-flight work. Benign today (nothing gates on it
+    // tightly) and it is the honest trade for delivering bytes progressively.
+    if (callbacks?.responseType === 'stream') {
+      return response.body as unknown as TResponse
+    }
+
     //try to parse the response based on content type
     const contentType = response.headers.get('Content-Type') || ''
 
@@ -687,5 +809,13 @@ export const callAsync = async <TResponse = unknown>(
       console.error(`Error calling endpoint ${endpointUrl}:`, error)
     }
     throw error // Re-throw to allow caller to handle it
+  } finally {
+    if (counted) netRequestEnd()
+    // A completed MUTATION invalidates joinability of every read that was
+    // already on the wire — a refetch issued after this point must get its own
+    // round-trip rather than joining a possibly-pre-mutation request. Bumped on
+    // failure too: a request that errored client-side may still have been
+    // applied server-side, so assuming "nothing changed" would be unsafe.
+    if (!endpointUrl.startsWith('GET ')) bumpFetchEpoch()
   }
 }

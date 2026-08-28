@@ -5,6 +5,11 @@
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test:node": "node ../../scripts/run-node-tests.mjs --min 1",
+    "test": "npm run typecheck && vitest run && npm run test:node"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./styles/kit.css": "./src/styles/kit.css",

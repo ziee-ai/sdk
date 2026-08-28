@@ -265,7 +265,19 @@ for (const sf of files) {
   // `.desktop.tsx` co-located overrides are desktop-only (excluded from the web
   // tsconfig/biome + the coverage walker) — not web surfaces. Per-module
   // `gallery.tsx` seed files are authoring metadata, not surfaces either.
-  if (/\.desktop\.tsx$/.test(base) || base === 'gallery.tsx' || base === 'gallery.ts')
+  //
+  // `.test.tsx` / `.stories.tsx` are not surfaces either, and this is where the
+  // "mirrors the coverage walker" claim above stopped being true:
+  // `gen-gallery-coverage.mjs`'s walker has skipped `/\.(test|stories|desktop)\.tsx$/`
+  // all along, and this list dropped the first two. It was latent only because
+  // no `.test.tsx` existed anywhere under `src/`; the first component test added
+  // (a mounted harness for the run_js approval card) made `--check` fail by
+  // proposing RequiredState keys for the CONDITIONALS INSIDE A TEST FILE.
+  if (
+    /\.(test|stories|desktop)\.tsx$/.test(base) ||
+    base === 'gallery.tsx' ||
+    base === 'gallery.ts'
+  )
     continue
   const { signals, panels, slots } = extractSurface(sf)
   const id = surfaceId(abs)

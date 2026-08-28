@@ -1,15 +1,24 @@
-import { useEffect, isValidElement } from 'react'
-import { Stores } from '@ziee/framework/stores'
-
-/** The minimal route shape this hook reads off the app-registered `Routes`
- *  store (see the SEAM note below). */
-interface PrefetchRoute {
-  element: unknown
-}
+import { useEffect } from 'react'
+import { routesSeam } from '@ziee/framework'
+import { authStoreProxy, hasPermissionNow } from '@ziee/framework/permissions'
+import type { PermissionExpr } from '@ziee/framework/permissions'
+import { selectPrefetchRoutes, type PrefetchRoute } from './prefetch-selection'
 
 /**
- * Hook to prefetch lazy-loaded modules after initial render. Uses
- * `requestIdleCallback` to prefetch when the browser is idle.
+ * Hook to prefetch lazy-loaded route chunks after initial render, on browser
+ * idle — so navigating to another page loads instantly instead of paying a
+ * chunk download.
+ *
+ * SCOPED prefetch (this is the important part): an app registers dozens of
+ * routes, many gated behind auth or a permission. Prefetching ALL of them is
+ * actively harmful — it downloads chunks the visitor can never navigate to,
+ * competing for bandwidth during boot. Which routes survive that scoping is
+ * `selectPrefetchRoutes` in `./prefetch-selection`, where the policy is stated
+ * and unit-tested; the notable part is that a SIGNED-OUT visitor is scoped, not
+ * excluded (it used to be excluded outright — see that file).
+ *
+ * Gate 3 lives here: no forced `requestIdleCallback` timeout, so prefetch runs
+ * at TRUE idle and never preempts the boot data fetches.
  *
  * SEAM: reads the app-registered `Routes` store (populated by
  * `@ziee/framework/router` or an app-local router module) through a typed view,
@@ -17,34 +26,43 @@ interface PrefetchRoute {
  */
 export function usePrefetchModules() {
   const { routes } = (
-    Stores as unknown as { Routes: { routes: PrefetchRoute[] } }
+    { Routes: routesSeam.get() as { routes: PrefetchRoute[] } }
   ).Routes
 
+  // Reactive read: re-run the effect when the session appears or disappears, so
+  // the eligible set is recomputed. `user` and `permissions` arrive together
+  // from /auth/me, so user-presence is a sufficient "authenticated +
+  // permissions ready" signal.
+  const isAuthed = authStoreProxy().user != null
+
   useEffect(() => {
-    // Check if requestIdleCallback is supported (not available in Safari < 16)
+    // Gate 0: the `VITE_STORE_PREFETCH=off` compile-time flag disables ALL
+    // prefetch (store-action warm AND this route-chunk prefetch), so a build can
+    // be measured with zero idle-prefetch warming. Vite inlines the env var, so
+    // this const-folds away in an `=off` build.
+    if (import.meta.env.VITE_STORE_PREFETCH === 'off') return
+
     const prefetch = () => {
-      routes.forEach(route => {
-        // If element is a function (preload function), call it to trigger the import
-        if (
-          typeof route.element === 'function' &&
-          !isValidElement(route.element)
-        ) {
-          ;(
-            route.element as () => Promise<{
-              default: React.ComponentType<any>
-            }>
-          )()
-        }
+      const selected = selectPrefetchRoutes({
+        routes,
+        isAuthed,
+        pathname: typeof window !== 'undefined' ? window.location.pathname : '',
+        hasPermission: permission =>
+          hasPermissionNow(permission as PermissionExpr),
       })
+      for (const route of selected) {
+        ;(route.element as () => Promise<unknown>)()
+      }
     }
 
+    // Gate 3: true idle, no forced timeout (don't preempt boot fetches).
     if ('requestIdleCallback' in window) {
-      const handle = requestIdleCallback(prefetch, { timeout: 2000 })
+      const handle = requestIdleCallback(prefetch)
       return () => cancelIdleCallback(handle)
     } else {
-      // Fallback for browsers without requestIdleCallback
+      // Fallback for browsers without requestIdleCallback (Safari < 16).
       const timer = setTimeout(prefetch, 1000)
       return () => clearTimeout(timer)
     }
-  }, [routes])
+  }, [routes, isAuthed])
 }

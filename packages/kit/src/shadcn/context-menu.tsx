@@ -2,6 +2,7 @@ import * as React from "react"
 import { ContextMenu as ContextMenuPrimitive } from "@base-ui/react/context-menu"
 
 import { cn } from "../lib/utils"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 import { ChevronRightIcon, CheckIcon } from "lucide-react"
 
 function ContextMenu({ ...props }: ContextMenuPrimitive.Root.Props) {
@@ -33,14 +34,20 @@ function ContextMenuContent({
   alignOffset = 4,
   side = "right",
   sideOffset = 0,
+  container,
   ...props
 }: ContextMenuPrimitive.Popup.Props &
   Pick<
     ContextMenuPrimitive.Positioner.Props,
     "align" | "alignOffset" | "side" | "sideOffset"
-  >) {
+  > & {
+    /** Portal target. Defaults to the document of the window this subtree renders in. */
+    container?: PortalContainerValue
+  }) {
+  const portalContainer = usePortalContainer(container)
   return (
-    <ContextMenuPrimitive.Portal>
+    <ContextMenuPrimitive.Portal container={portalContainer}>
+     <PortalContainerInherit>
       <ContextMenuPrimitive.Positioner
         className="isolate z-50 outline-none"
         align={align}
@@ -54,6 +61,7 @@ function ContextMenuContent({
           {...props}
         />
       </ContextMenuPrimitive.Positioner>
+     </PortalContainerInherit>
     </ContextMenuPrimitive.Portal>
   )
 }

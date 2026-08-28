@@ -14,9 +14,39 @@
 //! never `ziee::` — so it stays app-agnostic.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::boot::{BootHandle, ServerBoot};
+
+/// Unique label counter for pop-out windows (supports multiple simultaneous pop-outs).
+static POPOUT_LABEL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Handle a frontend `window.open` (the portal-move pop-out): create a REAL Tauri window loading the
+/// requested url, forwarding the window features. `.window_features(features)` is MANDATORY —
+/// omitting it trips a WebKit `WindowFeatures` assertion on Linux. The frontend opens `about:blank`
+/// (an EMPTY url returns null on WebKitGTK), so `url` is `about:blank` here.
+fn popout_new_window_response(
+    handle: &tauri::AppHandle,
+    url: tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
+) -> tauri::webview::NewWindowResponse<tauri::Wry> {
+    let n = POPOUT_LABEL_COUNTER.fetch_add(1, Ordering::SeqCst);
+    match tauri::webview::WebviewWindowBuilder::new(
+        handle,
+        format!("popout-{n}"),
+        tauri::WebviewUrl::External(url),
+    )
+    .window_features(features)
+    .build()
+    {
+        Ok(window) => tauri::webview::NewWindowResponse::Create { window },
+        Err(e) => {
+            tracing::warn!("pop-out window.open failed: {e}");
+            tauri::webview::NewWindowResponse::Deny
+        }
+    }
+}
 
 /// App-tunable parameters for the main window.
 ///
@@ -36,6 +66,12 @@ pub struct WindowConfig {
     pub effect_radius: f64,
     /// macOS traffic-light inset `(x, y)`.
     pub traffic_light_position: (f64, f64),
+    /// Opt in to frontend `window.open` POP-OUT windows (the portal-move pop-out). When true, a
+    /// `window.open('about:blank', …)` from the UI opens a REAL Tauri window (via `on_new_window` →
+    /// `Create`, forwarding window features) and, on Linux/WebKitGTK, the popup setting is enabled so
+    /// the call isn't blocked. Default `false` = the stock behavior (window.open denied). Verified on
+    /// Linux; the Mac/Windows related-view paths are wired behind `cfg` but not yet host-verified.
+    pub enable_popout_windows: bool,
 }
 
 /// Spawn the embedded-server boot on the Tauri async runtime, then create the
@@ -86,6 +122,7 @@ pub fn spawn_boot_then_window<F, Fut>(
 /// Create the main window with platform-specific customizations
 pub fn create_main_window(app_handle: &tauri::AppHandle, config: &WindowConfig) {
     tracing::info!("Creating main window...");
+    let popout_enabled = config.enable_popout_windows;
 
     // macOS: no native decorations initially (overlay titlebar set below).
     #[cfg(target_os = "macos")]
@@ -101,6 +138,16 @@ pub fn create_main_window(app_handle: &tauri::AppHandle, config: &WindowConfig) 
     .fullscreen(false)
     .decorations(false)
     .center()
+    .on_new_window({
+        let handle = app_handle.clone();
+        move |url, features| {
+            if popout_enabled {
+                popout_new_window_response(&handle, url, features)
+            } else {
+                tauri::webview::NewWindowResponse::Deny
+            }
+        }
+    })
     .effects(tauri::utils::config::WindowEffectsConfig {
         effects: vec![
             tauri::window::Effect::Mica,
@@ -136,6 +183,16 @@ pub fn create_main_window(app_handle: &tauri::AppHandle, config: &WindowConfig) 
     .fullscreen(false)
     .decorations(true)
     .center()
+    .on_new_window({
+        let handle = app_handle.clone();
+        move |url, features| {
+            if popout_enabled {
+                popout_new_window_response(&handle, url, features)
+            } else {
+                tauri::webview::NewWindowResponse::Deny
+            }
+        }
+    })
     .effects(tauri::utils::config::WindowEffectsConfig {
         effects: vec![
             tauri::window::Effect::Mica,
@@ -165,6 +222,21 @@ pub fn create_main_window(app_handle: &tauri::AppHandle, config: &WindowConfig) 
     main_window_builder
         .build()
         .expect("failed to build the main application window");
+
+    // Linux/WebKitGTK: enable programmatic `window.open` (off by default; wry doesn't set it) so the
+    // pop-out's `window.open('about:blank', …)` isn't blocked. Verified via probe on Tauri/WebKitGTK.
+    #[cfg(target_os = "linux")]
+    if popout_enabled {
+        use tauri::Manager;
+        if let Some(win) = app_handle.get_webview_window("main") {
+            let _ = win.with_webview(|pw| {
+                use webkit2gtk::{SettingsExt, WebViewExt};
+                if let Some(settings) = WebViewExt::settings(&pw.inner()) {
+                    settings.set_javascript_can_open_windows_automatically(true);
+                }
+            });
+        }
+    }
 
     // Post-build: Windows overlay
     #[cfg(target_os = "windows")]

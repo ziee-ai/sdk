@@ -37,6 +37,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { enumerateSurfaces } from './lib/gallery-surfaces.mjs'
 import { resolveGalleryConfig } from './lib/gallery-config.mjs'
+import { resolveGalleryPort } from './lib/run-key.mjs'
 
 // Config-driven anchors (was `../src/dev/gallery` + `runtime-baseline.js` +
 // port 1420 hardcodes). Resolved from `gallery.config.json` in the app's cwd.
@@ -60,7 +61,34 @@ const arg = (n, d) =>
     .join('=')
 const flag = n => process.argv.includes(`--${n}`)
 
-const PORT = process.env.GALLERY_PORT || String(CFG.port)
+// gate-ui always passes GALLERY_PORT (the finalized, bind-verified port), so it
+// and its runtime-health child agree. Standalone, derive the same key-based port
+// (CFG.port is null → key-derived; never the old fixed 1420).
+const PORT =
+  process.env.GALLERY_PORT ||
+  String(
+    resolveGalleryPort({
+      env: undefined,
+      cfgPort: CFG.port ?? null,
+      which: CFG.portWhich || 'webGallery',
+      cwd: CFG.__cwd,
+    }),
+  )
+// A falsy/NaN PORT here builds `http://localhost:/…`, which every browser
+// normalizes to PORT 80 — so the run silently audits a dead origin and reports
+// thousands of `net::ERR_NETWORK_CHANGED` HIGHs that read as a UI regression.
+// That misdiagnosis has cost several investigations (gate:ui runs whose findings
+// were ~100% ERR_NETWORK_CHANGED against a PORTLESS `http://localhost/`).
+// Fail loudly rather than audit nothing.
+if (!/^\d+$/.test(String(PORT)) || Number(PORT) <= 0 || Number(PORT) > 65535) {
+  console.error(
+    `runtime-health: refusing to run — resolved gallery PORT is ${JSON.stringify(PORT)}, ` +
+      `which would build "http://localhost:${PORT}${CFG.galleryUrl}". Browsers read that as ` +
+      `port 80, so every request fails and the findings describe nothing. ` +
+      `Pass --url=http://localhost:<port>${CFG.galleryUrl} or set GALLERY_PORT.`,
+  )
+  process.exit(2)
+}
 const BASE = arg('url', `http://localhost:${PORT}${CFG.galleryUrl}`)
 const OUT = arg('out', GALLERY_DIR)
 const STATES = arg('states', 'loaded,empty,error').split(',').filter(Boolean)

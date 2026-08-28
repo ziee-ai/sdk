@@ -4,8 +4,9 @@ import * as React from "react"
 import { Dialog as DialogPrimitive } from "@base-ui/react/dialog"
 
 import { cn } from "../lib/utils"
+import { OverlayCloseButton } from "../internal/overlay-close"
 import { Button } from "./button"
-import { XIcon } from "lucide-react"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 
 function Dialog({ ...props }: DialogPrimitive.Root.Props) {
   return <DialogPrimitive.Root data-slot="dialog" {...props} />
@@ -64,17 +65,25 @@ function DialogContent({
   className,
   children,
   showCloseButton = true,
+  closeLabel = "Close",
   container,
   ...props
 }: DialogPrimitive.Popup.Props & {
   showCloseButton?: boolean
-  /** Portal target for the popup. Defaults to `<body>`; the kit Dialog sets
-      this to a host focus-trap (e.g. an enclosing vaul Drawer) so inputs stay
-      typable — see kit/dialog.tsx. */
+  /** Accessible name AND hover text for the corner ×. Defaults to the English word this
+      component has always hardcoded in its `sr-only` span, so supplying it is optional and
+      omitting it is not a regression — but a translated app should supply it. */
+  closeLabel?: string
+  /** Portal target for the popup. Defaults to the `<body>` of the document this
+      subtree renders in (see kit/portal-container.tsx); the kit Dialog sets this
+      to a host focus-trap (e.g. an enclosing vaul Drawer) so inputs stay typable
+      — see kit/dialog.tsx. An explicit value always wins. */
   container?: DialogPrimitive.Portal.Props["container"]
 }) {
+  const portalContainer = usePortalContainer(container)
   return (
-    <DialogPortal container={container}>
+    <DialogPortal container={portalContainer}>
+     <PortalContainerInherit>
       <DialogOverlay />
       <DialogPrimitive.Popup
         data-slot="dialog-content"
@@ -91,22 +100,10 @@ function DialogContent({
       >
         {children}
         {showCloseButton && (
-          <DialogPrimitive.Close
-            data-slot="dialog-close"
-            render={
-              <Button
-                variant="ghost"
-                className="absolute top-2 right-2"
-                size="icon-sm"
-              />
-            }
-          >
-            <XIcon
-            />
-            <span className="sr-only">Close</span>
-          </DialogPrimitive.Close>
+          <OverlayCloseButton slot="dialog-close" label={closeLabel} className="absolute top-2 right-2" />
         )}
       </DialogPrimitive.Popup>
+     </PortalContainerInherit>
     </DialogPortal>
   )
 }

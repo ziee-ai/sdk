@@ -17,3 +17,22 @@ export * from './module'
 export * from './stores'
 export * from './events'
 export * from './overrides'
+export { createAppStoreSeam, routesSeam } from './app-seam'
+
+// Component-like classification + the one renderer behind every "render
+// whatever a module put in this field" surface (routes, slots, banners).
+// `markLazyLoader` is the explicit opt-in for a dynamic-import loader whose
+// shape cannot be recognised on its own.
+export {
+  classifyComponentLike,
+  isMarkedLazyLoader,
+  markLazyLoader,
+  type ComponentKind,
+  type Classification,
+  type LazyLoader,
+} from './lazy-component'
+export {
+  RenderComponentLike,
+  type ComponentLike,
+  type RenderComponentLikeProps,
+} from './lazy-component-view'

@@ -78,6 +78,42 @@ pub fn worktree_key(manifest_dir: &str) -> String {
     stable_suffix(&worktree_root(manifest_dir))
 }
 
+/// The per-worktree key derived from the CURRENT WORKING DIRECTORY's worktree
+/// root, for callers that are NOT a build.rs (no `CARGO_MANIFEST_DIR`) — e.g. a
+/// dev/test harness or a script. Resolves the worktree root the same way
+/// `worktree_key` does (strip from `/src-app` onward), so a script run anywhere
+/// under a worktree derives the SAME key as that worktree's build. Falls back to
+/// the raw cwd string on error (still stable per invocation location).
+///
+/// This is the Rust half of the unified run-key; the byte-identical Node twin is
+/// `sdk/packages/gallery/scripts/lib/run-key.mjs::worktreeKey`. Both hash the
+/// absolute worktree-root path with the SAME FNV-1a, so a Rust build and a Node
+/// harness in the same worktree agree on the key (asserted by a shared fixture
+/// vector in both test suites).
+pub fn worktree_key_for_cwd() -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    worktree_key(&cwd)
+}
+
+/// Deterministic port BASE (search start) from a run key. The key seeds ONLY the
+/// start — the caller then forward-searches with an OS bind-check for the first
+/// actually-bindable port (the audit invariant: "no fixed port anywhere; the key
+/// only seeds the search start"). `floor` is the lowest port of a harness's
+/// disjoint range and `span` its width; the base is `floor + (key % span)`.
+///
+/// Byte-identical to the Node twin `run-key.mjs::portBase` (same modulo math over
+/// the same 8-hex key parsed as u32), so a Rust caller and a Node caller in the
+/// same worktree pick the same base.
+pub fn port_base(key: &str, floor: u16, span: u16) -> u16 {
+    // The key is 8 lowercase hex chars; parse as u32. A malformed key (should be
+    // impossible from `worktree_key`) degrades to 0 → base == floor (still valid).
+    let k = u32::from_str_radix(key, 16).unwrap_or(0);
+    let span = span.max(1) as u32;
+    floor.wrapping_add((k % span) as u16)
+}
+
 /// True when `DATABASE_URL` is the committed sentinel (or unset) AND the
 /// dev hasn't opted out — i.e. it is safe to auto-isolate per worktree.
 pub fn should_auto_isolate(database_url: &Option<String>) -> bool {
@@ -136,6 +172,30 @@ mod tests {
         let a = worktree_key("/data/pbya/ziee/tmp/xwt-a/src-app/server");
         let b = worktree_key("/data/pbya/ziee/tmp/xwt-b/src-app/server");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cross_language_parity_fixture() {
+        // SHARED FIXTURE VECTOR — the Node twin (run-key.test.mjs) pins the SAME
+        // literal for the SAME worktree-root string. If either language's FNV
+        // drifts, one of the two suites goes red. `worktree_key` strips /src-app,
+        // so the manifest form and the bare-root form hash the identical string.
+        assert_eq!(worktree_key("/data/pbya/ziee/tmp/xwt-a/src-app/server"), "12080097");
+        assert_eq!(worktree_key("/data/pbya/ziee/tmp/xwt-a"), "12080097");
+        assert_eq!(worktree_key("/data/pbya/ziee/tmp/xwt-b"), "1208014a");
+    }
+
+    #[test]
+    fn port_base_is_deterministic_and_in_range() {
+        let key = worktree_key("/data/pbya/ziee/tmp/xwt-a");
+        let a = port_base(&key, 20000, 200);
+        let b = port_base(&key, 20000, 200);
+        assert_eq!(a, b, "same key + range → same base");
+        assert!((20000..20200).contains(&a), "base within [floor, floor+span)");
+        // Disjoint floors never collide for the same key.
+        assert_ne!(port_base(&key, 20000, 200), port_base(&key, 22000, 200));
+        // A malformed key degrades to floor, never panics.
+        assert_eq!(port_base("zzzzzzzz", 9000, 200), 9000);
     }
 
     #[test]

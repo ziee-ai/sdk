@@ -28,8 +28,8 @@
 //! // ... POST to /api/auth/oauth/apple/callback (form_post) ...
 //! ```
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
@@ -122,8 +122,7 @@ impl AppleMockServer {
     pub fn sign_id_token(&self, claims: &serde_json::Value) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_string());
-        let key =
-            EncodingKey::from_rsa_pem(self.private_key_pem.as_bytes()).expect("encoding key");
+        let key = EncodingKey::from_rsa_pem(self.private_key_pem.as_bytes()).expect("encoding key");
         encode(&header, claims, &key).expect("sign id_token")
     }
 

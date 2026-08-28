@@ -44,7 +44,13 @@ export const Tooltip = React.forwardRef<HTMLElement, TooltipProps>(function Tool
   return (
     <TooltipProvider delay={delay}>
       <TT>
-        <TooltipTrigger render={child} />
+        {/* `id` is hoisted onto the trigger for the same reason the kit Button hoists it: base-ui's
+            Tooltip.Trigger keys its store on the id it was GIVEN, then merges the rendered
+            element's props over its own — so an id injected by an enclosing trigger (this
+            <Tooltip> composed inside a Dropdown/Popover trigger) would leave the tooltip
+            registered under an id nothing on screen carries, and it would never open. See
+            icon-button-tooltip.test.tsx, which bisects it to `id` alone. */}
+        <TooltipTrigger id={rest.id} render={child} />
         <TooltipContent side={side} className={className}>{body}</TooltipContent>
       </TT>
     </TooltipProvider>

@@ -27,7 +27,14 @@ import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveGalleryConfig } from './lib/gallery-config.mjs'
+import { resolveGalleryConfig, resolveVisualTier } from './lib/gallery-config.mjs'
+import {
+  resolveGalleryPort,
+  pickBindablePort,
+  resolveWorktreeRoot,
+  fetchSentinelRoot,
+  serverIsThisWorktree,
+} from './lib/run-key.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // Config-driven anchors (was UI_DIR/GALLERY_DIR/port/visual hardcodes). The app
@@ -37,7 +44,19 @@ const CFG = resolveGalleryConfig()
 const UI_DIR = CFG.__cwd
 const GALLERY_DIR = path.resolve(UI_DIR, CFG.galleryDir)
 const RUNTIME_HEALTH = path.join(__dirname, 'runtime-health.mjs')
-const PORT = Number(process.env.GALLERY_PORT || CFG.port)
+// Key-derived, bind-checked port BASE (audit §7: no fixed 1420). The key only
+// seeds the search start; the actual PORT is decided in main() — reuse the base
+// ONLY if the server already there proves it's THIS worktree (sentinel), else
+// boot our own on a fresh bindable port. Precedence: GALLERY_PORT > cfg.port >
+// key-derived.
+const OWN_ROOT = resolveWorktreeRoot(UI_DIR)
+const PORT_BASE = resolveGalleryPort({
+  env: process.env.GALLERY_PORT,
+  cfgPort: CFG.port ?? null,
+  which: CFG.portWhich || 'webGallery',
+  cwd: UI_DIR,
+})
+let PORT = PORT_BASE // finalized in main()
 const SKIP_VISUAL = process.argv.includes('--skip-visual')
 
 const results = [] // { name, ok, detail }
@@ -100,10 +119,25 @@ async function main() {
   step('lint', lintOk, lintOk ? 'clean' : 'violations (see output above)')
   for (const r of lintRuns) if (r.code !== 0) console.log(r.out.slice(-1500))
 
-  // 3. + 4. runtime + visual need the gallery Vite server. Boot it (or reuse). -
+  // 3. + 4. runtime + visual need the gallery Vite server. Boot it (or reuse
+  // ONLY our own). NO-FOREIGN-REUSE (audit §2/§7): reuse a server already on the
+  // base port ONLY if its /__worktree sentinel proves it belongs to THIS
+  // worktree — otherwise a run silently tests a sibling worktree's source tree
+  // (the fixed-1420 false-pass). If the base holds a FOREIGN server (or nothing),
+  // pick a fresh bindable port and boot our own.
   let vite = null
-  const alreadyUp = await galleryUp(PORT)
-  if (!alreadyUp) {
+  const sentinelRoot = await fetchSentinelRoot(PORT_BASE)
+  const isOurs = serverIsThisWorktree(sentinelRoot, OWN_ROOT) && (await galleryUp(PORT_BASE))
+  if (isOurs) {
+    PORT = PORT_BASE
+    console.log(`• reusing THIS worktree's gallery dev server already on :${PORT}`)
+  } else {
+    if (sentinelRoot && sentinelRoot !== OWN_ROOT) {
+      console.log(
+        `• port :${PORT_BASE} holds a FOREIGN worktree's server (${sentinelRoot}); NOT reusing — booting our own on a fresh port`,
+      )
+    }
+    PORT = await pickBindablePort(PORT_BASE)
     console.log(`• booting gallery dev server on :${PORT} …`)
     const [devCmd, ...devArgs] = CFG.devCmd
     vite = spawn(
@@ -117,8 +151,6 @@ async function main() {
       finish()
       return
     }
-  } else {
-    console.log(`• reusing gallery dev server already on :${PORT}`)
   }
 
   try {
@@ -139,20 +171,21 @@ async function main() {
     )
 
     // 4. visual layer (Layer A always; Layer B when VISUAL_SNAPSHOTS) ----------
+    const tier = resolveVisualTier(CFG, { snapshots: !!process.env.VISUAL_SNAPSHOTS })
     if (SKIP_VISUAL) {
       step('visual', true, 'skipped (--skip-visual)')
+    } else if (!tier.enabled) {
+      // A DECLARED-absent visual tier is a skip, not a failure. Interpolating a
+      // null `visualConfig` into the argv used to hand playwright `-c null`,
+      // which died on `<uiRoot>/null does not exist` and failed the gate for an
+      // app whose config had said, in the config's own vocabulary, that it has
+      // no pixel tier yet.
+      step('visual', true, `skipped (${tier.reason})`)
     } else {
       console.log('• visual layer (layout + axe + regression) …')
       const vis = run(
         'npx',
-        [
-          'playwright',
-          'test',
-          '-c',
-          CFG.visualConfig,
-          ...CFG.visualSpecs,
-          ...(process.env.VISUAL_SNAPSHOTS ? CFG.visualSnapshotSpecs : []),
-        ],
+        ['playwright', 'test', '-c', tier.config, ...tier.specs],
         { env: { ...process.env, GALLERY_PORT: String(PORT) } },
       )
       const passed = (vis.out.match(/(\d+) passed/) || [])[1]

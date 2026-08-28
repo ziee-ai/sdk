@@ -18,7 +18,35 @@ interface ModuleSystemState {
   components: ComponentRegistration[]
   addComponents: (components: ComponentRegistration[]) => void
   registerModule: (module: AppModule) => void
+  /** Register a store proxy directly, by name (idempotent — keeps the first).
+   *  Used by whole-store-lazy stores that self-register as a side effect of
+   *  their (lazy) chunk loading, instead of being declared in a module's
+   *  `stores:` array. Keeps `Stores.<name>` (the compat shim) resolving to the
+   *  SAME proxy instance a direct `import { X }` returns. */
+  registerStore: (name: string, proxy: any) => void
   initializeModules: () => void
+}
+
+/**
+ * Names whose proxy is owned by the STORE FILE itself (`registerLazyStore` →
+ * `registerStore`), not by this registry. `stores.ts` documents that proxy as
+ * the sole owner of init-on-first-access + ref-counted destroy, and it is the
+ * instance every consumer holds via a direct `import { X } from './X.store'`.
+ * The registry must therefore never destroy or replace it — doing so would give
+ * the app two independently ref-counted lifecycles for one store, so `init`
+ * (and every `sync:*` listener it registers) could run twice.
+ */
+const selfOwnedStores = new Set<string>()
+
+/** `import.meta.env` is injected by the bundler and is UNDEFINED under a plain
+ *  node runtime (the unit-test resolver), so read it defensively — a dev-only
+ *  diagnostic must never be the thing that throws. */
+const isDev = (): boolean => {
+  try {
+    return Boolean((import.meta as { env?: { DEV?: boolean } }).env?.DEV)
+  } catch {
+    return false
+  }
 }
 
 export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
@@ -33,6 +61,17 @@ export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
     }))
   },
 
+  registerStore: (name: string, proxy: any) => {
+    selfOwnedStores.add(name)
+    set(state => {
+      // Idempotent: a store's chunk may be imported by several consumers, but
+      // ES-module singletons mean this runs once; guard anyway so a stray
+      // double-register never clobbers the live (ref-counted) proxy instance.
+      if (state.stores[name]) return state
+      return { stores: { ...state.stores, [name]: proxy } }
+    })
+  },
+
   registerModule: (module: AppModule) => {
     set(state => {
       // Check if module is already registered
@@ -42,7 +81,7 @@ export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
 
       if (existingIndex !== -1) {
         // In development, allow re-registration for HMR
-        if (import.meta.env.DEV) {
+        if (isDev()) {
           console.log(
             `🔄 Re-registering module for HMR: ${module.metadata.name}`,
           )
@@ -56,6 +95,21 @@ export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
           if (module.registerStores) {
             const storeRegistrations = module.registerStores()
             storeRegistrations.forEach(reg => {
+              // A self-owned proxy (see `selfOwnedStores`) must survive HMR:
+              // destroying + replacing it would tear down the LIVE instance every
+              // consumer holds and install a second, independently ref-counted
+              // one — the same double-`init` / double-`sync:*`-listener hazard
+              // the new-module branch below guards against.
+              //
+              // BE CLEAR ABOUT THE SCOPE: `registerLazyStore` routes EVERY
+              // store-kit-authored store through `registerStore`, so in practice
+              // this disables HMR destroy+replace for nearly all stores. That is
+              // the intended trade — a hot-reloaded module keeps its live store
+              // instance (state included) instead of silently acquiring a second
+              // lifecycle. Only the residual legacy `stores: [...]`-only stores,
+              // whose proxy this registry created, are still replaced.
+              if (selfOwnedStores.has(reg.name)) return
+
               // Destroy old store instance before replacing (HMR cleanup)
               const oldStoreProxy = state.stores[reg.name]
               if (oldStoreProxy?.$?.__destroy__) {
@@ -121,7 +175,26 @@ export const useModuleSystemStore = create<ModuleSystemState>((set, get) => ({
       if (module.registerStores) {
         const storeRegistrations = module.registerStores()
         storeRegistrations.forEach(reg => {
-          newStores[reg.name] = createStoreProxy(reg.store)
+          // REUSE an already-registered proxy. A store authored with
+          // `registerLazyStore` self-registers its proxy at import time
+          // (`stores.ts`), and that proxy is documented as the SOLE owner of
+          // init-on-first-access + ref-counted destroy. Building a second one
+          // here for a store also listed in a module's `stores:` array would
+          // give it an independent `storeInitialized` flag and ref count — so
+          // its `init` (and every `sync:*` listener that registers) could run
+          // twice. Idempotent, matching `registerStore` above.
+          if (!newStores[reg.name]) {
+            newStores[reg.name] = createStoreProxy(reg.store)
+          } else if (isDev() && !selfOwnedStores.has(reg.name)) {
+            // Two DIFFERENT modules claiming one store name is a real bug, and
+            // first-wins would hide it as "my store's actions do nothing".
+            // (A self-owned name reaching here is the expected case — the store
+            // file registered its own proxy — so it is not warned about.)
+            console.warn(
+              `[module-system] store name "${reg.name}" is already registered by ` +
+                `another module; keeping the first registration. Rename one of them.`,
+            )
+          }
         })
       }
 

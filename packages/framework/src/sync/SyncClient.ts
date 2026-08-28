@@ -1,10 +1,16 @@
 import { getAuthToken, getBaseUrl } from '../api-client/core'
+import { bumpFetchEpoch } from '../api-client/inflight'
 // Generic SSE frame shape (app-agnostic): the runtime only reads these
 // three string fields off each 'sync' frame, so the framework needs no
 // dependency on the app's generated SyncEntity/SyncAction unions.
 interface SyncEvent { entity: string; action: string; id: string }
 import { useEventBusStore } from '../events/store'
 import { setSyncConnectionId } from './connection'
+import {
+  INITIAL_BACKOFF_MS,
+  MAX_BACKOFF_MS,
+  reconnectDelayMs,
+} from './backoff'
 
 // Realtime-sync SSE client. A thin bridge: opens the per-user
 // `GET /api/sync/subscribe` stream and re-emits each `{entity, action,
@@ -14,8 +20,6 @@ import { setSyncConnectionId } from './connection'
 // same fetch + ReadableStream approach as the api-client so header auth
 // works (EventSource can't set Authorization).
 
-const INITIAL_BACKOFF_MS = 1_000
-const MAX_BACKOFF_MS = 30_000
 // A connection must stay alive this long before we trust it as "stable" and
 // reset the reconnect backoff. A stream that connects then immediately drops
 // (flapping) keeps backing off instead of hammering the 1s floor.
@@ -25,6 +29,20 @@ const STABLE_AFTER_MS = 3_000
 // all-stores reload storm — which would itself overload the connection and
 // keep it flapping (a self-reinforcing loop).
 const RESYNC_MIN_INTERVAL_MS = 5_000
+
+/** A subscribe attempt refused for capacity — carries the status so
+ *  `connectLoop` can pick the capacity backoff instead of the transient one. */
+class SubscribeRefused extends Error {
+  // Declared + assigned explicitly (not a TS parameter property) so the file
+  // stays parseable by type-STRIPPING runtimes — node's `--test` strip-only
+  // mode, which the unit specs run under, rejects parameter properties.
+  status: number
+  constructor(status: number) {
+    super(`[sync] subscribe failed: ${status}`)
+    this.name = 'SubscribeRefused'
+    this.status = status
+  }
+}
 
 let started = false
 // Monotonic loop generation. A user-switch (stop→start) bumps this so the
@@ -61,16 +79,18 @@ export function stopSyncClient(): void {
 
 async function connectLoop(myEpoch: number): Promise<void> {
   while (started && myEpoch === epoch) {
+    let refusedStatus: number | null = null
     try {
       await connectOnce(myEpoch)
     } catch (error) {
       if (!started || myEpoch !== epoch) break
+      if (error instanceof SubscribeRefused) refusedStatus = error.status
       if (!(error instanceof DOMException && error.name === 'AbortError')) {
         console.warn('[sync] stream ended; reconnecting', error)
       }
     }
     if (!started || myEpoch !== epoch) break
-    await delay(backoffMs)
+    await delay(reconnectDelayMs(refusedStatus, backoffMs))
     backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS)
   }
 }
@@ -108,7 +128,7 @@ async function connectOnce(myEpoch: number): Promise<void> {
   }
 
   if (!response.ok || !response.body) {
-    throw new Error(`[sync] subscribe failed: ${response.status}`)
+    throw new SubscribeRefused(response.status)
   }
 
   // Established. Reset the reconnect backoff only AFTER the stream proves
@@ -171,6 +191,10 @@ function maybeResync(): void {
   const now = Date.now()
   if (now - lastResyncAt < RESYNC_MIN_INTERVAL_MS) return
   lastResyncAt = now
+  // We were disconnected, so arbitrary remote changes may have been missed —
+  // same reasoning as a `sync` frame: the all-stores resync below must not be
+  // able to join reads that were already in flight across the gap.
+  bumpFetchEpoch()
   void useEventBusStore.getState().emit({ type: 'sync:reconnect', data: {} } as never)
 }
 
@@ -186,6 +210,12 @@ function handleFrame(event: string, data: unknown): void {
   if (event === 'sync') {
     const ev = data as SyncEvent | null
     if (!ev || !ev.entity || !ev.action || !ev.id) return
+    // A remote mutation landed. Invalidate joinability of every read already on
+    // the wire so the store's `sync:<entity>` refetch below performs a REAL
+    // round-trip instead of joining a request that started before the change —
+    // the notify-and-refetch contract must not be collapsed by the transport's
+    // in-flight coalescer.
+    bumpFetchEpoch()
     // Re-emit onto the existing EventBus as a per-entity event; whichever
     // store subscribed to this `sync:<entity>` reacts. Cast: the
     // template-literal key is a valid `keyof AppEvents` but TS can't narrow

@@ -42,8 +42,15 @@ const DEFAULTS = {
    * `@ziee/kit/testIds.generated`); `null` = the historical in-app default
    * `<srcDir>/components/ui/testIds.generated.ts`. */
   testidOut: null,
-  /** Dev-server port for the gate + runtime passes. */
-  port: 1420,
+  /** Dev-server port for the gate + runtime passes. `null` = derive a
+   *  per-worktree, bind-checked port from the unified run key (audit §7 — no
+   *  fixed 1420). An app may still pin an explicit number, and GALLERY_PORT
+   *  always overrides. */
+  port: null,
+  /** Which PORT_FLOORS range the key-derived port searches from (run-key.mjs).
+   *  Web uses `webGallery`; the desktop workspace sets `desktopGallery` so the
+   *  two never collide. */
+  portWhich: 'webGallery',
   /** Standalone gallery URL. */
   galleryUrl: '/gallery.html',
   /** Prod-exclusion marker (must equal the marker `@ziee/gallery` emits). */
@@ -58,7 +65,12 @@ const DEFAULTS = {
   extraTrees: [],
   /** App module exporting `isRuntimeBaselined(finding)` (or null = none). */
   runtimeBaselineModule: null,
-  /** Playwright visual config + spec list the gate runs. */
+  /**
+   * Playwright visual config + spec list the gate runs. `visualConfig: null` (or
+   * an empty `visualSpecs`) is the DECLARED "this app has no visual tier yet"
+   * shape — `resolveVisualTier()` below turns it into a skip, and the gate must
+   * ask that helper rather than interpolating these fields into an argv (a
+   * `null` there becomes the literal path `<uiRoot>/null`). */
   visualConfig: 'playwright.visual.config.ts',
   visualSpecs: ['layout.spec.ts', 'states.spec.ts', 'overlays.spec.ts'],
   visualSnapshotSpecs: ['gallery.spec.ts'],
@@ -78,4 +90,45 @@ export function resolveGalleryConfig(cwd = process.cwd()) {
     }
   }
   return { ...DEFAULTS, ...file, __cwd: cwd, __configPath: configPath }
+}
+
+/**
+ * Decide whether the app HAS a visual tier, and resolve the argv for it.
+ *
+ * The config's own vocabulary already admits "no visual tier": `visualConfig`
+ * is nullable and `visualSpecs` may be empty. Nothing consumed that vocabulary,
+ * so a declared-absent tier reached playwright as `-c null` and died with
+ * `<uiRoot>/null does not exist` — an app that had truthfully said it has no
+ * pixel tier failed the whole gate for saying so.
+ *
+ * Returns `{ enabled: false, reason }` for the declared-absent shapes, and for
+ * a `visualConfig` naming a file that is not there (a dangling pointer is a
+ * misconfiguration the gate should NAME, not a stack trace from playwright).
+ *
+ * @param {object} cfg    a `resolveGalleryConfig()` result
+ * @param {object} [opts] `{ snapshots }` — include `visualSnapshotSpecs`
+ * @returns {{enabled: boolean, reason?: string, config?: string, specs?: string[]}}
+ */
+export function resolveVisualTier(cfg, { snapshots = false } = {}) {
+  const configPath = cfg.visualConfig
+  const specs = Array.isArray(cfg.visualSpecs) ? cfg.visualSpecs : []
+
+  if (configPath == null || configPath === '')
+    return { enabled: false, reason: 'no visual tier configured (visualConfig: null)' }
+  if (specs.length === 0)
+    return { enabled: false, reason: 'no visual tier configured (visualSpecs: [])' }
+
+  const resolved = path.resolve(cfg.__cwd ?? process.cwd(), configPath)
+  if (!fs.existsSync(resolved))
+    return {
+      enabled: false,
+      reason: `visualConfig ${configPath} does not exist — set it to null to declare no visual tier`,
+    }
+
+  const snapshotSpecs = Array.isArray(cfg.visualSnapshotSpecs) ? cfg.visualSnapshotSpecs : []
+  return {
+    enabled: true,
+    config: configPath,
+    specs: [...specs, ...(snapshots ? snapshotSpecs : [])],
+  }
 }

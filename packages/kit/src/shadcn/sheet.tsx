@@ -2,8 +2,8 @@ import * as React from "react"
 import { Dialog as SheetPrimitive } from "@base-ui/react/dialog"
 
 import { cn } from "../lib/utils"
-import { Button } from "./button"
-import { XIcon } from "lucide-react"
+import { OverlayCloseButton } from "../internal/overlay-close"
+import { usePortalContainer, PortalContainerInherit, type PortalContainerValue } from "../kit/portal-container"
 
 function Sheet({ ...props }: SheetPrimitive.Root.Props) {
   return <SheetPrimitive.Root data-slot="sheet" {...props} />
@@ -43,19 +43,29 @@ function SheetContent({
   children,
   side = "right",
   showCloseButton = true,
+  closeLabel = "Close",
   onTouchStart,
   onTouchMove,
   onTouchEnd,
+  container,
   ...props
 }: SheetPrimitive.Popup.Props & {
   side?: "top" | "right" | "bottom" | "left"
   showCloseButton?: boolean
+  /** Accessible name AND hover text for the corner \u00d7. Defaults to the English word this
+      component has always hardcoded in its `sr-only` span, so supplying it is optional and
+      omitting it is not a regression \u2014 but a translated app should supply it. */
+  closeLabel?: string
+  /** Portal target. Defaults to the document of the window this subtree renders in. */
+  container?: PortalContainerValue
 }) {
   // Forward touch handlers to BOTH the overlay (mask) and the panel so a
   // swipe-to-close gesture can start on either.
   const touchHandlers = { onTouchStart, onTouchMove, onTouchEnd }
+  const portalContainer = usePortalContainer(container)
   return (
-    <SheetPortal>
+    <SheetPortal container={portalContainer}>
+     <PortalContainerInherit>
       <SheetOverlay {...touchHandlers} />
       <SheetPrimitive.Popup
         data-slot="sheet-content"
@@ -64,29 +74,40 @@ function SheetContent({
         className={cn(
           // A closed-but-still-mounted popup must not hit-test (see SheetOverlay).
           "data-[closed]:pointer-events-none",
-          "fixed z-50 flex flex-col gap-4 bg-popover bg-clip-padding text-sm text-popover-foreground shadow-lg transition duration-200 ease-in-out data-ending-style:opacity-0 data-starting-style:opacity-0 data-[side=bottom]:inset-x-0 data-[side=bottom]:bottom-0 data-[side=bottom]:h-auto data-[side=bottom]:border-t data-[side=bottom]:data-ending-style:translate-y-[2.5rem] data-[side=bottom]:data-starting-style:translate-y-[2.5rem] data-[side=left]:inset-y-0 data-[side=left]:left-0 data-[side=left]:h-full data-[side=left]:w-3/4 data-[side=left]:border-r data-[side=left]:data-ending-style:translate-x-[-2.5rem] data-[side=left]:data-starting-style:translate-x-[-2.5rem] data-[side=right]:inset-y-0 data-[side=right]:right-0 data-[side=right]:h-full data-[side=right]:w-3/4 data-[side=right]:border-l data-[side=right]:data-ending-style:translate-x-[2.5rem] data-[side=right]:data-starting-style:translate-x-[2.5rem] data-[side=top]:inset-x-0 data-[side=top]:top-0 data-[side=top]:h-auto data-[side=top]:border-b data-[side=top]:data-ending-style:translate-y-[-2.5rem] data-[side=top]:data-starting-style:translate-y-[-2.5rem] data-[side=left]:sm:max-w-sm data-[side=right]:sm:max-w-sm",
+          // bottom/top are CAPPED (`max-h-[85svh]`), not auto-height and not full-height.
+          //
+          // They used to carry `h-auto` while only left/right got `h-full`. This popup is a flex
+          // COLUMN whose body is `flex-1 overflow-y-auto`, and `flex-1` is inert under an
+          // auto-height parent — there is no definite height to take a remainder of. A tall
+          // bottom sheet therefore did not scroll, it GREW: measured at 3293px inside an 800px
+          // phone viewport, with its top at -2454, so its first 2454px were unreachable rather
+          // than merely off screen. `MobileShell`'s bottom "Analysis" sheet is that path.
+          //
+          // `h-full` would fix the overflow and break everything else: every bottom sheet, short
+          // ones included, would become full-screen. A CAP touches only what is too tall — a
+          // short sheet still sizes to its content, which is what `h-auto` was there for.
+          //
+          // 85svh, not 85vh/85dvh: `vh` resolves against the LARGE viewport, so with a mobile
+          // browser's toolbar showing, 85vh is taller than what the user can see — this same bug
+          // at a smaller scale. `svh` is the toolbar-visible viewport and is always safe. The 15%
+          // remainder is also the backdrop strip that keeps the sheet reading as an overlay and
+          // keeps tap-to-dismiss reachable. (The kit sidebar already uses `svh`.)
+          //
+          // The cap is the WHOLE fix; no `min-h-0` is needed on the body and adding one was
+          // measured to change nothing (see the note at `kit/sheet.tsx`'s body div). Pinned by
+          // `kit/sheet-bottom-track.test.tsx` and measured by
+          // `src-app/ui/tests/gallery-e2e/sheet-bottom-track.spec.ts`.
+          "fixed z-50 flex flex-col gap-4 bg-popover bg-clip-padding text-sm text-popover-foreground shadow-lg transition duration-200 ease-in-out data-ending-style:opacity-0 data-starting-style:opacity-0 data-[side=bottom]:inset-x-0 data-[side=bottom]:bottom-0 data-[side=bottom]:max-h-[85svh] data-[side=bottom]:border-t data-[side=bottom]:data-ending-style:translate-y-[2.5rem] data-[side=bottom]:data-starting-style:translate-y-[2.5rem] data-[side=left]:inset-y-0 data-[side=left]:left-0 data-[side=left]:h-full data-[side=left]:w-3/4 data-[side=left]:border-r data-[side=left]:data-ending-style:translate-x-[-2.5rem] data-[side=left]:data-starting-style:translate-x-[-2.5rem] data-[side=right]:inset-y-0 data-[side=right]:right-0 data-[side=right]:h-full data-[side=right]:w-3/4 data-[side=right]:border-l data-[side=right]:data-ending-style:translate-x-[2.5rem] data-[side=right]:data-starting-style:translate-x-[2.5rem] data-[side=top]:inset-x-0 data-[side=top]:top-0 data-[side=top]:max-h-[85svh] data-[side=top]:border-b data-[side=top]:data-ending-style:translate-y-[-2.5rem] data-[side=top]:data-starting-style:translate-y-[-2.5rem] data-[side=left]:sm:max-w-sm data-[side=right]:sm:max-w-sm",
           className
         )}
         {...props}
       >
         {children}
         {showCloseButton && (
-          <SheetPrimitive.Close
-            data-slot="sheet-close"
-            render={
-              <Button
-                variant="ghost"
-                className="absolute top-3 right-3"
-                size="icon-sm"
-              />
-            }
-          >
-            <XIcon
-            />
-            <span className="sr-only">Close</span>
-          </SheetPrimitive.Close>
+          <OverlayCloseButton slot="sheet-close" label={closeLabel} className="absolute top-3 right-3" />
         )}
       </SheetPrimitive.Popup>
+     </PortalContainerInherit>
     </SheetPortal>
   )
 }

@@ -5,8 +5,11 @@
 //! from a fully-migrated template so migrations run once per process, not once
 //! per test — the property that makes the suite safe WITHOUT `--test-threads=1`),
 //! allocates a free TCP port, writes a temp config file, health-polls the
-//! server up, and reaps everything on `Drop` (kill child, remove config, async
-//! `DROP DATABASE`, drop the isolated data-dir + any app keep-alive tempdirs).
+//! server up, and reaps everything on `Drop` — kill child, remove config,
+//! SYNCHRONOUSLY `DROP DATABASE` (see [`SpawnedServer::drop`] for why the word
+//! matters), drop the isolated data-dir + any app keep-alive tempdirs. The exit
+//! paths a destructor cannot reach are covered by [`sweep_stale_test_dbs`] at the
+//! start of the next test process.
 //!
 //! ## The seam
 //!
@@ -34,9 +37,21 @@ use uuid::Uuid;
 // on both sides.
 pub use ziee_build_support::worktree_db;
 
-// App-neutral auth/sync test fixtures (feature-gated; heavier test-only deps).
-#[cfg(feature = "fixtures")]
+// App-neutral auth/sync test fixtures. Two independently-selectable groups —
+// `sync-probe` (the SSE reader) and `auth-mocks` (oauth/ldap/apple) — so an app
+// can take the cheap one without the docker/HTTP-mock deps of the other.
+// `fixtures` = both, which is what it always meant.
+#[cfg(any(feature = "sync-probe", feature = "auth-mocks"))]
 pub mod fixtures;
+
+/// The per-test `app.data_dir`: owned, unmounted before removal, and swept at the
+/// start of the next process. See the module docs for why a bare `TempDir` leaked
+/// 176 GB and 703 mount-table entries on the happy path.
+pub mod data_dir;
+
+pub use data_dir::{
+    sweep_stale_test_data_dirs, DataDirSweepReport, PerTestDataDir, TEST_DATA_DIR_PREFIX,
+};
 
 /// Seam for [`fixtures::sync_probe::SyncProbe::open`]: the consuming app's thin
 /// `TestServer` shim implements this so the probe can build the
@@ -190,12 +205,15 @@ pub fn shared_test_app_data_dir(manifest_dir: &Path) -> PathBuf {
 /// `lit-cache/`) are SYMLINKED in from the shared `.ziee-cache` dir so the
 /// hundreds-of-MB extraction still happens once per `cargo test` run. Non-unix
 /// falls back to the shared dir (the CI parallel target is linux).
-pub fn make_isolated_data_dir(manifest_dir: &Path) -> tempfile::TempDir {
+///
+/// Returns a [`PerTestDataDir`], NOT a `tempfile::TempDir`: the tree routinely
+/// contains a squashfuse mount, and `TempDir`'s destructor is a `remove_dir_all`
+/// whose error is discarded — which over this tree means it deletes the symlinks
+/// below, fails with `ENOSYS` at the mount point, and silently leaves ~300 MB and a
+/// `/proc/mounts` entry behind on every green run. See [`data_dir`].
+pub fn make_isolated_data_dir(manifest_dir: &Path) -> PerTestDataDir {
     let shared = shared_test_app_data_dir(manifest_dir);
-    let td = tempfile::Builder::new()
-        .prefix("ziee-test-data-")
-        .tempdir()
-        .expect("create per-test data_dir TempDir");
+    let td = PerTestDataDir::new().expect("create per-test data_dir");
     // Symlink the read-only / content-addressed caches so they stay shared.
     // `lib` is load-bearing for the macOS sandbox: the embedded sandbox-runtime
     // bundle extracts its launcher to `bin/` and its dylibs (libkrun, …) to
@@ -222,6 +240,202 @@ pub fn make_isolated_data_dir(manifest_dir: &Path) -> tempfile::TempDir {
 
 static TEST_TEMPLATE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
+/// Prefix of every per-test database this engine creates. The ONE literal — the
+/// creator ([`TestHarness::start`]), the reaper ([`SpawnedServer::drop`]) and the
+/// sweep ([`sweep_stale_test_dbs`]) all key on it, so they cannot drift apart into
+/// "creates one shape, collects another".
+pub const TEST_DB_PREFIX: &str = "test_db_";
+
+/// Default age floor for [`sweep_stale_test_dbs`], in seconds.
+///
+/// A per-test database is created immediately before its server spawns and reaped
+/// when the test's handle drops, so its whole life is one test's wall time — bounded
+/// above by the 30s readiness ceiling plus the body, i.e. minutes at the very worst.
+/// Two hours is two orders of magnitude of margin over that, which is the point: the
+/// floor is not a tuning knob, it is the distance between "no test is this slow" and
+/// "a concurrent run could still be using this".
+const DEFAULT_SWEEP_MIN_AGE_SECS: i64 = 7200;
+
+/// Upper bound on one sweep, so a badly-leaked cluster costs a bounded startup
+/// rather than minutes of `DROP DATABASE`. The sweep is self-healing across runs, so
+/// a capped pass still converges.
+const SWEEP_MAX_PER_PASS: i64 = 2000;
+
+/// Reclaim per-test databases that no `Drop` will ever reap.
+///
+/// `Drop` covers the normal return, the early `?` return and the panicking body. It
+/// covers NONE of `panic = "abort"`, a SIGKILL, an OOM kill, or a test-binary
+/// timeout — and those are precisely the runs that leak in bulk. This sweep is the
+/// self-healing half: it runs once per test process, before the first clone, and
+/// needs no cooperation from the run that leaked.
+///
+/// ## What it will and will not take
+///
+/// A database is collected only when ALL of:
+///
+///   1. its name matches the anchored `test_db_` prefix — never the shared
+///      `<app>_test_template_<key>` or `<app>_build_<key>` databases, which a whole
+///      worktree's concurrent run depends on and which carry no such prefix;
+///   2. it has ZERO sessions in `pg_stat_activity`;
+///   3. the creation time of its `PG_VERSION` file is older than `min_age_secs`.
+///
+/// Neither (2) nor (3) is sufficient alone, which is why both are required. (2)
+/// alone is unsafe because a LIVE test's database genuinely can show zero backends:
+/// the harness renders `idle_timeout_secs: 10` into the server's pool config, so a
+/// test that pauses ten seconds between requests has no connections while very much
+/// still running. (3) alone is unsafe because it is a wall-clock guess about a
+/// stranger's process. Together they describe a database that both looks abandoned
+/// and has had far longer than any test takes to prove otherwise.
+///
+/// The drop itself is a plain `DROP DATABASE` — deliberately **not** `WITH (FORCE)`.
+/// FORCE would terminate the sessions of whatever is connected, converting the
+/// residual race in (2)→(3) from "the drop errors and we log it" into "a concurrent
+/// run loses its database mid-test". Erroring is the correct outcome here, so the
+/// non-forcing form is load-bearing, not an oversight.
+///
+/// Returns a [`SweepReport`]. It carries `considered` — every name the query
+/// admitted — and not merely `dropped`, because those two answer different
+/// questions and only the first can guard the in-use check. A sweep that has lost
+/// its in-use check still fails to drop a live database (Postgres refuses a
+/// non-forcing `DROP` while a session is attached), so a control that only inspects
+/// `dropped` goes green on exactly the mutation it exists to catch. `considered` is
+/// the set the sweep BELIEVED was abandoned, which is the thing under test.
+pub async fn sweep_stale_test_dbs(admin_url: &str, min_age_secs: i64) -> SweepReport {
+    let mut report = SweepReport::default();
+
+    let pool = match PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(admin_url)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("test harness: stale-db sweep could not connect: {e}");
+            return report;
+        }
+    };
+
+    // `pg_stat_file` needs superuser / `pg_read_server_files`. The harness connects
+    // as the cluster's admin role, but a deployment that does not may lose the age
+    // column — in which case the sweep does NOTHING rather than falling back to a
+    // less safe discriminator. Losing the sweep re-opens a leak; losing the age
+    // check would let it eat a live run.
+    let sql = format!(
+        "SELECT d.datname \
+           FROM pg_database d \
+          WHERE d.datname LIKE '{TEST_DB_PREFIX}%' \
+            AND NOT d.datistemplate \
+            AND NOT EXISTS ( \
+                  SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname) \
+            AND (pg_stat_file('base/' || d.oid || '/PG_VERSION')).modification \
+                  < now() - make_interval(secs => $1) \
+          LIMIT {SWEEP_MAX_PER_PASS}"
+    );
+
+    let rows: Vec<(String,)> = match sqlx::query_as(&sql)
+        .bind(min_age_secs as f64)
+        .fetch_all(&pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("test harness: stale-db sweep could not enumerate candidates: {e}");
+            pool.close().await;
+            return report;
+        }
+    };
+
+    for (name,) in rows {
+        // Never interpolate a name that is not the shape we create. Belt to the
+        // LIKE's braces: the identifier goes into DDL, where a bind parameter is
+        // not available.
+        if !is_engine_test_db_name(&name) {
+            continue;
+        }
+        report.considered.push(name.clone());
+        match sqlx::query(&format!("DROP DATABASE IF EXISTS {name}"))
+            .execute(&pool)
+            .await
+        {
+            Ok(_) => report.dropped.push(name),
+            // Expected and fine: something connected between the check and the
+            // drop, so Postgres refused. That refusal is the residual-race safety
+            // net, NOT the in-use check — which is why it is recorded separately.
+            Err(e) => {
+                eprintln!("test harness: stale-db sweep left {name} in place: {e}");
+                report.refused.push(name);
+            }
+        }
+    }
+
+    pool.close().await;
+    if !report.dropped.is_empty() {
+        eprintln!(
+            "test harness: stale-db sweep reclaimed {} orphaned {TEST_DB_PREFIX}* database(s)",
+            report.dropped.len()
+        );
+    }
+    report
+}
+
+/// What one [`sweep_stale_test_dbs`] pass did.
+#[derive(Debug, Default, Clone)]
+pub struct SweepReport {
+    /// Every database the sweep judged abandoned and attempted to drop. This is
+    /// the set the safety controls assert against: a database still in use must
+    /// never reach it, whether or not the drop would then have failed.
+    pub considered: Vec<String>,
+    /// Successfully dropped.
+    pub dropped: Vec<String>,
+    /// Considered, but Postgres refused (something connected in between).
+    pub refused: Vec<String>,
+}
+
+/// Exactly the shape [`TestHarness::start`] generates: the prefix followed by a
+/// UUID with its hyphens replaced by underscores. Anything else is somebody
+/// else's database and is never interpolated into DDL.
+fn is_engine_test_db_name(name: &str) -> bool {
+    match name.strip_prefix(TEST_DB_PREFIX) {
+        Some(rest) => !rest.is_empty() && rest.chars().all(|c| c.is_ascii_hexdigit() || c == '_'),
+        None => false,
+    }
+}
+
+static STARTUP_SWEEP_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the once-per-process startup sweep hook has run in THIS process.
+///
+/// Exists so a test can assert the sweep is INSTALLED, not merely callable. Every
+/// other sweep test invokes [`sweep_stale_test_dbs`] directly and would stay green
+/// if the call inside the harness's own startup were deleted — which is the half of
+/// this fix that covers SIGKILL, OOM, `panic = "abort"` and binary timeouts.
+pub fn startup_sweep_ran() -> bool {
+    STARTUP_SWEEP_RAN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Run [`sweep_stale_test_dbs`] once per test process with the configured floor.
+///
+/// `ZIEE_TEST_DB_SWEEP=0` disables it; `ZIEE_TEST_DB_SWEEP_MIN_AGE_SECS` overrides
+/// the floor (the harness's own control tests call the function directly rather than
+/// going through this, so the knobs are not load-bearing for correctness).
+async fn sweep_stale_test_dbs_once(admin_url: &str) {
+    // Recorded BEFORE the opt-out, because what this flag attests is that the
+    // startup hook RAN — not what it decided. A guard on `sweep_stale_test_dbs`
+    // is not a guard on anything calling it: deleting the call site leaves every
+    // direct-call test green while the self-healing half of the fix is simply
+    // gone. See [`startup_sweep_ran`].
+    STARTUP_SWEEP_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+    if env::var("ZIEE_TEST_DB_SWEEP").as_deref() == Ok("0") {
+        return;
+    }
+    let min_age = env::var("ZIEE_TEST_DB_SWEEP_MIN_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_SWEEP_MIN_AGE_SECS);
+    sweep_stale_test_dbs(admin_url, min_age).await;
+}
+
 /// The fully-migrated TEMPLATE database name = the app's per-variant base +
 /// the per-worktree suffix.
 fn test_template_db<A: HarnessApp>(app: &A, variant: Variant, manifest_dir: &Path) -> String {
@@ -244,6 +458,15 @@ async fn ensure_test_template<A: HarnessApp>(
 ) {
     TEST_TEMPLATE
         .get_or_init(|| async {
+            // Reclaim the orphans no `Drop` could have reaped (abort/SIGKILL/OOM/
+            // timeout), BEFORE this process starts cloning its own. Self-healing:
+            // it needs nothing from the run that leaked.
+            sweep_stale_test_dbs_once(admin_url).await;
+            // The same half of the same problem, for the per-test DATA DIR — whose
+            // orphans cost ~300 MB and a `/proc/mounts` entry each, not a catalog
+            // row. Runs here rather than in `start` so it is once per PROCESS.
+            data_dir::sweep_stale_test_data_dirs_once();
+
             let admin = PgPoolOptions::new()
                 .max_connections(1)
                 .connect(admin_url)
@@ -317,9 +540,17 @@ pub struct SpawnedServer {
     pub database_name: String,
     pub database_url: String,
     temp_config_path: PathBuf,
-    admin_db_url: String,
-    /// Per-test isolated data_dir (mutable state); dropped at test end.
-    _data_tempdir: tempfile::TempDir,
+    /// Declared AFTER `process`/`temp_config_path` so it drops after them: the
+    /// child's Postgres sessions are gone before the reap asks for the database.
+    _db: PerTestDb,
+    /// Per-test isolated data_dir (mutable state), reclaimed at test end.
+    ///
+    /// Ordering is load-bearing and is provided by [`SpawnedServer::drop`]'s BODY,
+    /// which kills and `wait`s the child before any field is dropped. The server
+    /// must be dead before this field's destructor unmounts its squashfuse mounts —
+    /// a live server holding the mount makes the unmount fail and the tree
+    /// un-removable, which is the state this whole type exists to prevent.
+    _data_tempdir: PerTestDataDir,
     /// App-supplied handles (workspace/hub/sandbox-cache tempdirs) held for the
     /// server's lifetime; dropped at test end.
     _keep_alive: Vec<Box<dyn Any + Send + Sync>>,
@@ -332,43 +563,166 @@ impl SpawnedServer {
     }
 }
 
-impl Drop for SpawnedServer {
+/// Drop the per-test database, synchronously. Errors are RETURNED, never
+/// discarded: a `DROP DATABASE` that fails and a `DROP DATABASE` that never ran
+/// leave the cluster in the identical state, which is exactly how this leak stayed
+/// invisible for the whole life of the harness.
+async fn reap_test_database(admin_url: &str, database_name: &str) -> Result<(), sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(admin_url)
+        .await?;
+
+    // The server child was SIGKILLed a moment ago; Postgres may not have reaped its
+    // backends yet, and `DROP DATABASE` refuses while any session is attached. This
+    // terminates OUR OWN test's sessions only — the statement is scoped to this
+    // per-test database, never the template and never anyone else's.
+    let terminate = sqlx::query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+          WHERE datname = $1 AND pid <> pg_backend_pid()",
+    )
+    .bind(database_name)
+    .execute(&pool)
+    .await;
+
+    let dropped = sqlx::query(&format!("DROP DATABASE IF EXISTS {database_name}"))
+        .execute(&pool)
+        .await;
+
+    pool.close().await;
+    terminate?;
+    dropped?;
+    Ok(())
+}
+
+/// Sole owner of one per-test database, from the moment `CREATE DATABASE` returns
+/// until it is reaped.
+///
+/// It exists because the reap used to hang off [`SpawnedServer`], which is not
+/// constructed until the server is HEALTHY — leaving a window between the create and
+/// that construction in which two `panic!`/`expect` sites unwind past an unowned
+/// database: `Command::spawn` (a missing or unbuilt binary) and the 30s readiness
+/// ceiling. The second is not hypothetical — it fired during this change's own
+/// full-suite validation run on the shared box. Ownership now starts where the
+/// resource does, so the window has no width rather than a shorter one.
+struct PerTestDb {
+    name: String,
+    admin_url: String,
+}
+
+impl Drop for PerTestDb {
+    /// Reap SYNCHRONOUSLY, on a thread this destructor owns and joins.
+    ///
+    /// ## What was wrong, and why the shape (not the call) is the fix
+    ///
+    /// This used to be `tokio::runtime::Handle::current().spawn(async { … })` on
+    /// [`SpawnedServer`]. A test's handle drops at the end of its body, so that task
+    /// was scheduled onto the very runtime `#[tokio::test]`'s `block_on` is about to
+    /// return from; dropping a current-thread runtime does not poll its pending
+    /// tasks, so the task was cancelled at its first `.await` — a Postgres connect —
+    /// and the database was never touched. Measured: one ordinary PASSING test
+    /// leaked exactly one database, i.e. a 100% leak rate. That is where 8,753
+    /// orphaned `test_db_*` databases on the shared build cluster came from; at
+    /// ~46,000, Postgres startup took minutes just scanning them.
+    ///
+    /// The fix is not "remember to clean up" — a call at the end of a test body is
+    /// skipped by every early `?`, every early return and every failed assertion.
+    /// The reap is bound to a VALUE's lifetime, so the language runs it on all of
+    /// those paths, and it runs on a dedicated OS thread with its own runtime which
+    /// is then JOINED. Owning the thread is what makes it uncancellable: nothing
+    /// about the caller's runtime — its flavour, its shutdown, or its imminent
+    /// unwind — can discard the work, and drop cannot return until the cluster has
+    /// answered.
+    ///
+    /// It still cannot cover `panic = "abort"`, a SIGKILL, an OOM kill or a
+    /// test-binary timeout. Nothing in this process can. Those are
+    /// [`sweep_stale_test_dbs`]'s job, at the START of the next test process, which
+    /// needs no cooperation from the run that died.
     fn drop(&mut self) {
-        // Kill the server process.
+        // DECISION — a failing test drops its database rather than keeping it. The
+        // name is a v4 UUID printed nowhere, the server process is already dead and
+        // the data dir is a `TempDir` that goes with it, so a retained database is
+        // not a debugging artifact; it is 8,753 of them. Retention is available
+        // DELIBERATELY and per-run, and prints the URL so the kept database can
+        // actually be reached — and because the startup sweep reclaims it later,
+        // opting in cannot re-open the leak.
+        if env::var("ZIEE_TEST_KEEP_DB").as_deref() == Ok("1") {
+            eprintln!(
+                "test harness: ZIEE_TEST_KEEP_DB=1 — keeping {}{}",
+                self.name,
+                if std::thread::panicking() {
+                    " [test was failing]"
+                } else {
+                    ""
+                }
+            );
+            return;
+        }
+
+        let name = self.name.clone();
+        let admin_url = self.admin_url.clone();
+
+        // A dedicated thread with its OWN runtime: `block_on` inside a runtime
+        // thread would panic, and a task on the CALLER's runtime is what leaked.
+        let worker = std::thread::Builder::new()
+            .name("harness-db-reap".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("test harness: LEAKED {name} — no runtime to reap it: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async {
+                    // Bounded, so a wedged cluster costs one test a timeout instead
+                    // of hanging the whole binary inside a destructor.
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        reap_test_database(&admin_url, &name),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            eprintln!("test harness: LEAKED {name} — DROP DATABASE failed: {e}")
+                        }
+                        Err(_) => {
+                            eprintln!("test harness: LEAKED {name} — DROP DATABASE timed out")
+                        }
+                    }
+                });
+            });
+
+        match worker {
+            // Joining is the whole point: without it this is the old detached
+            // spawn wearing a thread instead of a task.
+            Ok(handle) => {
+                if handle.join().is_err() {
+                    eprintln!("test harness: LEAKED {} — reap thread panicked", self.name);
+                }
+            }
+            Err(e) => eprintln!(
+                "test harness: LEAKED {} — could not spawn a reap thread: {e}",
+                self.name
+            ),
+        }
+    }
+}
+
+impl Drop for SpawnedServer {
+    /// Kill the child and remove the temp config. The per-test DATABASE is NOT
+    /// handled here — it belongs to the [`PerTestDb`] field, whose drop runs
+    /// immediately after this body and which has owned it since `CREATE DATABASE`
+    /// returned, i.e. since well before this struct existed.
+    fn drop(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
-
-        // Delete the temporary config file.
         let _ = fs::remove_file(&self.temp_config_path);
-
-        // Cleanup database.
-        let database_name = self.database_name.clone();
-        let db_url = self.admin_db_url.clone();
-
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = handle.spawn(async move {
-                if let Ok(pool) = PgPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&db_url)
-                    .await
-                {
-                    // Terminate existing connections.
-                    let _ = sqlx::query(&format!(
-                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{}' AND pid <> pg_backend_pid()",
-                        database_name
-                    ))
-                    .execute(&pool)
-                    .await;
-
-                    // Drop the database.
-                    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {}", database_name))
-                        .execute(&pool)
-                        .await;
-
-                    pool.close().await;
-                }
-            });
-        }
     }
 }
 
@@ -439,8 +793,7 @@ impl<A: HarnessApp> TestHarness<A> {
 
         // Write the temp config (cross-platform temp dir).
         let temp_config_path = std::env::temp_dir().join(format!("testharness-{test_id}.yaml"));
-        fs::write(&temp_config_path, &plan.config_yaml)
-            .expect("Failed to write temporary config");
+        fs::write(&temp_config_path, &plan.config_yaml).expect("Failed to write temporary config");
 
         // Ensure the fully-migrated template exists (built once per process),
         // then clone the per-test DB from it — no migrations run per test.
@@ -462,6 +815,15 @@ impl<A: HarnessApp> TestHarness<A> {
         .expect("Failed to create test database from template");
 
         pool.close().await;
+
+        // The database now EXISTS. Take ownership before anything below can panic —
+        // writing the config, a missing binary, the readiness ceiling — so an unwind
+        // from any of them reaps it. This assignment is the whole no-leak property;
+        // everything after it is inside the guard's scope.
+        let db_guard = PerTestDb {
+            name: database_name.clone(),
+            admin_url: db_url.clone(),
+        };
 
         // Resolve the binary path. Windows appends `.exe`. The workspace layout
         // puts `target/` at `src-app/target`, so walk up from `manifest_dir`:
@@ -524,7 +886,10 @@ impl<A: HarnessApp> TestHarness<A> {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         if !ready {
-            panic!("TestServer at {} did not become healthy within 30s", base_url);
+            panic!(
+                "TestServer at {} did not become healthy within 30s",
+                base_url
+            );
         }
 
         SpawnedServer {
@@ -533,9 +898,54 @@ impl<A: HarnessApp> TestHarness<A> {
             database_name,
             database_url: test_database_url,
             temp_config_path,
-            admin_db_url: db_url,
+            _db: db_guard,
             _data_tempdir: data_tempdir,
             _keep_alive: plan.keep_alive,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sweep interpolates a database name straight into DDL, so the predicate
+    /// that admits a name is the only thing standing between a `pg_database` row
+    /// and `DROP DATABASE <that row>`. These are the cases that must NOT be admitted.
+    #[test]
+    fn only_the_engines_own_test_db_names_are_admitted() {
+        // What `TestHarness::start` actually generates: a v4 UUID, hyphens → `_`.
+        let generated = format!(
+            "{TEST_DB_PREFIX}{}",
+            Uuid::new_v4().to_string().replace('-', "_")
+        );
+        assert!(is_engine_test_db_name(&generated), "{generated}");
+
+        // The shared databases this fix must never take with it.
+        assert!(!is_engine_test_db_name(
+            "cytoanalyst_test_template_1a2b3c4d"
+        ));
+        assert!(!is_engine_test_db_name("cytoanalyst_build_1a2b3c4d"));
+        assert!(!is_engine_test_db_name("ziee_test_template_1a2b3c4d"));
+        assert!(!is_engine_test_db_name("postgres"));
+
+        // Unanchored containment is not a match.
+        assert!(!is_engine_test_db_name("not_a_test_db_abc"));
+        assert!(!is_engine_test_db_name("x_test_db_abc"));
+
+        // The prefix alone names no database.
+        assert!(!is_engine_test_db_name(TEST_DB_PREFIX));
+
+        // Anything outside [0-9a-f_] cannot reach DDL — quotes, semicolons,
+        // whitespace and the wildcards a LIKE pattern would have let through.
+        for hostile in [
+            "test_db_a; DROP DATABASE postgres",
+            "test_db_\"a\"",
+            "test_db_a b",
+            "test_db_a%",
+            "test_db_ZZZ",
+        ] {
+            assert!(!is_engine_test_db_name(hostile), "admitted {hostile:?}");
         }
     }
 }

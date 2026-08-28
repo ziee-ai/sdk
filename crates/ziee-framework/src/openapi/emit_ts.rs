@@ -1082,15 +1082,8 @@ const HEADER: &str = r#"/**
 "#;
 
 const HELPERS_SECTION: &str = r#"// Type helpers
-export type ApiEndpoint = keyof typeof ApiEndpoints
-export type ApiEndpointUrl = (typeof ApiEndpoints)[ApiEndpoint]
-
-// Extract endpoint key from URL pattern
-export function getEndpointKey(url: string): ApiEndpoint | undefined {
-  const entries = Object.entries(ApiEndpoints) as [ApiEndpoint, string][]
-  const found = entries.find(([_key, value]) => value === url)
-  return found ? found[0] : undefined
-}
+// `ApiEndpoint`, `ApiEndpointUrl`, `getEndpointKey` moved to `./apiEndpoints`
+// (imported above) so the `ApiEndpoints` value stays out of this eager module.
 
 // Get parameter type for endpoint
 export type GetParameterType<K extends ApiEndpoint> = ApiEndpointParameters[K]
@@ -1141,20 +1134,20 @@ fn generate_typescript_content(
 
     let schema_definitions = format!("{}\n\n", generate_all_schemas(schemas));
 
-    let permissions_section = format!(
-        "// =============================================================================\n// PERMISSIONS\n// =============================================================================\n\n{}\n\n{}\n\n",
-        generate_permissions_enum(permissions),
-        generate_permission_descriptions(permissions)
-    );
+    // NOTE: the `Permissions` enum and `PermissionDescriptions` map are emitted
+    // as SEPARATE modules (`permissions.ts` / `permissionDescriptions.ts`) — see
+    // `generate_permissions_ts` / `generate_permission_descriptions_ts`. Keeping
+    // them out of this eagerly-imported `types.ts` lets their value uses inline
+    // (permissions) and the objects land in lazy chunks, so the entry chunk stays
+    // flat as the permission set grows. `permissions` param unused here now.
+    let _ = permissions;
+    let permissions_section = String::new();
 
-    let endpoints_section = format!(
-        "// =============================================================================\n// API ENDPOINTS\n// =============================================================================\n\n// API endpoint definitions\nexport const ApiEndpoints = {{\n{}\n}} as const\n\n",
-        sorted_endpoints
-            .iter()
-            .map(|k| format!("  '{}': '{}'", k, endpoints[*k]))
-            .collect::<Vec<_>>()
-            .join(",\n")
-    );
+    // `ApiEndpoints` (the value) + `ApiEndpoint`/`ApiEndpointUrl` + `getEndpointKey`
+    // live in the split-out `apiEndpoints.ts`. This file keeps the endpoint-keyed
+    // helper TYPES below, which reference `typeof ApiEndpoints` / `ApiEndpoint` —
+    // imported here type-only (erased at build, no runtime tether).
+    let endpoints_section = "import { ApiEndpoints } from './apiEndpoints'\nimport type { ApiEndpoint, ApiEndpointUrl } from './apiEndpoints'\n\n".to_string();
 
     let parameters_section = format!(
         "// API endpoint parameters\nexport type ApiEndpointParameters = {{\n{}\n}}\n\n",
@@ -1177,9 +1170,9 @@ fn generate_typescript_content(
     format!(
         "{}{}{}{}{}{}{}",
         HEADER,
+        endpoints_section, // the `./apiEndpoints` import — must precede the type helpers
         schema_definitions,
         permissions_section,
-        endpoints_section,
         parameters_section,
         responses_section,
         HELPERS_SECTION
@@ -1233,6 +1226,92 @@ pub fn generate_types_ts_from_json(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let spec: J = serde_json::from_str(openapi_json)?;
     Ok(generate_types_ts(&spec))
+}
+
+/// Generate the standalone `permissionDescriptions.ts` module content. Split out
+/// of `types.ts` so this human-readable label map (consumed only by the lazy
+/// permission-picker UI) rides that lazy chunk instead of the eager entry chunk.
+pub fn generate_permission_descriptions_ts(spec: &J) -> String {
+    let permissions = extract_permissions_from_spec(spec);
+    format!(
+        "// AUTO-GENERATED — do not edit. Regenerate with `just openapi-regen`.\n// Human-readable permission labels, split out of `types.ts` so they load only\n// where used (the permission picker) instead of on every page.\n\n{}\n",
+        generate_permission_descriptions(&permissions)
+    )
+}
+
+/// Parse an `openapi.json` string and emit `permissionDescriptions.ts` content.
+pub fn generate_permission_descriptions_ts_from_json(
+    openapi_json: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let spec: J = serde_json::from_str(openapi_json)?;
+    Ok(generate_permission_descriptions_ts(&spec))
+}
+
+/// Generate the standalone `permissions.ts` module (the `Permissions` enum),
+/// split out of `types.ts`. Value uses (`Permissions.X`) are inlined to string
+/// literals by the app's build transform, so in a fully-inlined build this
+/// module is pulled only by the (lazy) permission picker that enumerates it —
+/// keeping the enum object out of the eager entry chunk. Scales flat as the
+/// permission set grows.
+pub fn generate_permissions_ts(spec: &J) -> String {
+    let permissions = extract_permissions_from_spec(spec);
+    format!(
+        "// AUTO-GENERATED — do not edit. Regenerate with `just openapi-regen`.\n// The `Permissions` enum, split out of `types.ts` so it isn't pinned to the\n// eager entry chunk (value uses are inlined at build; only the lazy picker\n// enumerates the object).\n\n{}\n",
+        generate_permissions_enum(&permissions)
+    )
+}
+
+/// Parse an `openapi.json` string and emit `permissions.ts` content.
+pub fn generate_permissions_ts_from_json(
+    openapi_json: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let spec: J = serde_json::from_str(openapi_json)?;
+    Ok(generate_permissions_ts(&spec))
+}
+
+/// Generate the standalone `apiEndpoints.ts` module: the `ApiEndpoints` map (a
+/// full enumeration of the API surface) + `ApiEndpoint`/`ApiEndpointUrl` types +
+/// `getEndpointKey`. Split out of `types.ts` so the app's build transform can
+/// inline every `ApiClient.NS.method()` call to `callAsync("METHOD /url", …)` and
+/// the map itself tree-shakes away — no single API inventory ships, and the entry
+/// chunk stays flat as endpoints grow. `types.ts` keeps the endpoint-keyed helper
+/// TYPES (they reference `typeof ApiEndpoints`, an erased import).
+pub fn generate_api_endpoints_ts(spec: &J) -> String {
+    let mut endpoints: IndexMap<String, String> = IndexMap::new();
+    if let Some(paths) = spec.get("paths").and_then(|p| p.as_object()) {
+        for (path, methods) in paths {
+            if let Some(methods) = methods.as_object() {
+                for (method, operation) in methods {
+                    let operation_id = match operation.get("operationId").and_then(|x| x.as_str())
+                    {
+                        Some(id) => id.to_string(),
+                        None => continue,
+                    };
+                    endpoints
+                        .insert(operation_id, format!("{} {}", method.to_uppercase(), path));
+                }
+            }
+        }
+    }
+    let mut sorted: Vec<&String> = endpoints.keys().collect();
+    sorted.sort();
+    let body = sorted
+        .iter()
+        .map(|k| format!("  '{}': '{}'", k, endpoints[*k]))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        "// AUTO-GENERATED — do not edit. Regenerate with `just openapi-regen`.\n// The API endpoint map, split out of `types.ts`. `ApiClient.NS.method()` calls\n// are inlined to `callAsync(\"METHOD /url\", …)` at build, so this map ships only\n// where still enumerated (e.g. `getEndpointKey`), not in the entry chunk.\n\nexport const ApiEndpoints = {{\n{}\n}} as const\n\nexport type ApiEndpoint = keyof typeof ApiEndpoints\nexport type ApiEndpointUrl = (typeof ApiEndpoints)[ApiEndpoint]\n\n// Extract endpoint key from URL pattern\nexport function getEndpointKey(url: string): ApiEndpoint | undefined {{\n  const entries = Object.entries(ApiEndpoints) as [ApiEndpoint, string][]\n  const found = entries.find(([_key, value]) => value === url)\n  return found ? found[0] : undefined\n}}\n",
+        body
+    )
+}
+
+/// Parse an `openapi.json` string and emit `apiEndpoints.ts` content.
+pub fn generate_api_endpoints_ts_from_json(
+    openapi_json: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let spec: J = serde_json::from_str(openapi_json)?;
+    Ok(generate_api_endpoints_ts(&spec))
 }
 
 

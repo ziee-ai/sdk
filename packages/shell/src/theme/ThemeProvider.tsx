@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useUpdate } from 'react-use'
-import { Stores } from '@ziee/framework/stores'
+import { configClientSeam } from '../app-store-seams'
 import type { StoreProxy } from '@ziee/framework/stores'
 import { Toaster, DialogHost } from '@ziee/kit'
 import { ThemeContext, type ThemePreference } from './useTheme'
@@ -25,8 +25,7 @@ interface ThemeConfigView {
 }
 
 function themeConfig(): StoreProxy<ThemeConfigView> {
-  return (Stores as unknown as { ConfigClient: StoreProxy<ThemeConfigView> })
-    .ConfigClient
+  return (configClientSeam.get() as StoreProxy<ThemeConfigView>)
 }
 
 /**
