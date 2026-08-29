@@ -27,6 +27,7 @@ use crate::auth::providers::events::AuthProviderEvent;
 use crate::auth::providers::{
     AuthResult, create_provider, health as provider_health, repository as provider_repo,
 };
+use crate::auth::registration::{check_registration_allowed, RegistrationChannel};
 use crate::auth::refresh_tokens;
 use crate::auth::refresh_tokens::mint_session_tokens;
 use crate::auth::types::{
@@ -96,6 +97,12 @@ pub async fn register(
     headers: HeaderMap,
     Json(mut req): Json<RegisterRequest>,
 ) -> ApiResult<Response> {
+    // The deployment's registration policy is consulted BEFORE anything else:
+    // a closed site must not run the username/email existence probes below,
+    // which are the very lookups that make this endpoint an enumeration
+    // surface. `None` installed = open, this crate's historical behaviour.
+    check_registration_allowed(RegistrationChannel::LocalPassword).await?;
+
     // Validate input fields. The username goes through the shared
     // `validate_username` bound/charset gate (length ≤ the varchar(100)
     // column, no whitespace/control/bidi, alnum + `. _ - @ +` only) — without
@@ -375,6 +382,13 @@ async fn login_with_provider(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, AppError::not_found("User")))?
     } else {
+        // No auth link → this login would CREATE an account, so it is a
+        // registration and the policy decides. Placed inside this branch, not
+        // in front of the handler: the `if let Some(user_id)` arm above is an
+        // ordinary sign-in through an external provider and must keep working
+        // when sign-UP is closed.
+        check_registration_allowed(RegistrationChannel::ExternalFirstLogin).await?;
+
         // User doesn't exist - create new user with auth link and default group assignment
         let display_name = auth_result
             .attributes
@@ -1466,6 +1480,15 @@ async fn oauth_complete_inner(
     }
 
     // ── 3. No link, no collision → auto-provision a new user ────
+    //
+    // This is the ONLY branch of the callback that creates an account, and it
+    // is only knowable here — the returning-user branch (1) and the
+    // first-broker-link branch (2) both need the completed code exchange to be
+    // ruled out. That is why the registration policy is consulted at this
+    // point rather than by a guard in front of the callback route: such a guard
+    // would refuse every OAuth SIGN-IN too.
+    check_registration_allowed(RegistrationChannel::OauthFirstLogin).await?;
+
     let username = ensure_unique_username(ctx.pool(), &auth_result.attributes.username).await?;
     let display_name = auth_result
         .attributes
