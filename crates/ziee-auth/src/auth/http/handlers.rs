@@ -195,9 +195,15 @@ pub async fn register(
 
 /// Documentation for register endpoint
 pub fn register_docs(op: TransformOperation) -> TransformOperation {
-    op.description(
-        "Register a new user with username, email, and password.\n\n         Error codes (in `error_code`):\n         - `INVALID_USERNAME` / `INVALID_EMAIL` / `INVALID_PASSWORD` (400)\n         - `ACCOUNT_EXISTS` (409) — username or email already taken\n         - the deployment's registration-policy code (403) when the site is not          accepting new accounts; the code is chosen by the installed          `RegistrationPolicy` (e.g. `REGISTRATION_CLOSED`)",
-    )
+    op.description(concat!(
+        "Register a new user with username, email, and password.\n\n",
+        "Error codes (in `error_code`):\n",
+        "- `INVALID_USERNAME` / `INVALID_EMAIL` / `INVALID_PASSWORD` (400)\n",
+        "- `ACCOUNT_EXISTS` (409) - username or email already taken\n",
+        "- the deployment's registration-policy code (403) when the site is not ",
+        "accepting new accounts; the code is chosen by the installed ",
+        "`RegistrationPolicy` (e.g. `REGISTRATION_CLOSED`)",
+    ))
     .id("Auth.register")
     .tag("auth")
     .response::<201, Json<AuthResponse>>()
@@ -318,16 +324,23 @@ pub async fn login(
 
 /// Documentation for login endpoint
 pub fn login_docs(op: TransformOperation) -> TransformOperation {
-    op.description(
-        "Login with username/email and password.\n\n         Error codes (in `error_code`):\n         - `INVALID_CREDENTIALS` (401)\n         - the deployment's registration-policy code (403) — ONLY on an          external-provider login (`provider != \"local\"`) whose user has no          account yet, because that path would auto-provision one. An existing          user's sign-in is never refused by the registration policy.",
-    )
+    op.description(concat!(
+        "Login with username/email and password.\n\n",
+        "Error codes (in `error_code`):\n",
+        "- `INVALID_CREDENTIALS` (401)\n",
+        "- the deployment's registration-policy code (403) - ONLY on an ",
+        "external-provider login (`provider != \"local\"`) whose user has no ",
+        "account yet, because that path would auto-provision one. An existing ",
+        "user's sign-in is never refused by the registration policy.",
+    ))
     .id("Auth.login")
     .tag("auth")
     .response::<200, Json<AuthResponse>>()
     .response_with::<403, (), _>(|res| {
-        res.description(
-            "External first login refused by the deployment's registration policy              (it would create an account)",
-        )
+        res.description(concat!(
+            "External first login refused by the deployment's registration ",
+            "policy (it would create an account)",
+        ))
     })
 }
 
