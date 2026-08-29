@@ -25,7 +25,16 @@ export interface RouteLike {
 
 /** The app's router-store hook (selector form) — `useRoutesStore(s => s.routes)`.
  *  Loosely typed (a DI seam): the app's concrete zustand hook assigns cleanly. */
-export type RoutesStoreHook = (selector: (state: any) => any) => any
+/** The app's routes store hook.
+ *
+ *  `getState` is declared because enumeration (`listAllSurfaces`) must read the
+ *  route list OUTSIDE React — it runs from a Playwright `page.evaluate`, not a
+ *  render. Every zustand store hook carries it; it is optional here so an app
+ *  passing a hand-rolled hook still type-checks (enumeration then falls back to
+ *  the DOM scrape). */
+export type RoutesStoreHook = ((selector: (state: any) => any) => any) & {
+  getState?: () => any
+}
 
 /** The app's error boundary — rendered with `label` + a render-prop `fallback`.
  *  Loosely typed so the app's concrete boundary component assigns cleanly. */

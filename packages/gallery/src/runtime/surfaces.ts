@@ -22,6 +22,8 @@ import {
   getOverlayEntries,
   getSeededSurfaceEntries,
 } from './surfaces-registry'
+import { getGalleryConfig } from './config'
+import { resolvePages } from './pages'
 
 export interface GallerySurfaceClasses {
   pages: string[]
@@ -44,24 +46,40 @@ export const interactionManifest = (): InteractionManifestEntry[] =>
   ])
 
 /**
- * Enumerate EVERY gallery surface across all four classes. Pages are read from
- * the rendered browse DOM (they only exist after the router store populates);
- * the other three are the assembled entry lists. Call this on the browse canvas
- * (no `?surface=`) so the page list is populated.
+ * Enumerate EVERY gallery surface across all four classes.
+ *
+ * Pages come from the ROUTES STORE via `resolvePages`, not from the rendered
+ * DOM. They used to be scraped out of `[data-testid^="gallery-page-"]`, which
+ * made the surface list a function of whether the canvas finished rendering:
+ * anything that threw at the top of the canvas silently SHORTENED the list every
+ * capture / coverage / runtime-health run was built from, and the resulting
+ * per-surface PASS table looked exactly like a clean one. Measured in a
+ * consuming app — one story case with a `<Link>` outside a Router — the gate
+ * enumerated 73 of 126 surfaces and reported `69/73 PASS`.
+ *
+ * The DOM scrape survives only as a FALLBACK, for a caller whose gallery config
+ * has no routes store wired.
  */
 export function listAllSurfaces(): GallerySurfaceClasses {
   const OVERLAY_SLUGS = overlaySlugs()
   const DEEP_SLUGS = deepSlugs()
   const SEEDED_SLUGS = seededSlugs()
   const special = new Set([...OVERLAY_SLUGS, ...DEEP_SLUGS, ...SEEDED_SLUGS])
-  const pages =
-    typeof document !== 'undefined'
-      ? Array.from(document.querySelectorAll('[data-testid^="gallery-page-"]'))
-          .map(el =>
-            (el.getAttribute('data-testid') || '').replace('gallery-page-', ''),
-          )
-          .filter(id => id && !special.has(id))
-      : []
+  let pages: string[] = []
+  try {
+    const cfg = getGalleryConfig()
+    const routes = cfg.useRoutesStore.getState?.().routes as Parameters<typeof resolvePages>[0]
+    pages = resolvePages(routes ?? [], cfg.skipPaths)
+      .map(p => p.id)
+      .filter(id => id && !special.has(id))
+  } catch {
+    /* no config / no routes store — fall through to the DOM scrape */
+  }
+  if (pages.length === 0 && typeof document !== 'undefined') {
+    pages = Array.from(document.querySelectorAll('[data-testid^="gallery-page-"]'))
+      .map(el => (el.getAttribute('data-testid') || '').replace('gallery-page-', ''))
+      .filter(id => id && !special.has(id))
+  }
   return {
     // De-dup: a slug could appear twice if the browse canvas and a mounted frame
     // coexist in the DOM.

@@ -110,10 +110,21 @@ function resolveInitialPath(path: string): string | undefined {
 }
 
 /** Build the ordered, de-duplicated page list from the router store. */
-export function useResolvedPages(): ResolvedPage[] {
-  const cfg = getGalleryConfig()
-  const routes = cfg.useRoutesStore(s => s.routes) as RouteLike[]
-  const skip = new Set(cfg.skipPaths ?? ['/', '/dev/gallery', '/auth/callback'])
+/**
+ * The page-surface list as a PURE function of the routes store.
+ *
+ * Split out of `useResolvedPages` so the enumeration every capture / coverage /
+ * runtime-health pass runs (`listAllSurfaces`) can compute it WITHOUT reading
+ * the rendered DOM. It used to scrape `[data-testid^="gallery-page-"]`, which
+ * made the surface list a function of whether the canvas rendered — so anything
+ * that stopped the render silently SHORTENED it. Measured in a consuming app:
+ * one story case containing a `<Link>` threw outside a Router at the top of the
+ * canvas, and the gate enumerated 73 of 126 surfaces and printed `69/73 PASS`.
+ * Fifty-three surfaces were never rendered, never audited, and nothing in the
+ * output distinguished that from a clean run.
+ */
+export function resolvePages(routes: RouteLike[], skipPaths?: string[]): ResolvedPage[] {
+  const skip = new Set(skipPaths ?? ['/', '/dev/gallery', '/auth/callback'])
   const seen = new Set<string>()
   const pages: ResolvedPage[] = []
   for (const route of routes) {
@@ -129,6 +140,13 @@ export function useResolvedPages(): ResolvedPage[] {
   // Stable, reviewable order.
   return pages.sort((a, b) => a.id.localeCompare(b.id))
 }
+
+export function useResolvedPages(): ResolvedPage[] {
+  const cfg = getGalleryConfig()
+  const routes = cfg.useRoutesStore(s => s.routes) as RouteLike[]
+  return resolvePages(routes, cfg.skipPaths)
+}
+
 
 function PageFrame({
   page,
