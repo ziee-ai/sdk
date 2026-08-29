@@ -24,13 +24,15 @@
     "ziee-kit-manifest": "./src/lint/kit-manifest.mjs"
   },
   "scripts": {
-    "test": "node --test scripts/config.test.mjs"
+    "test": "node --test scripts/config.test.mjs src/lint/settings-field.test.mjs src/lint/logical-direction.test.mjs"
   },
   "peerDependencies": {
     "typescript": "*"
   },
   "peerDependenciesMeta": {
-    "typescript": { "optional": true }
+    "typescript": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "typescript": "~6.0.3"

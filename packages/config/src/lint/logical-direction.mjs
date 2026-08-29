@@ -42,10 +42,38 @@ const ts = require('typescript')
 // Parameterized over the app's src path(s) via `--path-include=<substr>` (repeatable):
 // only changed files whose repo-relative path contains one of these substrings are
 // scanned. Defaults to ziee's monorepo UI trees for backward-compatible behavior.
+// A SCOPE FLAG THAT IS SILENTLY IGNORED IS A GATE THAT SCANS THE WRONG TREE.
+//
+// Every other lint in this directory is scoped with `--root=<dir>` (roots.mjs),
+// and callers reasonably pass the same flag here. This script read only
+// `--path-include`, so `--root=src` was accepted, dropped on the floor, and the
+// scan silently fell back to ziee's hard-coded trees. An app whose UI does NOT
+// live at `src-app/ui/src/` therefore ran this lint over ZERO files and was told
+// its new code was clean. `--root` is now honoured: each root is resolved
+// against CWD and turned into the repo-relative prefix the diff filter wants.
 const PATH_INCLUDE = (() => {
-  const p = parseMulti('path-include')
-  return p.length ? p : ['src-app/ui/src/', 'src-app/desktop/ui/src/']
+  const explicit = parseMulti('path-include')
+  if (explicit.length) return explicit
+  const roots = parseMulti('root')
+  if (roots.length) {
+    return roots.map(r => {
+      const abs = path.resolve(process.cwd(), r)
+      const rel = path.relative(repoRootEarly() ?? process.cwd(), abs).replace(/\\/g, '/')
+      return rel ? (rel.endsWith('/') ? rel : rel + '/') : ''
+    })
+  }
+  return ['src-app/ui/src/', 'src-app/desktop/ui/src/']
 })()
+function repoRootEarly() {
+  try {
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+  } catch {
+    return null
+  }
+}
 const OPT_OUT = 'rtl-ok'
 
 // Physical utility → logical replacement. The key regex matches the utility as a
@@ -130,11 +158,16 @@ if (!base) {
 
 // `git diff --unified=0 <base>` = every change on this branch (committed + working
 // tree) vs the fork point. Parse hunk headers to build file → Set(addedLineNos).
+// Files this run DECLINED because of the path scope (not the extension filter).
+// Kept so a run that scanned nothing can say WHY — see the floor below.
+const scopeExcluded = new Set()
 function isScanned(rel) {
   const p = rel.replace(/\\/g, '/')
   if (!/\.(tsx|ts|css)$/.test(p)) return false
   if (p.endsWith('.generated.ts') || p.endsWith('.d.ts')) return false
-  return PATH_INCLUDE.some(inc => p.includes(inc))
+  if (PATH_INCLUDE.some(inc => inc && p.includes(inc))) return true
+  scopeExcluded.add(p)
+  return false
 }
 let diff
 try {
@@ -230,7 +263,7 @@ function collectClassNameNodes(sf) {
 // either: it walks a TypeScript AST for `className` attributes, so a `.css`
 // file was skipped whole. Nocturne's own sheets are `.css`.
 const CSS_PROP_RULES = [
-  { name: 'padding-left', to: 'padding-inline-start', re: /(?<![\w-])padding-left[[:space:]]*:/ },
+  { name: 'padding-left', to: 'padding-inline-start', re: /(?<![\w-])padding-left\s*:/ },
   { name: 'padding-right', to: 'padding-inline-end', re: /(?<![\w-])padding-right\s*:/ },
   { name: 'margin-left', to: 'margin-inline-start', re: /(?<![\w-])margin-left\s*:/ },
   { name: 'margin-right', to: 'margin-inline-end', re: /(?<![\w-])margin-right\s*:/ },
@@ -239,7 +272,6 @@ const CSS_PROP_RULES = [
   { name: 'text-align: left', to: 'text-align: start', re: /text-align\s*:\s*left\b/ },
   { name: 'text-align: right', to: 'text-align: end', re: /text-align\s*:\s*right\b/ },
 ]
-CSS_PROP_RULES[0].re = /(?<![\w-])padding-left\s*:/
 
 function scanCss(file, lines, findings) {
   const srcLines = fs.readFileSync(file, 'utf-8').split('\n')
@@ -257,8 +289,12 @@ function scanCss(file, lines, findings) {
 }
 
 const findings = []
+let scannedFiles = 0
+let scannedLines = 0
 for (const [file, lines] of added) {
   if (!lines.size || !fs.existsSync(file)) continue
+  scannedFiles++
+  scannedLines += lines.size
   if (file.endsWith('.css')) {
     scanCss(file, lines, findings)
     continue
@@ -287,7 +323,7 @@ findings.sort((a, b) => (a.file === b.file ? a.line - b.line : a.file < b.file ?
 
 if (findings.length) {
   console.log(
-    `[logical-direction] ${findings.length} physical direction utilit${findings.length === 1 ? 'y' : 'ies'} in new/changed code — use the RTL-safe logical equivalent:\n`,
+    `[logical-direction] ${findings.length} physical direction utilit${findings.length === 1 ? 'y' : 'ies'} in new/changed code (${scannedFiles} file(s), ${scannedLines} added line(s) scanned vs ${base.slice(0, 9)}) — use the RTL-safe logical equivalent:\n`,
   )
   for (const f of findings.slice(0, 80)) {
     console.log(
@@ -303,5 +339,32 @@ if (findings.length) {
   )
   process.exit(1)
 } else {
-  console.log('[logical-direction] ✓ new/changed code uses logical direction utilities.')
+  // A RUN THAT SCANNED NOTHING MUST SAY SO — it is not a pass.
+  //
+  // Two of this lint's three original blind spots ended in the same place: the
+  // script printed "✓ new/changed code uses logical direction utilities" having
+  // opened zero files. That line is indistinguishable from a real pass in a CI
+  // log, which is why nobody noticed. Every run now states its base, its scope,
+  // and what it actually read.
+  //
+  // Scanning zero files is legitimate (a Rust-only branch). Scanning zero files
+  // while the diff DID touch .ts/.tsx/.css outside the configured scope is not:
+  // that is the scope being wrong, and it is the shape `--root=src` being
+  // silently ignored used to produce.
+  if (scannedFiles === 0 && scopeExcluded.size) {
+    console.error(
+      `[logical-direction] FAIL: scanned 0 files, but ${scopeExcluded.size} changed ` +
+        `source file(s) were excluded BY SCOPE.\n` +
+        `  base:  ${base}\n` +
+        `  scope: ${PATH_INCLUDE.map(x => x || '(empty)').join(', ')}\n` +
+        `  e.g.:  ${[...scopeExcluded].slice(0, 5).join('\n         ')}\n` +
+        `  A run that opens no files is not a pass. Point the scope at this app's UI\n` +
+        `  tree with --root=<dir> (or --path-include=<repo-relative-prefix>).`,
+    )
+    process.exit(2)
+  }
+  console.log(
+    `[logical-direction] ✓ ${scannedFiles} changed file(s) / ${scannedLines} added line(s) ` +
+      `use logical direction utilities  [base ${base.slice(0, 9)}, scope ${PATH_INCLUDE.map(x => x || '(repo root)').join(' ')}]`,
+  )
 }
