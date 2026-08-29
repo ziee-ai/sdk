@@ -11,8 +11,9 @@
  * These ids are COMPUTED (template strings), so they never enter the static
  * testid registry nor the duplicate-literal build gate.
  */
-import type { ReactNode } from 'react'
+import { Component, type ErrorInfo, type ReactNode } from 'react'
 import { Text, Title } from '@ziee/kit'
+import { MemoryRouter } from 'react-router-dom'
 
 /** One permutation of a component (a variant × state × size cell). */
 export interface GalleryCase {
@@ -45,6 +46,45 @@ export const caseTestId = (storyId: string, caseKey: string) =>
  * Each case sits in its own bordered cell with a computed testid so the layout
  * layers can localize a diff/violation to a single permutation.
  */
+/**
+ * One story section's own error boundary.
+ *
+ * Without it a single throwing case blanks the ENTIRE gallery page — every other
+ * story and, because `GalleryPages` renders in the same tree, every seeded
+ * surface with it. That is the worst possible failure shape for an auditing
+ * tool: one broken case and the harness reports nothing about the other 90-odd
+ * cells, with no signal distinguishing "clean" from "never rendered".
+ *
+ * The error is re-thrown to the console as well as rendered, so the runtime
+ * health pass still records it as a console-error finding on this surface — the
+ * boundary contains the blast radius, it does not swallow the report.
+ */
+class StoryErrorBoundary extends Component<
+  { storyId: string; children: ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null }
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error(`[gallery story ${this.props.storyId}]`, error, info.componentStack)
+  }
+  render() {
+    if (!this.state.error) return this.props.children
+    return (
+      <div
+        data-testid={`gallery-story-error-${this.props.storyId}`}
+        className="rounded border border-destructive p-3"
+      >
+        <Text tone="muted" className="text-xs">
+          This story threw while rendering: {this.state.error.message}
+        </Text>
+      </div>
+    )
+  }
+}
+
 export function StorySection({ story }: { story: GalleryStory }) {
   return (
     <section
@@ -59,6 +99,7 @@ export function StorySection({ story }: { story: GalleryStory }) {
           </Text>
         ) : null}
       </div>
+      <StoryErrorBoundary storyId={story.id}>
       <div className="flex flex-wrap gap-4 items-start">
         {story.cases.map(c => (
           <div
@@ -69,10 +110,30 @@ export function StorySection({ story }: { story: GalleryStory }) {
             <Text tone="muted" className="text-xs uppercase tracking-wide">
               {c.label}
             </Text>
-            <div className="flex flex-wrap gap-2 items-center">{c.render()}</div>
+            <div className="flex flex-wrap gap-2 items-center">
+              {/* EVERY case gets its own Router. The real app ALWAYS mounts one,
+                  so a component reaching for `useNavigate`/`useLocation`/`<Link>`
+                  is correct code — and outside a Router it throws
+                  `Cannot destructure property 'basename' of useContext(...)`,
+                  which React escalates to the nearest boundary. StorySection
+                  sits at the TOP of GalleryPage, so ONE such case took the whole
+                  page down: every other story AND every seeded surface on the
+                  same page went blank behind the error boundary, and the runtime
+                  health pass (which walks `?surface=` cells, each with its own
+                  MemoryRouter) reported those surfaces clean while the stories
+                  lane was on fire.
+
+                  SeededSurfaceFrame and OverlayFrame in pages.tsx already do
+                  this, and OverlayFrame's comment records that it was added for
+                  exactly this reason. Stories were the third case and were
+                  missed. Per CASE, not per section, so one case cannot leak
+                  navigation state into its neighbours. */}
+              <MemoryRouter>{c.render()}</MemoryRouter>
+            </div>
           </div>
         ))}
       </div>
+      </StoryErrorBoundary>
     </section>
   )
 }

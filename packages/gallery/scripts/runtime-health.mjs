@@ -447,6 +447,24 @@ async function main() {
   const classes = await enumerateSurfaces(enumPage, BASE)
   await enumPage.close()
 
+  // A ZERO-PAGE ENUMERATION IS A BROKEN CANVAS, NOT A GALLERY WITHOUT PAGES.
+  //
+  // The `pages` class is derived from the app's routes store; every consuming
+  // app registers routes, so zero pages means the canvas never got far enough to
+  // register them. Without this the run would still build overlay/deep/seeded
+  // cells, report a per-surface PASS table over that subset, and exit 0 —
+  // a green gate over a gallery whose entire page class was missing.
+  if (classes.pages.length === 0 && !arg('only-kinds', '') && !arg('only-match', '')) {
+    console.error(
+      `runtime-health: enumerated 0 pages from ${BASE} (overlays ${classes.overlays.length}, ` +
+        `deep ${classes.deep.length}, seeded ${classes.seeded.length}).\n` +
+        `  Every app registers routes, so this means the canvas did not finish booting — ` +
+        `grading the remaining classes would be a green gate over a partial gallery.`,
+    )
+    await browser.close()
+    process.exit(2)
+  }
+
   // 2. Build the surface × state matrix. Pages get the data-state set; the
   //    interaction-only classes (overlay/deep/seeded) render once via
   //    `?surface=<slug>` (state is ignored by the mock for those).
