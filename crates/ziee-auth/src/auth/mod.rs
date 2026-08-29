@@ -18,6 +18,7 @@ pub mod password;
 pub mod permissions;
 pub mod providers;
 pub mod refresh_tokens;
+pub mod registration;
 pub mod repository;
 pub mod session_settings;
 pub mod types;
@@ -52,6 +53,15 @@ pub use turnkey::{mount_auth, AuthMountOptions, DefaultIdentityResolver};
 
 #[cfg(feature = "module")]
 pub use module::AuthModule;
+
+// The registration POLICY seam: how a deployment closes account creation.
+// Engine-level (no `routes` feature) so an app that mounts the router by hand
+// gets the same gate.
+pub use registration::{
+    OpenRegistrationPolicy, RegistrationChannel, RegistrationPolicy, RegistrationRefused,
+    check_registration_allowed, install_registration_policy, registration_policy,
+    resolve_registration,
+};
 
 // Re-exports (mirror the app auth module's public surface).
 pub use context::{
