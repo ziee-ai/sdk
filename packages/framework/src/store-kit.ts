@@ -1,6 +1,7 @@
 import { create, useStore } from 'zustand'
 import { createStore } from 'zustand/vanilla'
 import {
+  createJSONStorage,
   persist as persistMiddleware,
   type PersistOptions,
   subscribeWithSelector,
@@ -15,6 +16,14 @@ import { createStoreProxy, type StoreProxy } from './stores'
 import { onNetworkIdle } from './net-idle'
 import { createLazyDispatcher } from './lazy-dispatch'
 import { isStaleBuild } from './chunk-recovery'
+import {
+  applyStoreSeed,
+  createServerPersistStorage,
+  isStoreServerRender,
+  registerStoreExpose,
+  type StoreExposeOption,
+  type StoreSeedOption,
+} from './store-kit-seed'
 
 // ============================================================================
 // store-kit — thin authoring layer over the existing Zustand + Stores.X proxy.
@@ -358,6 +367,17 @@ export interface StoreConfig<
   init?: (
     ctx: StoreInitCtx<State> & { actions: Actions & LazyDispatchers<LA> },
   ) => void
+  /** SSR: merge this store's slice from the incoming document seed into its
+   *  BIRTH state (see `store-kit-seed.ts`). `true` = shallow spread over
+   *  `state`. Changing birth state rather than `setState`-ing after the fact is
+   *  what makes a seeded store need no zustand patching on a hydrating client:
+   *  `getInitialState()` — which is what React reads as the server snapshot —
+   *  already returns the seeded value. */
+  seeded?: StoreSeedOption<State>
+  /** SSR: what of this store travels to the next document. `true` = the whole
+   *  state object. Registered as a GETTER at definition time and read once, on
+   *  a server, after the render has quiesced. */
+  ssrExpose?: StoreExposeOption<State>
 }
 
 /** Internal lifecycle keys the Stores proxy already understands. */
@@ -478,9 +498,32 @@ function applyMiddleware<State extends object, Actions extends object>(
 ) {
   const withImmer = config.immer ? immerMiddleware(builder as any) : builder
   const withPersist = config.persist
-    ? persistMiddleware(withImmer as any, config.persist)
+    ? persistMiddleware(withImmer as any, serverSafePersist(config.persist))
     : withImmer
   return subscribeWithSelector(withPersist as any)
+}
+
+/**
+ * On a server, replace the store's `persist` storage with a fresh per-render
+ * one — OVERRIDING whatever it declared, never merely filling an absent slot.
+ *
+ * The spread order below is the whole rule: `...options` LAST would let a
+ * store's own `storage` win, and two of comic's five persisted stores ship one
+ * whose server fallback is a module-scope `Map` — i.e. exactly the value that
+ * must not survive a request. So the override is written after the spread, and
+ * `store-kit-seed.ts` carries why that is safe independently of the host's
+ * isolation model.
+ *
+ * In a browser this returns the caller's own object, unchanged and un-copied.
+ */
+function serverSafePersist<State extends object>(
+  options: PersistOptions<State, any>,
+): PersistOptions<State, any> {
+  if (!isStoreServerRender()) return options
+  return {
+    ...options,
+    storage: createJSONStorage(() => createServerPersistStorage()),
+  }
 }
 
 /** The folder-glob store config: `actions` is `import.meta.glob('./actions/*.ts')`;
@@ -493,6 +536,13 @@ export interface GlobStoreConfig<State extends object, AM> {
   init?: (
     ctx: StoreInitCtx<State> & { actions: DispatchersFromTypeMap<AM> },
   ) => void
+  /** SSR — see {@link StoreConfig.seeded}. Declared on all three overload
+   *  shapes deliberately: 61 of comic's 66 stores are folder-glob, so a pair of
+   *  options that existed only on the explicit-`actions` shape would be
+   *  unreachable for almost every store that needs them. */
+  seeded?: StoreSeedOption<State>
+  /** SSR — see {@link StoreConfig.ssrExpose}. */
+  ssrExpose?: StoreExposeOption<State>
 }
 
 /** The EAGER folder-glob config: `actions: import.meta.glob('./actions/*.ts',
@@ -507,6 +557,13 @@ export interface EagerGlobStoreConfig<State extends object, AM> {
   init?: (
     ctx: StoreInitCtx<State> & { actions: EagerDispatchersFromTypeMap<AM> },
   ) => void
+  /** SSR — see {@link StoreConfig.seeded}. Declared on all three overload
+   *  shapes deliberately: 61 of comic's 66 stores are folder-glob, so a pair of
+   *  options that existed only on the explicit-`actions` shape would be
+   *  unreachable for almost every store that needs them. */
+  seeded?: StoreSeedOption<State>
+  /** SSR — see {@link StoreConfig.ssrExpose}. */
+  ssrExpose?: StoreExposeOption<State>
 }
 
 /**
@@ -538,11 +595,38 @@ export function defineStore<State extends object, AM extends Record<string, any>
 ): StoreHandle<FullStoreState<State, EagerDispatchersFromTypeMap<AM>>>
 export function defineStore(name: string, config: any): any {
   const normalized = normalizeGlobConfig(config) as StoreConfig<any, any>
-  const builder = makeBuilder(name, normalized)
+  // The seed is applied to the BIRTH state, before construction — not after,
+  // and not through `setState`. `zustand/vanilla` captures `initialState` once
+  // (`vanilla.mjs:13`) and `setState` never touches it, so a store seeded after
+  // construction would render from its seed and HYDRATE from its defaults.
+  const seeded = {
+    ...normalized,
+    state: applyStoreSeed(name, normalized.state, normalized.seeded),
+  }
+  const builder = makeBuilder(name, seeded)
   const store = create<any>()(
-    applyMiddleware(builder as any, normalized) as any,
+    applyMiddleware(builder as any, seeded) as any,
   ) as BoundStore<any>
+  if (seeded.ssrExpose) {
+    const select = seeded.ssrExpose
+    registerStoreExpose(name, () =>
+      typeof select === 'function' ? select(store.getState()) : plainState(store.getState()),
+    )
+  }
   return { name, store }
+}
+
+/** A store's DATA fields — the state object minus actions and the two lifecycle
+ *  keys the builder always adds back. `ssrExpose: true` means "my data", and a
+ *  function or a lifecycle hook in a JSON payload is a defect, not a slice. */
+function plainState(full: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(full)) {
+    if (k === '__init__' || k === '__destroy__') continue
+    if (typeof v === 'function') continue
+    out[k] = v
+  }
+  return out
 }
 
 // ============================================================================
