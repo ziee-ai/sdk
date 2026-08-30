@@ -113,6 +113,17 @@ const exposed = new Map<string, () => unknown>()
  * has any state worth sending — so what is stored is a GETTER, read later. Last
  * registration wins for a given name, which matters only under HMR; two live
  * stores sharing a name is already a defect the proxy registry refuses.
+ *
+ * **This registry is per-REALM, like every store module it registers**, and that
+ * is a weaker guarantee than {@link createServerPersistStorage}'s deliberately
+ * is — so the difference is stated rather than left to look like an oversight.
+ * The two are not comparable: a persisted store's `storage` is a value the store
+ * DECLARED, so overriding it per render is meaningful, whereas these getters
+ * close over the very store objects that a shared realm would already be
+ * sharing. In a pooled realm the leak is the STORES, not this Map, and no
+ * registry-level fix would address it. A host that reuses a realm has a bigger
+ * problem than the seed, and comic's does not (a fresh runtime and context per
+ * render, with a deliberately-pooled negative control proving the difference).
  */
 export function registerStoreExpose(name: string, getter: () => unknown): void {
   exposed.set(name, getter)
@@ -127,15 +138,30 @@ export function registerStoreExpose(name: string, getter: () => unknown): void {
  * absent from the result, which the client reads as "not seeded" and handles by
  * falling back to its declared defaults — the same outcome as a store that never
  * declared `ssrExpose`.
+ *
+ * **Each slice is SERIALISATION-CHECKED here, inside that same guard, and this
+ * is not belt-and-braces.** The caller stringifies the whole envelope in one
+ * call, so a circular reference, a `BigInt`, or a `toJSON` that throws in ONE
+ * slice would throw out of that call and fail the whole document — i.e. the
+ * isolation promised above would not exist where it matters most. Round-tripping
+ * per slice is what makes the promise true, and it costs one extra
+ * stringify of a payload that is capped at a few hundred KiB anyway.
  */
 export function collectStoreSeed(): StoreSeedEnvelope {
   const out: StoreSeedEnvelope = {}
   for (const [name, getter] of exposed) {
     try {
       const value = getter()
-      if (value !== undefined) out[name] = value
+      if (value === undefined) continue
+      // Throws here — not in the caller's single stringify — so the `catch`
+      // below can drop this one slice and keep the document.
+      JSON.stringify(value)
+      out[name] = value
     } catch (err) {
-      console.error(`[store-kit] ssrExpose getter for "${name}" threw; slice omitted`, err)
+      console.error(
+        `[store-kit] ssrExpose for "${name}" threw or is not serialisable; slice omitted`,
+        err,
+      )
     }
   }
   return out
@@ -162,10 +188,17 @@ export function __resetStoreSeedForTests(): void {
  *
  * A SECOND global next to the consuming app's own render-mode flag, and
  * deliberately so: the framework may not read a flag named after one app, and an
- * app may not be forced to name its flag after the framework. They are ONE FACT
- * with two readers, set together by whatever boots the render (in comic, the
- * host's `shim/00-mode.js`), and the pairing is stated at both ends so neither
- * can drift silently.
+ * app may not be forced to name its flag after the framework.
+ *
+ * **They are ONE FACT with two readers and they must be set TOGETHER.** In comic
+ * the host sets both in `shim/06-seed.js`, before the SSR bundle is evaluated.
+ * What each gates is worth knowing, because setting one alone is worse than
+ * setting neither: the app's flag gates the server SNAPSHOT
+ * (`getInitialState` returns live state) and this one gates the per-request
+ * PERSIST STORAGE. A realm with the app flag and not this one renders from live
+ * state while writing to the BROWSER storage a store declared — which is exactly
+ * the cross-request `Map` leak `createServerPersistStorage` exists to prevent.
+ * A test helper that enters server-render mode must therefore set both.
  */
 export const SERVER_RENDER_GLOBAL = '__ZIEE_SERVER_RENDER__'
 
