@@ -182,3 +182,39 @@ test('canHideColumn refuses to hide the last visible column', () => {
   assert.equal(canHideColumn(['a'], 'a'), false) // last one
   assert.equal(canHideColumn(['a', 'b'], 'zzz'), false) // not visible
 })
+
+// ---------------------------------------------------------------------------
+// PORTABILITY. `compareValues` produces a DOM-TREE ORDER, so an engine without
+// ICU must agree with one that has it. It used to call `localeCompare`, which
+// exists everywhere and ANSWERS DIFFERENTLY without ICU behind it — a silent
+// divergence, not a throw, and therefore exactly the class that rots unnoticed.
+//
+// **Deleting `globalThis.Intl` does NOT disable `String.prototype.localeCompare`**,
+// so the realm test below is a sanity check, not the guard: the reverted code
+// would pass it. The assertion with teeth is `collate.test.ts`'s SOURCE SCAN,
+// which goes red the moment either file names an ICU entry point again.
+// ---------------------------------------------------------------------------
+
+test('sorting is identical in a realm with no Intl at all', () => {
+  const cells = ['Édith', 'edward', 'Item 10', 'Item 2', 'Æther', '12', '3', 'zoo']
+  const withIntl = [...cells].sort(compareValues)
+
+  const g = globalThis as { Intl?: unknown }
+  const saved = g.Intl
+  delete g.Intl
+  try {
+    assert.deepEqual([...cells].sort(compareValues), withIntl)
+  } finally {
+    g.Intl = saved
+  }
+
+  // Pinned, so a comparator that quietly became a no-op cannot satisfy the
+  // equality above by returning the input order in both realms.
+  assert.deepEqual(withIntl, ['3', '12', 'Æther', 'Édith', 'edward', 'Item 2', 'Item 10', 'zoo'])
+})
+
+test('the numeric+base-sensitivity behaviour the localeCompare call had is kept', () => {
+  assert.ok(compareValues('Item 2', 'Item 10') < 0) // numeric: true
+  assert.ok(compareValues('apple', 'Banana') < 0) // sensitivity: 'base'
+  assert.ok(compareValues('Ångström', 'apple') < 0) // accents fold to base
+})

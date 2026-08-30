@@ -5,6 +5,8 @@
 // exercise it with Node's native type-stripping — no bundler, no DOM. The React
 // hook (`use-table-view.ts`) and the render paths (`table.tsx`) wrap these.
 
+import { compareNatural } from './collate.ts'
+
 export type SortDir = 'asc' | 'desc'
 export interface SortState {
   key: string
@@ -66,8 +68,16 @@ export function isNumericValue(v: unknown): boolean {
   return !Number.isNaN(asNumber(v))
 }
 
-/** Compare two cell values: numerically when both are numbers, else by locale
- *  string compare. Stable, total ordering. */
+/** Compare two cell values: numerically when both are numbers, else by the
+ *  kit's own deterministic collation. Stable, total ordering.
+ *
+ *  The text arm was `localeCompare(…, { numeric: true, sensitivity: 'base' })`
+ *  until it became a portability defect: a sort produces a DOM-TREE ORDER, and
+ *  an engine with no ICU behind `localeCompare` still ANSWERS — differently. A
+ *  server-rendered table and its client hydration then disagree about row
+ *  order, which is a React hydration error rather than a visible drift.
+ *  `compareNatural` keeps both option flags this call relied on and is the same
+ *  arithmetic in every runtime. See `collate.ts`. */
 export function compareValues(a: unknown, b: unknown): number {
   const na = asNumber(a)
   const nb = asNumber(b)
@@ -76,7 +86,7 @@ export function compareValues(a: unknown, b: unknown): number {
   if (aNum && bNum) return na - nb
   // A numeric cell sorts before a non-numeric one for a mixed column (stable).
   if (aNum !== bNum) return aNum ? -1 : 1
-  return cellString(a).localeCompare(cellString(b), undefined, { numeric: true, sensitivity: 'base' })
+  return compareNatural(cellString(a), cellString(b))
 }
 
 function comparatorFor<T>(col: CoreColumn): (a: T, b: T) => number {
