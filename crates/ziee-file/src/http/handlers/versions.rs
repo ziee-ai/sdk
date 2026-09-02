@@ -20,7 +20,7 @@ use super::download::{content_disposition, FILE_CONTENT_CACHE_CONTROL};
 use crate::get_file_storage;
 use crate::models::{File, FileVersion};
 use crate::permissions::{FilesDownload, FilesPreview, FilesRead, FilesUpload};
-use crate::repository::FileRepository;
+use crate::seams::FileAccess;
 use crate::types::{PreviewQuery, TextPageQuery};
 use ziee_auth::{Group, User};
 use ziee_core::{ApiResult, AppError};
@@ -57,11 +57,9 @@ pub async fn list_versions<R: IdentityResolver<User = User, Group = Group>>(
     Extension(ctx): Extension<FileContext>,
 ) -> ApiResult<Json<Vec<FileVersion>>> {
     let user_id = auth.user.id;
-    // 404 if the file isn't the user's (don't leak existence).
-    ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    // 404 if the principal may not reach the file (don't leak existence).
+    ctx.authorized_file(user_id, file_id, FileAccess::ReadMetadata)
+        .await?;
     let limit = q
         .limit
         .unwrap_or(VERSIONS_DEFAULT_LIMIT)
@@ -80,6 +78,11 @@ pub async fn get_head_version<R: IdentityResolver<User = User, Group = Group>>(
     Extension(ctx): Extension<FileContext>,
 ) -> ApiResult<Json<FileVersion>> {
     let user_id = auth.user.id;
+    // `get_head` resolves through `file_versions` and applies its own
+    // `f.user_id` conjunct, so it never touched `get_by_id_and_user` — which is
+    // exactly why this route was easy to leave behind. Authorize explicitly.
+    ctx.authorize(user_id, file_id, FileAccess::ReadMetadata)
+        .await?;
     let head = ctx.files
         .get_head(file_id, user_id)
         .await?
@@ -94,6 +97,10 @@ pub async fn get_version<R: IdentityResolver<User = User, Group = Group>>(
     Extension(ctx): Extension<FileContext>,
 ) -> ApiResult<Json<FileVersion>> {
     let user_id = auth.user.id;
+    // As in `get_head_version`: this resolves through `file_versions`, so the
+    // authorization has to be asked for rather than inherited.
+    ctx.authorize(user_id, file_id, FileAccess::ReadMetadata)
+        .await?;
     let v = ctx.files
         .get_version(file_id, version, user_id)
         .await?
@@ -116,10 +123,11 @@ pub async fn restore_version<R: IdentityResolver<User = User, Group = Group>>(
     Json(req): Json<RestoreVersionRequest>,
 ) -> ApiResult<Json<File>> {
     let user_id = auth.user.id;
-    let head = ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    // Restore moves the file's head — a WRITE, so it asks for `Write` rather
+    // than the read kinds the sibling version routes use.
+    let head = ctx
+        .authorized_file(user_id, file_id, FileAccess::Write)
+        .await?;
 
     // No-op: already at the requested version.
     if req.version == head.version {
@@ -148,6 +156,10 @@ pub async fn restore_version<R: IdentityResolver<User = User, Group = Group>>(
     // Document RAG: a restore makes a different version the head → re-index.
     ctx.events.on_committed(user_id, file_id, false);
 
+    // Re-read the new head to return it. Deliberately the raw owner-scoped
+    // fetch: this principal's `Write` was authorized at the top of the handler
+    // and the restore has already been performed, so re-asking the policy would
+    // buy nothing but another round-trip.
     let updated = ctx.files
         .get_by_id_and_user(file_id, user_id)
         .await?
@@ -157,17 +169,22 @@ pub async fn restore_version<R: IdentityResolver<User = User, Group = Group>>(
 
 /// Helper: resolve (file head/filename, target version) and load that version's
 /// original bytes for the pinned download/preview/text endpoints.
+///
+/// Takes the whole [`FileContext`] rather than a bare `&FileRepository` so the
+/// authorization runs here, once, for all three pinned-version routes. `access`
+/// differs between them: a version DOWNLOAD hands over original bytes
+/// (`ReadContent`) while a version preview/text serves a derivative
+/// (`ReadMetadata`).
 async fn version_and_file(
-    files: &FileRepository,
+    ctx: &FileContext,
     file_id: Uuid,
     version: i32,
     user_id: Uuid,
+    access: FileAccess,
 ) -> Result<(File, FileVersion), AppError> {
-    let file = files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
-    let v = files
+    let file = ctx.authorized_file(user_id, file_id, access).await?;
+    let v = ctx
+        .files
         .get_version(file_id, version, user_id)
         .await?
         .ok_or_else(|| AppError::not_found("File version"))?;
@@ -181,7 +198,7 @@ pub async fn download_version<R: IdentityResolver<User = User, Group = Group>>(
     Extension(ctx): Extension<FileContext>,
 ) -> ApiResult<Response> {
     let user_id = auth.user.id;
-    let (file, v) = version_and_file(&ctx.files, file_id, version, user_id).await?;
+    let (file, v) = version_and_file(&ctx, file_id, version, user_id, FileAccess::ReadContent).await?;
     let extension = file
         .filename
         .rsplit('.')
@@ -216,7 +233,7 @@ pub async fn preview_version<R: IdentityResolver<User = User, Group = Group>>(
     Extension(ctx): Extension<FileContext>,
 ) -> ApiResult<Response> {
     let user_id = auth.user.id;
-    let (_file, v) = version_and_file(&ctx.files, file_id, version, user_id).await?;
+    let (_file, v) = version_and_file(&ctx, file_id, version, user_id, FileAccess::ReadMetadata).await?;
     let storage = get_file_storage();
     let image = storage
         .load_preview(user_id, v.blob_version_id, query.page)
@@ -238,7 +255,7 @@ pub async fn text_version<R: IdentityResolver<User = User, Group = Group>>(
     Extension(ctx): Extension<FileContext>,
 ) -> ApiResult<Response> {
     let user_id = auth.user.id;
-    let (_file, v) = version_and_file(&ctx.files, file_id, version, user_id).await?;
+    let (_file, v) = version_and_file(&ctx, file_id, version, user_id, FileAccess::ReadMetadata).await?;
     let storage = get_file_storage();
     let text = match query.page {
         Some(page_num) => {

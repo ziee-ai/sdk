@@ -11,6 +11,7 @@ use super::download::FILE_HEAD_CACHE_CONTROL;
 use crate::get_file_storage;
 use crate::models::File;
 use crate::permissions::{FilesDelete, FilesDownload, FilesPreview, FilesRead};
+use crate::seams::FileAccess;
 use crate::types::{FileListResponse, PaginationQuery, PreviewQuery, TextPageQuery};
 use ziee_auth::{Group, User};
 use ziee_core::{ApiResult, AppError};
@@ -26,8 +27,12 @@ pub async fn list_files<R: IdentityResolver<User = User, Group = Group>>(
 ) -> ApiResult<Json<FileListResponse>> {
     let user_id = auth.user.id;
 
-    let (files, total) = ctx.files
-        .list_by_user(user_id, params.page, params.per_page)
+    // Filter BEFORE paging and counting. A per-item check applied to an
+    // already-paged result returns short pages and a `total` that still counts
+    // the rows it just hid — which leaks the existence of files the caller may
+    // not see, the very signal the per-file 404 is careful not to give.
+    let (files, total) = ctx
+        .authorized_list(user_id, params.page, params.per_page)
         .await?;
 
     Ok((
@@ -49,10 +54,9 @@ pub async fn get_file<R: IdentityResolver<User = User, Group = Group>>(
 ) -> ApiResult<Json<File>> {
     let user_id = auth.user.id;
 
-    let file = ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    let file = ctx
+        .authorized_file(user_id, file_id, FileAccess::ReadMetadata)
+        .await?;
 
     Ok((StatusCode::OK, Json(file)))
 }
@@ -67,10 +71,9 @@ pub async fn get_preview<R: IdentityResolver<User = User, Group = Group>>(
     let user_id = auth.user.id;
 
     // Verify file ownership + resolve head blob.
-    let file = ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    let file = ctx
+        .authorized_file(user_id, file_id, FileAccess::ReadMetadata)
+        .await?;
 
     // Load high-quality preview image
     let storage = get_file_storage();
@@ -110,10 +113,9 @@ pub async fn get_raw<R: IdentityResolver<User = User, Group = Group>>(
     let user_id = auth.user.id;
 
     // Verify ownership + resolve the head blob (cross-user → 404).
-    let file = ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    let file = ctx
+        .authorized_file(user_id, file_id, FileAccess::ReadContent)
+        .await?;
 
     // Extract extension (storage keys originals by extension), mirroring
     // download_file.
@@ -313,10 +315,9 @@ pub async fn get_text_rects<R: IdentityResolver<User = User, Group = Group>>(
     Extension(ctx): Extension<FileContext>,
 ) -> ApiResult<Json<TextRectsResponse>> {
     let user_id = auth.user.id;
-    let file = ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    let file = ctx
+        .authorized_file(user_id, file_id, FileAccess::ReadMetadata)
+        .await?;
 
     let empty = TextRectsResponse {
         page_w: 1.0,
@@ -376,10 +377,9 @@ pub async fn get_thumbnail<R: IdentityResolver<User = User, Group = Group>>(
     let user_id = auth.user.id;
 
     // Verify file ownership + resolve head blob.
-    let file = ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    let file = ctx
+        .authorized_file(user_id, file_id, FileAccess::ReadMetadata)
+        .await?;
 
     // Load thumbnail
     let storage = get_file_storage();
@@ -409,10 +409,9 @@ pub async fn get_text_content<R: IdentityResolver<User = User, Group = Group>>(
     let user_id = auth.user.id;
 
     // Verify file ownership and get file info
-    let file = ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    let file = ctx
+        .authorized_file(user_id, file_id, FileAccess::ReadMetadata)
+        .await?;
 
     let storage = get_file_storage();
     let text_content = match query.page {
@@ -467,6 +466,13 @@ pub async fn delete_file<R: IdentityResolver<User = User, Group = Group>>(
     Extension(ctx): Extension<FileContext>,
 ) -> ApiResult<StatusCode> {
     let user_id = auth.user.id;
+
+    // `delete` runs its own `id = $1 AND user_id = $2` and never touched
+    // `get_by_id_and_user`, so ownership was the entire authorization for
+    // DESTROYING the file. Authorize first — and note the check must precede the
+    // delete, not merely accompany it: a refusal returned after the row is gone
+    // is not a refusal.
+    ctx.authorize(user_id, file_id, FileAccess::Delete).await?;
 
     // Delete from database (returns the DISTINCT blob_version_ids to purge).
     let blob_ids = ctx.files.delete(file_id, user_id).await?;
