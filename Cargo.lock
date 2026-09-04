@@ -8998,6 +8998,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
+ "libc",
  "portpicker",
  "reqwest 0.12.28",
  "rsa",

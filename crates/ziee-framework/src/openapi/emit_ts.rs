@@ -655,6 +655,13 @@ fn get_type_from_schema(schema: &J, is_optional_or_nullable: bool) -> String {
                         props.push(format!("{}: {}", ts_prop_key(prop_name), prop_type));
                     }
                     format!("{{ {} }}", props.join("; "))
+                } else if let Some(ap) = schema.get("additionalProperties") {
+                    // BTreeMap<String, V> → Record<string, V>
+                    let value_type = match ap {
+                        J::Bool(true) => "unknown".to_string(),
+                        _ => get_type_from_schema(ap, false),
+                    };
+                    format!("Record<string, {}>", value_type)
                 } else {
                     "any".to_string()
                 }
