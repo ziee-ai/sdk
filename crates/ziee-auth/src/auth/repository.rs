@@ -220,6 +220,14 @@ impl AuthRepository {
         external_email: Option<&str>,
         external_data: Option<&serde_json::Value>,
     ) -> Result<bool, AppError> {
+        // Trim the provider-supplied address (issue #251). `users.email` is now guaranteed
+        // trimmed by `users_email_trimmed`, so an UNTRIMMED `external_email` would never
+        // satisfy the `lower(email) = lower($2)` guard below — the identity would link while
+        // `email_verified` silently stayed false. Fail-closed, but wrong: the same address
+        // already resolved through `find_user_by_email_for_linking` (which trims) to reach
+        // this flow at all, so the two would disagree about the same string.
+        let external_email = external_email.map(str::trim).filter(|e| !e.is_empty());
+
         let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
 
         // TOCTOU / double-submit safe (CODING_GUIDELINES §4). `link_account`

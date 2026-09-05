@@ -141,6 +141,15 @@ pub async fn register(
     // asserted BYTE-IDENTICAL across the username, exact-email, case-variant-email and
     // Unicode-whitespace-variant collisions (cytoanalyst `tests/auth/email_case_insensitive.rs`),
     // by raw body comparison rather than by status code.
+    //
+    // SCOPE, stated because an earlier version of this comment overclaimed it: that identity
+    // holds for THIS PRE-CHECK arm. The TOCTOU race loser takes a different path — the unique
+    // violation inside `create_local_user_with_default_group` becomes
+    // `RESOURCE_CONFLICT`/"Username or email already exists", which IS distinguishable from
+    // the generic 409 here. That differential pre-dates #251 and is not widened by it (the
+    // new index maps to the same arm the old constraint did), but #251 does enlarge the input
+    // set that can reach it, since case and whitespace variants now race too. Tracked
+    // separately rather than absorbed.
     let username_taken = ctx.user()
         .get_by_username(&req.username)
         .await

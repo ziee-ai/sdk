@@ -183,80 +183,62 @@ impl UserRepository {
 
     /// Get user by username or email — the sole resolver for local password login.
     ///
-    /// The EMAIL half is case-insensitive (issue #251, as [`Self::get_by_email`]); the
-    /// USERNAME half stays byte-exact, because `users_username_key` is still a
-    /// case-sensitive UNIQUE constraint and matching usernames more loosely than the
-    /// constraint enforces would let one identifier resolve to a row it does not name.
+    /// # Deliberately UNCHANGED by #251, after two attempts to improve it made things worse
     ///
-    /// # An AMBIGUOUS identifier resolves to NOBODY, and that is the whole point
+    /// This is byte-exact on BOTH halves, exactly as it was before this branch. That is a
+    /// reversal, and the reasoning is recorded here because "why didn't the case-insensitive
+    /// fix reach login?" is the obvious question.
     ///
-    /// `username` and `email` are separately unique but NOT disjoint. `validate_username`
+    /// `username` and `email` are separately unique but NOT disjoint: `validate_username`
     /// permits `@` and `.`, and registration imposes no `@` requirement on the email field,
-    /// so ONE identifier string can match a username on one row and an email on another.
-    /// Both directions are reachable by an unauthenticated attacker:
+    /// so ONE identifier string can match a username on one row and an email on another. The
+    /// caller then bcrypt-verifies the submitted password against whichever row comes back.
+    /// Two revisions tried to make that safe and each was reproduced as a worse attack by a
+    /// blind audit:
     ///
-    /// * register `email` = a victim's USERNAME; or
-    /// * register `username` = a victim's EMAIL.
+    /// * **Case-insensitive email half + `ORDER BY (username = $1) DESC`.** This did not
+    ///   remove the ambiguity, it chose which attack to enable: an attacker registering
+    ///   `username` = a victim's EMAIL now wins DETERMINISTICALLY, so the victim's correct
+    ///   password is checked against an attacker-chosen hash. A planner coin-flip became a
+    ///   guaranteed hijack of the more guessable of the two identifiers.
+    /// * **Case-insensitive email half + fail closed on >1 match.** Worse again: two
+    ///   unauthenticated registrations (one `email` = the victim's username, one `username` =
+    ///   the victim's email) make BOTH of the victim's identifiers ambiguous, so neither
+    ///   resolves and the victim cannot log in at all. There is no self-service email change
+    ///   and no password reset, so that lockout is permanent. It was also asymmetric — with
+    ///   the username half byte-exact, `ALICE` still resolved UNIQUELY to an attacker holding
+    ///   `email = 'alice'`, so the guard did not even fire on the case variants the
+    ///   case-insensitivity introduced.
     ///
-    /// Whichever row this function then returns, the caller bcrypt-verifies the submitted
-    /// password against THAT row's hash. So if the attacker's row can win, the victim's own
-    /// correct credentials are checked against an attacker-chosen hash — a targeted,
-    /// unauthenticated authentication denial.
+    /// Every one of those attacks needs the email half to be case-insensitive HERE. So it is
+    /// not. **#251 does not require it**: the invitation binding resolves users through
+    /// [`Self::get_by_email`], and registration's collision pre-check uses the same method —
+    /// neither goes through this function. Making login case-tolerant was a convenience, and
+    /// it bought a new attack class in exchange for letting someone who registered
+    /// `Bob@corp.com` type `bob@corp.com`.
     ///
-    /// **There is no safe way to PICK.** A previous revision ordered by
-    /// `(username = $1) DESC` on the reasoning that an exact username match is what a user
-    /// typing their username expects. A blind audit showed that merely chose which attack to
-    /// enable: it made the mirror direction — attacker registers `username` = victim's email
-    /// — resolve to the attacker DETERMINISTICALLY, upgrading a planner coin-flip into a
-    /// guaranteed hijack of the more guessable identifier. Preferring the email half is
-    /// symmetric and no better. Any total order over the two rows hands one of the two
-    /// attacks a reliable win.
-    ///
-    /// So this **fails closed**: if the identifier matches more than one row, it resolves to
-    /// `None` and the caller sees "no such user". Neither party gains anything, both retain
-    /// their own unambiguous identifier (the victim can always log in with the one the
-    /// attacker did not take), and the attacker's own account becomes equally unreachable by
-    /// that string — the attack is self-defeating rather than profitable.
-    ///
-    /// This makes the collision harmless; it does not make it impossible. Refusing a username
-    /// that collides with an existing address (and vice versa) at REGISTRATION is the real
-    /// fix and is tracked separately — it is a behavioural change to a public route and needs
-    /// a disposition for pre-existing rows, neither of which belongs in a security patch.
+    /// The real fix is at the WRITER — refuse a username that collides with an existing
+    /// address, and vice versa — which is a behavioural change to a public route with its own
+    /// disposition for pre-existing rows, and is tracked separately. Until then this stays as
+    /// it has always been: pre-existing behaviour, no new surface.
     pub async fn get_by_username_or_email(
         &self,
         identifier: &str,
     ) -> Result<Option<User>, AppError> {
-        let identifier = crate::auth::email::trim_email_for_lookup(identifier);
-        // LIMIT 2, not 1: the second row is not wanted, it is the AMBIGUITY DETECTOR. Asking
-        // for one row cannot distinguish "resolves uniquely" from "resolves arbitrarily".
-        let mut matches = sqlx::query_as!(
+        sqlx::query_as!(
             User,
             r#"
             SELECT id, username, email, email_verified, password_hash, display_name,
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
-            WHERE username = $1 OR lower(email) = lower($1)
-            LIMIT 2
+            WHERE username = $1 OR email = $1
             "#,
             identifier
         )
-        .fetch_all(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(AppError::database_error)?;
-
-        if matches.len() > 1 {
-            // Deliberately not an error: the caller is an unauthenticated login attempt, and
-            // a distinguishable "that identifier is ambiguous" would confirm to an attacker
-            // that their squat landed. Logged for operators, who can then resolve it.
-            tracing::warn!(
-                "login identifier matches a username on one account and an email on another; \
-                 refusing to guess (issue #251). Resolve the collision to restore that login."
-            );
-            return Ok(None);
-        }
-
-        Ok(matches.pop())
+        .map_err(AppError::database_error)
     }
 
     /// List users with pagination
