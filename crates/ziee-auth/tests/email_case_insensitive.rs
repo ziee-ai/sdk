@@ -58,6 +58,7 @@ async fn stored_email(pool: &PgPool, id: Uuid) -> String {
 // =====================================================================================
 
 #[tokio::test]
+// TEST-4 [acceptance, INV-1] (issue #251) — the DATABASE refuses the second principal.
 async fn database_refuses_a_case_variant_of_an_existing_address() {
     let (pool, db) = fresh_db().await;
 
@@ -119,6 +120,7 @@ async fn database_refuses_a_case_variant_of_an_existing_address() {
 // =====================================================================================
 
 #[tokio::test]
+// TEST-5 [acceptance, INV-3] (issue #251) — the trim CHECK refuses every Unicode-whitespace pad.
 async fn check_constraint_rejects_every_unicode_whitespace_pad() {
     let (pool, db) = fresh_db().await;
 
@@ -166,6 +168,7 @@ async fn check_constraint_rejects_every_unicode_whitespace_pad() {
 // =====================================================================================
 
 #[tokio::test]
+// TEST-6 (issue #251) — every by-email resolver resolves the variants to one principal.
 async fn get_by_email_resolves_case_and_whitespace_variants() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
@@ -254,6 +257,7 @@ async fn get_by_email_resolves_case_and_whitespace_variants() {
 }
 
 #[tokio::test]
+// TEST-6 (issue #251) — storage keeps the casing the user typed.
 async fn stored_casing_is_preserved_verbatim() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
@@ -287,6 +291,7 @@ async fn stored_casing_is_preserved_verbatim() {
 // =====================================================================================
 
 #[tokio::test]
+// TEST-7 (issue #251) — every users.email writer trims at the write.
 async fn every_users_writer_trims_at_the_write() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
@@ -362,6 +367,7 @@ async fn every_users_writer_trims_at_the_write() {
 }
 
 #[tokio::test]
+// TEST-7 (issue #251) — a real writer cannot create a padded twin.
 async fn a_writer_cannot_create_a_padded_twin_of_an_existing_principal() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
@@ -414,6 +420,7 @@ async fn a_writer_cannot_create_a_padded_twin_of_an_existing_principal() {
 /// consequence: an untrimmed address raised `23514 users_email_trimmed`, and the
 /// unique-violation-only error mapper turned that into a 500.
 #[tokio::test]
+// TEST-17 (issue #251) — UserRepository::update trims and names the right field.
 async fn update_trims_and_reports_an_email_collision_as_an_email_collision() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
@@ -483,6 +490,7 @@ async fn update_trims_and_reports_an_email_collision_as_an_email_collision() {
 /// pre-existing behaviour is intact — and, importantly, that reverting it did NOT undo the
 /// actual fix.
 #[tokio::test]
+// TEST-18 [acceptance, INV-4] (issue #251) — the login resolver is deliberately unchanged; get_by_email is not.
 async fn login_resolver_keeps_its_pre_251_semantics_while_get_by_email_is_fixed() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
@@ -555,6 +563,7 @@ async fn login_resolver_keeps_its_pre_251_semantics_while_get_by_email_is_fixed(
 // =====================================================================================
 
 #[tokio::test]
+// TEST-12 (issue #251) — OAuth provisioning resolves to the existing user.
 async fn oauth_linking_lookup_resolves_case_and_whitespace_variants() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
@@ -623,6 +632,7 @@ async fn oauth_linking_lookup_resolves_case_and_whitespace_variants() {
 /// match: the identity would link while `email_verified` silently stayed false. Fail-closed,
 /// but the two would disagree about the same string.
 #[tokio::test]
+// TEST-21 (issue #251) — the FBL write guard agrees with the lookup that reached it.
 async fn first_broker_login_verifies_a_whitespace_padded_provider_address() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
@@ -779,6 +789,7 @@ async fn assert_fixed_schema(pool: &PgPool) {
 /// stops and asks. The rollback assertions below are the important half: a diagnostic that
 /// left the table half-modified would be worse than no diagnostic.
 #[tokio::test]
+// TEST-8 / TEST-14 [acceptance, INV-1] (issue #251) — the migration refuses and changes nothing.
 async fn migration_refuses_a_preexisting_collision_and_changes_nothing() {
     let (pool, db) = fresh_db().await;
     rewind_to_pre_migration(&pool).await;
@@ -852,6 +863,7 @@ async fn migration_refuses_a_preexisting_collision_and_changes_nothing() {
 /// is a PAUSE, not a dead end. Without this the test above would be satisfied by a migration
 /// that can never apply to a database that ever had a collision.
 #[tokio::test]
+// TEST-15 (issue #251) — the refusal is a pause, not a dead end.
 async fn migration_applies_once_the_operator_has_resolved_the_collision() {
     let (pool, db) = fresh_db().await;
     rewind_to_pre_migration(&pool).await;
@@ -885,6 +897,7 @@ async fn migration_applies_once_the_operator_has_resolved_the_collision() {
 /// A whitespace-padded twin IS a collision under the new rule, and is caught by the guard
 /// rather than silently merged — step 2 normalizes before step 3 counts.
 #[tokio::test]
+// TEST-16 (issue #251) — a padded twin is a collision.
 async fn migration_refuses_a_whitespace_padded_twin_as_a_collision() {
     let (pool, db) = fresh_db().await;
     rewind_to_pre_migration(&pool).await;
@@ -908,6 +921,7 @@ async fn migration_refuses_a_whitespace_padded_twin_as_a_collision() {
 /// This is the POSITIVE CONTROL for the three refusal tests above — without it they would
 /// pass just as well against a migration that always refuses.
 #[tokio::test]
+// TEST-20 (issue #251) — POSITIVE CONTROL for the refusal tests.
 async fn migration_applies_cleanly_when_there_are_no_collisions() {
     let (pool, db) = fresh_db().await;
     rewind_to_pre_migration(&pool).await;

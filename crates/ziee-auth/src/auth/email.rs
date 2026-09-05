@@ -201,6 +201,7 @@ mod tests {
 
     /// TEST-2 -- the Rust constant cannot drift from the language's own definition.
     #[test]
+    // TEST-2 (issue #251) — the constant equals char::is_whitespace.
     fn unicode_whitespace_const_equals_char_is_whitespace() {
         let from_const: BTreeSet<char> = UNICODE_WHITESPACE.iter().copied().collect();
         assert_eq!(
@@ -223,6 +224,7 @@ mod tests {
     /// address), and it fails vacuously for neither: the count is pinned and every literal in
     /// the file must agree.
     #[test]
+    // TEST-3 [acceptance, INV-3] (issue #251) — THE TRIM AGREES WITH THE INDEX.
     fn migration_charset_equals_rust_trim_set() {
         let literals = escape_string_literals(MIGRATION_SQL);
         assert!(
@@ -259,6 +261,7 @@ mod tests {
 
     /// TEST-1 -- storage normalization trims, preserves case, and is idempotent.
     #[test]
+    // TEST-1 (issue #251) — storage normalization trims, preserves case, is idempotent.
     fn normalize_for_storage_trims_but_never_case_folds() {
         assert_eq!(
             normalize_email_for_storage("  Bob@Corp.COM  ").unwrap(),
@@ -281,6 +284,7 @@ mod tests {
     /// TEST-1 -- empty / whitespace-only is refused, including whitespace no ASCII-only
     /// trim would have removed.
     #[test]
+    // TEST-1 (issue #251) — empty / whitespace-only is refused.
     fn normalize_for_storage_refuses_empty_and_whitespace_only() {
         assert!(normalize_email_for_storage("").is_err());
         assert!(normalize_email_for_storage("   ").is_err());
@@ -293,6 +297,7 @@ mod tests {
 
     /// TEST-1 -- the lookup form trims identically and is total.
     #[test]
+    // TEST-1 (issue #251) — lookup and storage trim identically.
     fn trim_for_lookup_matches_storage_normalization() {
         for raw in [
             "  bob@corp.com  ",
