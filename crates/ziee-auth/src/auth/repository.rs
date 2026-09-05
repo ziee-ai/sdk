@@ -46,7 +46,7 @@ impl AuthRepository {
         password_hash: Option<String>,
         display_name: Option<String>,
     ) -> Result<User, AppError> {
-        // Trim at the WRITE (issue #251): the `users_email_lower_key` unique index
+        // Trim at the WRITE (issue #251): the `users_email_lower_unique_idx` unique index
         // (`202609050010`) case-folds but does NOT trim, so an untrimmed row could sit beside
         // its trimmed twin as a second principal. `crate::auth::email` explains why the trim
         // lives in Rust and the case-fold lives in Postgres, and why neither does the other's
@@ -387,7 +387,7 @@ impl AuthRepository {
         external_id: &str,
         external_data: Option<&serde_json::Value>,
     ) -> Result<Uuid, AppError> {
-        // Trim at the WRITE (issue #251): the `users_email_lower_key` unique index
+        // Trim at the WRITE (issue #251): the `users_email_lower_unique_idx` unique index
         // (`202609050010`) case-folds but does NOT trim, so an untrimmed row could sit beside
         // its trimmed twin as a second principal. `crate::auth::email` explains why the trim
         // lives in Rust and the case-fold lives in Postgres, and why neither does the other's
@@ -556,7 +556,7 @@ impl AuthRepository {
         email: Option<String>,
         display_name: &str,
     ) -> Result<Uuid, AppError> {
-        // Trim at the WRITE (issue #251): the `users_email_lower_key` unique index
+        // Trim at the WRITE (issue #251): the `users_email_lower_unique_idx` unique index
         // (`202609050010`) case-folds but does NOT trim, so an untrimmed row could sit beside
         // its trimmed twin as a second principal. `crate::auth::email` explains why the trim
         // lives in Rust and the case-fold lives in Postgres, and why neither does the other's
@@ -606,7 +606,7 @@ impl AuthRepository {
         provider_id: Uuid,
         external_id: &str,
     ) -> Result<Uuid, AppError> {
-        // Trim at the WRITE (issue #251): the `users_email_lower_key` unique index
+        // Trim at the WRITE (issue #251): the `users_email_lower_unique_idx` unique index
         // (`202609050010`) case-folds but does NOT trim, so an untrimmed row could sit beside
         // its trimmed twin as a second principal. `crate::auth::email` explains why the trim
         // lives in Rust and the case-fold lives in Postgres, and why neither does the other's

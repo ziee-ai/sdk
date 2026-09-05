@@ -22,6 +22,31 @@
 //! for at least that input, and a `to_lowercase()` in this module would have introduced a new
 //! divergence class while closing the old one. **Nothing here lowercases.**
 //!
+//! # The limit of that claim
+//!
+//! An earlier version of this comment concluded that the crossing therefore "does not exist".
+//! That is true INSIDE this crate and false across a table boundary, and a blind audit
+//! demonstrated the difference. A consumer that stores a RUST-lowercased address in its own
+//! table and matches it against `users.email` is performing exactly the comparison this
+//! design avoids internally. A full `0..0x10FFFF` sweep finds 56 divergent code points: the
+//! spellings `U+0130` and `U+0069 U+0307` are DIFFERENT under Postgres `lower()`, so both may
+//! be stored here as separate principals -- yet IDENTICAL under Rust `to_lowercase()`, so
+//! both would satisfy one such binding. For those inputs #251 survives in the consumer.
+//!
+//! Over printable ASCII the two folds agree exactly, so a consumer whose addresses are
+//! ASCII-only is unaffected. That is a constraint on the CONSUMER, not a property of this
+//! module, and it must be asserted where the charset rule lives rather than assumed here.
+//! (cytoanalyst does assert it: `validate_invitation_email` admits only printable ASCII, and
+//! `tests/auth/email_case_insensitive.rs` proves both halves -- the folds agree on everything
+//! that validator admits, and it refuses everything they disagree on.) The remedy for a
+//! consumer that widens its charset is the same discipline this module follows: do not
+//! case-fold in Rust; compare with `lower()` on both sides.
+//!
+//! `lower()` is also collation-driven. ASCII folding is collation-INVARIANT, so the same
+//! ASCII-only domain is unaffected; for non-ASCII addresses the fold -- and therefore the
+//! uniqueness rule -- depends on the cluster locale and can shift across a glibc/ICU upgrade
+//! or a restore into a differently-collated cluster. Same residual, same tracking.
+//!
 //! # The single crossing, and how it is kept honest
 //!
 //! Migration `202609050010` has to `btrim` once -- to normalize legacy rows and for its

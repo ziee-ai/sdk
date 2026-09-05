@@ -149,7 +149,7 @@ impl UserRepository {
 
     /// Get user by email. CASE-INSENSITIVE (issue #251).
     ///
-    /// `lower(email) = lower($1)` matches the `users_email_lower_key` unique index
+    /// `lower(email) = lower($1)` matches the `users_email_lower_unique_idx` unique index
     /// (`202609050010`) exactly, which is what makes this both correct and index-using: the
     /// functional index is only consulted when the query repeats its expression verbatim.
     ///
@@ -181,12 +181,32 @@ impl UserRepository {
         .map_err(AppError::database_error)
     }
 
-    /// Get user by username or email.
+    /// Get user by username or email — the sole resolver for local password login.
     ///
     /// The EMAIL half is case-insensitive (issue #251, as [`Self::get_by_email`]); the
     /// USERNAME half stays byte-exact, because `users_username_key` is still a
-    /// case-sensitive UNIQUE constraint and matching usernames loosely than the constraint
-    /// enforces would let one identifier resolve to a row it does not name.
+    /// case-sensitive UNIQUE constraint and matching usernames more loosely than the
+    /// constraint enforces would let one identifier resolve to a row it does not name.
+    ///
+    /// # Why the ORDER BY is not decoration
+    ///
+    /// `username` and `email` are separately unique but NOT disjoint: `validate_username`
+    /// permits `@` and `.`, and registration imposes no `@` requirement on the email field,
+    /// so one identifier string can match a username on one row AND an email on another.
+    /// The predicate then returns TWO rows and `fetch_optional` silently keeps whichever the
+    /// planner produced first — meaning which principal the login boundary resolves to was
+    /// arbitrary. An attacker could exploit that deliberately: register with `email` set to
+    /// a victim's `username`, and the victim's own correct password gets verified against
+    /// the attacker's hash. A targeted, unauthenticated authentication denial-of-service.
+    ///
+    /// The ambiguity predates #251 (the byte-exact `OR email = $1` had the same shape), but
+    /// case-insensitivity strictly WIDENS the set of colliding spellings, so it is resolved
+    /// here rather than inherited: **an exact username match always wins**, then the oldest
+    /// row, then by id. Deterministic, and the reading a user typing their username expects.
+    /// `LIMIT 1` states the single-row intent that `fetch_optional` only implied.
+    ///
+    /// This makes the resolution well-defined; it does not make the collision *impossible*.
+    /// Refusing such a username at registration is the real fix and is tracked separately.
     pub async fn get_by_username_or_email(
         &self,
         identifier: &str,
@@ -200,6 +220,8 @@ impl UserRepository {
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
             WHERE username = $1 OR lower(email) = lower($1)
+            ORDER BY (username = $1) DESC, created_at, id
+            LIMIT 1
             "#,
             identifier
         )
@@ -248,7 +270,7 @@ impl UserRepository {
         display_name: Option<String>,
         permissions: Option<Vec<String>>,
     ) -> Result<User, AppError> {
-        // Trim at the WRITE (issue #251). The `users_email_lower_key` unique index does not
+        // Trim at the WRITE (issue #251). The `users_email_lower_unique_idx` unique index does not
         // trim, so an untrimmed row would sit beside its trimmed twin as a second principal
         // and the bypass would survive via a leading/trailing Unicode-whitespace variant.
         // `str::trim` here and `btrim(<the same 25 code points>)` in the migration's CHECK
@@ -316,6 +338,16 @@ impl UserRepository {
         display_name: Option<String>,
         permissions: Option<Vec<String>>,
     ) -> Result<User, AppError> {
+        // Trim at the WRITE (issue #251), like every other `users.email` writer. This is a
+        // `pub` method on a library crate, so "no in-tree caller passes `Some(email)` today"
+        // is not a reason to skip it — and skipping it was a real defect a blind audit
+        // reproduced: an untrimmed address raised `23514 users_email_trimmed`, which the
+        // unique-violation-only mapper below turned into a 500 SYSTEM_DATABASE_ERROR. It also
+        // falsified the migration's own claim that every in-crate writer trims.
+        let email = email
+            .map(|e| crate::auth::email::normalize_email_for_storage(&e))
+            .transpose()?;
+
         sqlx::query_as!(
             User,
             r#"
@@ -342,8 +374,21 @@ impl UserRepository {
         // (the pre-check is a TOCTOU window) is caught by the DB UNIQUE
         // constraint and surfaced as a 409 — not a raw 500. Mirrors the
         // mapping `update_profile` below has always had.
+        //
+        // The email arm is named separately (issue #251): before the case-insensitive index
+        // existed, only a byte-identical email could collide here and the blanket
+        // "Username" label was merely imprecise. Now a CASE VARIANT collides too, so the
+        // same label would actively misdirect an operator to a username that is fine. There
+        // is no enumeration cost in distinguishing them on THIS route: it edits a user by
+        // id, so the caller already knows the account exists — unlike registration, where
+        // the two branches must stay collapsed.
         .map_err(|e| match e {
-            sqlx::Error::Database(db) if db.is_unique_violation() => AppError::conflict("Username"),
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                match db.constraint() {
+                    Some("users_email_lower_unique_idx") => AppError::conflict("Email"),
+                    _ => AppError::conflict("Username"),
+                }
+            }
             other => AppError::database_error(other),
         })
     }

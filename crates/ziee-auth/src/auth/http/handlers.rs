@@ -110,7 +110,7 @@ pub async fn register(
     // created a second principal for the same mailbox.
     //
     // Normalization here is TRIM ONLY — the case-fold belongs to Postgres (`lower(email) =
-    // lower($1)` in the lookup, `users_email_lower_key` in the index), and the stored value
+    // lower($1)` in the lookup, `users_email_lower_unique_idx` in the index), and the stored value
     // keeps the casing the user typed for display and SMTP. `crate::auth::email` explains why
     // the two jobs are split rather than shared.
     //
@@ -134,7 +134,7 @@ pub async fn register(
     // operator debugging.
     //
     // The email side is now CASE-INSENSITIVE (issue #251): `get_by_email` compares
-    // `lower(email) = lower($1)`, matching the `users_email_lower_key` unique index, so
+    // `lower(email) = lower($1)`, matching the `users_email_lower_unique_idx` unique index, so
     // `BOB@corp.com` is refused when `bob@corp.com` exists. That refusal MUST stay inside
     // this collapse — a distinguishable "that case variant is taken" would trade the
     // invitation bypass for a user-enumeration oracle, which is a worse deal. The refusal is
