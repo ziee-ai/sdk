@@ -25,20 +25,45 @@ impl LocalAuthProvider {
         })
     }
 
+    /// Resolve a login identifier to a user — BYTE-EXACT on both halves.
+    ///
+    /// # This is the SECOND local-password resolver, and #251 nearly changed it by accident
+    ///
+    /// `UserRepository::get_by_username_or_email` is the one most people mean; this is the
+    /// other, reached through `login_with_provider` when an operator has added an
+    /// `auth_providers` row of type `local` under some name other than `"local"`. DEC-15
+    /// reverted that one to byte-exact after two attempts to make its email half
+    /// case-insensitive were each reproduced as a worse attack — and a blind audit then found
+    /// that THIS resolver had silently inherited the case-insensitivity anyway, via
+    /// `get_by_email`. The two local login resolvers disagreed about who an identifier names:
+    /// with a user stored as `Bob@Corp.com`, `authenticate("bob@corp.com", pw)` succeeded
+    /// here while `get_by_username_or_email("bob@corp.com")` returned `None`.
+    ///
+    /// It also has exactly the shape DEC-15 identifies as the attack: username tried FIRST
+    /// and byte-exact, email second — so an attacker registering `username` = a victim's
+    /// EMAIL wins deterministically, and the victim's correct password is bcrypt-verified
+    /// against the attacker's hash.
+    ///
+    /// So the email lookup here is byte-exact too. Reachability is admin-gated (no `local`
+    /// provider row is seeded and `create_provider` refuses the name `"local"`), which makes
+    /// this latent rather than live — but a latent authentication inconsistency in a resolver
+    /// nobody remembered is exactly what an audit is for, and consistency between the two
+    /// resolvers costs nothing.
+    ///
+    /// #251's fix is unaffected: the invitation binding and registration's collision
+    /// pre-check both go through `get_by_email` directly, not through any login resolver.
+    /// Test seam for the crate-scoped integration suite (TEST-24): the resolver itself is
+    /// private, but the property that BOTH local resolvers agree is exactly what needs
+    /// asserting, and asserting it through `authenticate` would confound it with password
+    /// verification.
+    pub async fn get_user_for_test(&self, username: &str) -> Result<Option<User>, AuthError> {
+        self.get_user(username).await
+    }
+
     async fn get_user(&self, username: &str) -> Result<Option<User>, AuthError> {
         let users = UserRepository::new(self.pool.clone());
-        // Try username first
-        if let Some(user) = users
-            .get_by_username(username)
-            .await
-            .map_err(|e| AuthError::InternalError(format!("Database error: {}", e)))?
-        {
-            return Ok(Some(user));
-        }
-
-        // Try email
         users
-            .get_by_email(username)
+            .get_by_username_or_email(username)
             .await
             .map_err(|e| AuthError::InternalError(format!("Database error: {}", e)))
     }

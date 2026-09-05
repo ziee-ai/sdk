@@ -86,12 +86,13 @@
 -- 1. Drop the CASE-SENSITIVE constraint FIRST.
 --
 --    Ordering here is load-bearing, and getting it wrong is a deploy-time failure rather
---    than a cosmetic issue -- it was caught by
---    `migration_resolves_preexisting_collisions_without_failing`, which builds the collision
---    state deliberately. With `users_email_key` still in force, step 2's whitespace UPDATE
+--    than a cosmetic issue -- it is caught by
+--    `migration_refuses_a_whitespace_padded_twin_as_a_collision`, which goes RED if this
+--    DROP is moved below step 2. With `users_email_key` still in force, step 2's UPDATE
 --    normalizes a `U+00A0`-padded twin onto its unpadded original and trips the OLD
 --    constraint (`23505 users_email_key`), aborting the migration on exactly the data this
---    migration exists to repair. Steps 2 and 4 need a window with NO uniqueness rule on
+--    migration exists to repair -- and with a Postgres duplicate-key error rather than the
+--    diagnostic step 3 exists to give. Step 2 needs a window with NO uniqueness rule on
 --    `email`; sqlx applies each migration inside a transaction, so that window is never
 --    visible to anyone else.
 --
@@ -151,13 +152,38 @@ UPDATE public.users
 --    run, nothing is mutated (the whole migration is one transaction, so the trim in step 2
 --    rolls back with it), and the upgrade resumes the moment a human has adjudicated.
 --
---    This is safe to make blocking because a collision is not a routine state: `users_email_key`
---    has enforced byte-exact uniqueness since `202607140050`, so the ONLY way to hold two
---    rows for one mailbox is a deliberate case or whitespace variant -- i.e. the artifact of
---    the attack this migration exists to close. A deployment in that state has an active
---    security incident, and blocking its upgrade until a human looks is the correct outcome.
---    The precheck across every reachable database on the development cluster found ZERO
---    collisions, so in practice this never fires.
+--    THE COST OF BLOCKING, NAMED RATHER THAN GLOSSED. Refusing is not free, and an earlier
+--    version of this comment asserted its safety without weighing the downside. Registration
+--    on a not-yet-upgraded deployment is public and unverified, so TWO anonymous requests --
+--    `bob@corp.com` and `BOB@corp.com` -- pre-plant a collision that makes this block refuse.
+--    Because the app runs migrations at startup, the result is not a degraded auth subsystem:
+--    the SERVER DOES NOT BOOT, identically on every restart, until an operator adjudicates.
+--    An attacker who knows an upgrade is coming can therefore deny the upgrade for the cost of
+--    two HTTP requests, and choose the address it happens on.
+--
+--    That is accepted, with eyes open, because the alternative is worse in kind rather than in
+--    degree. The three automatic rules above each hand the attacker a PERMANENT, SILENT
+--    AUTHORIZATION outcome -- the squatter holding the contested mailbox, or the legitimate
+--    admin deactivated -- which the new unique index then protects and which no operator is
+--    told about. This refusal costs AVAILABILITY, loudly, recoverably, and in a way one
+--    `UPDATE` fixes. A loud recoverable outage is a better failure than a silent permanent
+--    compromise; and unlike the automatic rules, it cannot be arranged to favour the attacker.
+--    The diagnostic below is what keeps the outage short, which is why it carries the ids and
+--    the remediation in MESSAGE rather than in fields the client drops.
+--
+--    It is also not a routine state: `users_email_key` has enforced byte-exact uniqueness
+--    since `202607140050`, so the ONLY way to hold two rows for one mailbox is a deliberate
+--    case or whitespace variant -- the artifact of the attack this migration exists to close.
+--    A deployment in that state has an active security incident, and blocking its upgrade
+--    until a human looks is the correct outcome. The precheck across every reachable database
+--    on the development cluster found ZERO collisions, so in practice this never fires.
+--
+--    Two residuals are stated rather than hidden: a whitespace-ONLY pre-existing address is
+--    normalized by step 2 to the empty string (no shipped writer can produce one, and the
+--    unique index then admits exactly one such row); and sqlx leaks its session advisory lock
+--    when a migration fails, so a consumer that RETRIES the migrator on the SAME pool blocks
+--    rather than re-reporting the refusal. The app is unaffected -- it runs the migrator once
+--    and exits, so each restart gets a fresh pool.
 --
 --    The diagnostic names USER IDS, never addresses: an operator can resolve the collision
 --    from ids, and a migration should not dump user email addresses into deploy logs.
@@ -165,9 +191,10 @@ DO $$
 DECLARE
     colliding int;
     ids       text;
+    extra     int;
 BEGIN
-    SELECT count(*), string_agg(id::text, ', ' ORDER BY id)
-      INTO colliding, ids
+    SELECT count(*)
+      INTO colliding
       FROM public.users
      WHERE lower(email) IN (SELECT lower(email)
                               FROM public.users
@@ -175,24 +202,53 @@ BEGIN
                             HAVING count(*) > 1);
 
     IF colliding > 0 THEN
-        -- `USING MESSAGE/DETAIL/HINT` rather than a `RAISE ... , args` format string: the
-        -- latter takes ONE literal, so the multi-line diagnostic an operator actually needs
-        -- does not fit it, and the structured fields are what a client surfaces separately.
+        -- Bounded: an unbounded `string_agg` produced a 3.8 MB single-line field at 100k
+        -- colliding rows, which is unusable in any error surface.
+        SELECT string_agg(id::text, ', ' ORDER BY id)
+          INTO ids
+          FROM (SELECT id
+                  FROM public.users
+                 WHERE lower(email) IN (SELECT lower(email)
+                                          FROM public.users
+                                         GROUP BY lower(email)
+                                        HAVING count(*) > 1)
+                 ORDER BY id
+                 LIMIT 50) capped;
+        extra := colliding - least(colliding, 50);
+
+        -- EVERYTHING actionable goes in MESSAGE, not DETAIL/HINT.
+        --
+        -- That is the opposite of the idiomatic choice, and it is deliberate: three
+        -- independent blind audits reproduced the same defect against the real runner.
+        -- sqlx's `MigrateError`/`Error` `Display` impl renders ONLY Postgres's primary
+        -- message (`PgDatabaseError::Display` is `f.write_str(self.message())`); DETAIL and
+        -- HINT survive only under `{:?}`. The app's startup path prints the `Display` form
+        -- (`main.rs`: `eprintln!("fatal: {e}")`), so an affected deployment previously saw a
+        -- bare count and nothing else -- no ids, no remediation, no statement that nothing
+        -- had been modified -- on a server that then refuses to boot. Structured fields are
+        -- the right shape for a client that surfaces them; this client drops them.
+        --
+        -- The remediation names the ids DIRECTLY rather than handing over a discovery query.
+        -- An earlier version's query omitted the whitespace `btrim` that step 2 applies, so
+        -- it returned ZERO ROWS for a whitespace-only collision -- the operator was told to
+        -- run something that could not find what the migration had just refused over. The
+        -- ids are exact, need no charset, and cannot drift from the guard.
         RAISE EXCEPTION
             USING MESSAGE = format(
                       'MIGRATION 202609050010 STOPPED: %s user account(s) share a mailbox '
-                      'case-insensitively. This migration will not guess which account owns '
-                      'an address -- see the comment above this block for why every automatic '
-                      'rule was reproduced as an attack.',
-                      colliding),
-                  DETAIL = format('Affected users.id: %s', ids),
-                  HINT = 'List them with: SELECT id, username, email, is_admin, '
-                         'email_verified, is_active, created_at FROM users WHERE lower(email) '
-                         'IN (SELECT lower(email) FROM users GROUP BY lower(email) HAVING '
-                         'count(*) > 1) ORDER BY lower(email), created_at; -- then decide '
-                         'which account owns each address, change the OTHER accounts'' email '
-                         '(or remove them), and re-run. NOTHING HAS BEEN MODIFIED: this '
-                         'migration is a single transaction and has rolled back.';
+                      '(case-insensitively, or after trimming whitespace). This migration '
+                      'will not guess which account owns an address -- see the comment above '
+                      'this block for why every automatic rule was reproduced as an attack. '
+                      'Affected users.id: %s%s. '
+                      'Inspect with: SELECT id, username, email, is_admin, email_verified, '
+                      'is_active, created_at FROM users WHERE id IN (<the ids above>); '
+                      'then decide which account owns each address, change the OTHER '
+                      'accounts to a different email (or remove them), and re-run. '
+                      'NOTHING HAS BEEN MODIFIED: this migration is a single transaction '
+                      'and has rolled back.',
+                      colliding,
+                      ids,
+                      CASE WHEN extra > 0 THEN format(' (and %s more)', extra) ELSE '' END);
     END IF;
 END
 $$;
@@ -207,6 +263,30 @@ $$;
 --    fail at runtime.
 CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx
     ON public.users (lower(email));
+
+--    ...and PROVE it is unique. `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME ONLY, so
+--    a pre-existing NON-unique index of this name makes the statement a silent no-op: an
+--    audit pre-created one, ran this migration, watched it report SUCCESS, and then inserted
+--    `bob@corp.com` and `BOB@corp.com` side by side. That is the whole bypass, reopened by a
+--    migration that claims to have closed it. This is the single enforcement statement in the
+--    file; it is the one that must not be able to quietly not-enforce.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1
+                     FROM pg_class c
+                     JOIN pg_index i ON i.indexrelid = c.oid
+                    WHERE c.relname = 'users_email_lower_unique_idx'
+                      AND i.indisunique) THEN
+        RAISE EXCEPTION
+            USING MESSAGE =
+                'MIGRATION 202609050010 STOPPED: an index named users_email_lower_unique_idx '
+                'already existed and is NOT UNIQUE, so CREATE UNIQUE INDEX IF NOT EXISTS was '
+                'a no-op and case-insensitive uniqueness is NOT enforced. Drop that index and '
+                're-run. NOTHING HAS BEEN MODIFIED: this migration is a single transaction '
+                'and has rolled back.';
+    END IF;
+END
+$$;
 
 -- 4b. `202607140050` already created `idx_users_lower_email` on the byte-identical expression
 --     `lower(email)`. It is now strictly redundant -- every write would maintain two identical

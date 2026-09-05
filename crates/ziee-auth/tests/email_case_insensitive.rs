@@ -703,6 +703,162 @@ async fn first_broker_login_verifies_a_whitespace_padded_provider_address() {
     drop_db(&db).await;
 }
 
+// TEST-23 (issue #251) — the OAuth auto-provision branch refuses cleanly, not with a 500.
+/// A DEACTIVATED account holding the mailbox must not turn an OAuth signup into a 500.
+///
+/// `find_user_by_email_for_linking` filters `is_active = true` — deliberately, so a disabled
+/// user's address does not render `/auth/link-account` and thereby confirm it is registered.
+/// The consequence after #251: the First-Broker-Login branch is skipped, the callback falls
+/// through to auto-provision, and `users_email_lower_unique_idx` now rejects any CASE or
+/// WHITESPACE variant there — not just a byte-identical address. A blind audit reproduced the
+/// result as `500 SYSTEM_DATABASE_ERROR` on an unauthenticated callback, which is both an
+/// opaque failure and an existence oracle for deactivated accounts (500 vs a successful
+/// signup), i.e. exactly the signal the `is_active` filter exists to suppress.
+#[tokio::test]
+async fn oauth_provisioning_over_a_deactivated_holder_is_a_clean_conflict_not_a_500() {
+    let (pool, db) = fresh_db().await;
+    let auth = AuthRepository::new(pool.clone());
+
+    let bob = auth
+        .create_local_user_with_default_group("bob", "bob@corp.com", None, None)
+        .await
+        .expect("local principal");
+    sqlx::query("UPDATE users SET is_active = false WHERE id = $1")
+        .bind(bob.id)
+        .execute(&pool)
+        .await
+        .expect("deactivate");
+
+    // Precondition: the FBL lookup does NOT see them, so the callback reaches auto-provision.
+    assert_eq!(
+        auth.find_user_by_email_for_linking("BOB@CORP.COM")
+            .await
+            .expect("query ok"),
+        None,
+        "the is_active filter must still hide a disabled account from the linking lookup"
+    );
+
+    for variant in ["BOB@CORP.COM", "bob@corp.com", "\u{00A0}Bob@Corp.com\u{2009}"] {
+        let err = auth
+            .provision_external_user_atomic(
+                &format!("ext_{}", variant.len()),
+                Some(variant),
+                true,
+                "Ext",
+                provider_id(),
+                &format!("ext-{variant}"),
+                None,
+            )
+            .await
+            .expect_err("the address is taken, so provisioning must be refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("EMAIL_TAKEN_BY_EXTERNAL_ACCOUNT"),
+            "the refusal must be the same 409 the ACTIVE-account collision returns — a 500 \
+             is both opaque and an existence oracle for deactivated accounts; got: {msg}"
+        );
+        assert!(
+            !msg.contains("SYSTEM_DATABASE_ERROR"),
+            "and must not be a raw database error; got: {msg}"
+        );
+    }
+
+    // POSITIVE CONTROL — provisioning a genuinely free address still works, so the refusals
+    // above are specific to the collision and not to provisioning being broken.
+    auth.provision_external_user_atomic(
+        "ext_ok",
+        Some("someone.else@corp.com"),
+        true,
+        "Ext OK",
+        provider_id(),
+        "ext-ok",
+        None,
+    )
+    .await
+    .expect("a free address still provisions");
+
+    drop_db(&db).await;
+}
+
+// TEST-24 (issue #251) — the SECOND local-login resolver agrees with the first.
+/// `LocalAuthProvider::get_user` is the other local-password resolver, reached when an
+/// operator adds an `auth_providers` row of type `local` under a name other than `"local"`.
+/// It used to try `get_by_username` and then `get_by_email` — so #251 silently made it
+/// case-insensitive on the email half, the exact property DEC-15 reverted from
+/// `get_by_username_or_email` because two attempts to keep it were each reproduced as a
+/// worse attack. The two resolvers disagreed about who an identifier named. Now there is one
+/// resolver behind both.
+#[tokio::test]
+async fn both_local_login_resolvers_agree_on_who_an_identifier_names() {
+    let (pool, db) = fresh_db().await;
+    let auth = AuthRepository::new(pool.clone());
+    let users = UserRepository::new(pool.clone());
+
+    let bob = auth
+        .create_local_user_with_default_group(
+            "bob",
+            "Bob@Corp.com",
+            Some(hash_password("userPassw0rd!").expect("hash")),
+            None,
+        )
+        .await
+        .expect("bob");
+
+    let provider = ziee_auth::auth::providers::models::AuthProvider {
+        id: provider_id(),
+        name: "corp-local".to_string(),
+        provider_type: "local".to_string(),
+        enabled: true,
+        config: serde_json::json!({}),
+        created_at: bob.created_at,
+        updated_at: bob.updated_at,
+        last_test_at: None,
+        last_test_ok: None,
+        last_test_message: None,
+    };
+    let local = ziee_auth::auth::providers::local::LocalAuthProvider::new(&provider, pool.clone())
+        .expect("construct the provider");
+
+    for identifier in ["bob", "Bob@Corp.com", "bob@corp.com", "BOB@CORP.COM"] {
+        let via_repo = users
+            .get_by_username_or_email(identifier)
+            .await
+            .expect("query ok")
+            .map(|u| u.id);
+        let via_provider = local
+            .get_user_for_test(identifier)
+            .await
+            .expect("query ok")
+            .map(|u| u.id);
+        assert_eq!(
+            via_repo, via_provider,
+            "the two local-password resolvers must agree about {identifier:?} — they \
+             disagreed before #251's revert reached this one, so `bob@corp.com` \
+             authenticated through one and resolved to nobody through the other"
+        );
+    }
+
+    // ...and the agreed answer is the byte-exact one (DEC-15).
+    assert_eq!(
+        local
+            .get_user_for_test("Bob@Corp.com")
+            .await
+            .expect("query ok")
+            .map(|u| u.id),
+        Some(bob.id)
+    );
+    assert!(
+        local
+            .get_user_for_test("bob@corp.com")
+            .await
+            .expect("query ok")
+            .is_none(),
+        "a case variant must NOT authenticate — that is the property DEC-15 restored"
+    );
+
+    drop_db(&db).await;
+}
+
 // =====================================================================================
 // TEST-8 — the migration REFUSES a pre-existing collision rather than guessing
 // =====================================================================================
@@ -812,9 +968,52 @@ async fn migration_refuses_a_preexisting_collision_and_changes_nothing() {
         "the refusal must be the named diagnostic, not an incidental constraint error; \
          got: {msg}"
     );
+    // NOT `msg.contains('2')` — a blind audit proved that vacuous: the migration id
+    // "202609050010" contains a '2', so the assertion held on a build whose message dropped
+    // the count entirely. Assert the rendered phrase.
     assert!(
-        msg.contains('2'),
-        "and must state HOW MANY accounts collide; got: {msg}"
+        msg.contains("STOPPED: 2 user account(s)"),
+        "the diagnostic must state HOW MANY accounts collide, and state it correctly \
+         (2 here — `bob` and `squatter`; `carol` and `bob_padded` are not in the group); \
+         got: {msg}"
+    );
+
+    // The ids are the headline of this whole design — "refuses, NAMES the affected
+    // users.id, rolls back" — and nothing asserted them: replacing the id list with a
+    // constant left the entire suite green.
+    let ids: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM users WHERE username IN ('bob', 'squatter') ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read the colliding ids");
+    for (id,) in &ids {
+        assert!(
+            msg.contains(&id.to_string()),
+            "the diagnostic must NAME the colliding account {id} — without the ids the \
+             operator has a server that refuses to boot and nothing to act on; got: {msg}"
+        );
+    }
+    let bystander: (Uuid,) = sqlx::query_as("SELECT id FROM users WHERE username = 'carol'")
+        .fetch_one(&pool)
+        .await
+        .expect("bystander id");
+    assert!(
+        !msg.contains(&bystander.0.to_string()),
+        "and must NOT name a bystander — otherwise the id list is not a collision report"
+    );
+
+    // The remediation must survive to the surface the operator actually sees. sqlx renders
+    // only Postgres's primary MESSAGE through `Display`, and the app prints `Display`, so
+    // anything parked in DETAIL/HINT is invisible in production.
+    assert!(
+        msg.contains("NOTHING HAS BEEN MODIFIED"),
+        "the message must say the migration rolled back; got: {msg}"
+    );
+    assert!(
+        msg.contains("SELECT id, username, email"),
+        "and must carry the inspection query, in MESSAGE — not in DETAIL/HINT, which \
+         sqlx's Display drops; got: {msg}"
     );
 
     // NOTHING CHANGED. The whole migration is one transaction, so step 2's trim rolls back
@@ -826,7 +1025,10 @@ async fn migration_refuses_a_preexisting_collision_and_changes_nothing() {
     assert_eq!(
         email_of(&pool, "bob_padded").await,
         "\u{00A0}dave@corp.com",
-        "step 2's whitespace normalization must have rolled back too"
+        "step 2's whitespace normalization must have rolled back too — see \
+         migration_applies_cleanly_when_there_are_no_collisions for the proof that step 2 \
+         does anything at all when the migration is allowed to complete (on its own this \
+         assertion cannot distinguish 'rolled back' from 'never ran')"
     );
 
     let total: (i64,) = sqlx::query_as("SELECT count(*) FROM users")
@@ -871,7 +1073,18 @@ async fn migration_applies_once_the_operator_has_resolved_the_collision() {
     seed(&pool, "bob", "bob@corp.com", "2026-01-01T00:00:00Z").await;
     seed(&pool, "squatter", "BOB@corp.com", "2026-02-01T00:00:00Z").await;
 
-    assert!(pool.execute(MIGRATION_SQL).await.is_err(), "refused first");
+    // Assert the NAMED diagnostic, not merely `is_err()`. A blind audit disabled the guard
+    // entirely and this test stayed green — the duplicate-key error from CREATE UNIQUE INDEX
+    // satisfied `is_err()` just as well, so the test could not tell "refused deliberately"
+    // from "crashed on the way past".
+    let err = pool
+        .execute(MIGRATION_SQL)
+        .await
+        .expect_err("refused first");
+    assert!(
+        format!("{err}").contains("MIGRATION 202609050010 STOPPED"),
+        "the first run must fail with the migration's OWN diagnostic; got: {err}"
+    );
 
     // The operator adjudicates — exactly the action the HINT describes.
     sqlx::query("UPDATE users SET email = 'squatter@corp.com' WHERE username = 'squatter'")
@@ -913,6 +1126,61 @@ async fn migration_refuses_a_whitespace_padded_twin_as_a_collision() {
 
     // Rolled back, including the trim.
     assert_eq!(email_of(&pool, "bob_padded").await, "\u{00A0}bob@corp.com");
+
+    drop_db(&db).await;
+}
+
+// TEST-25 (issue #251) — the single enforcement statement cannot silently not-enforce.
+/// `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME ONLY.
+///
+/// A blind audit pre-created a NON-unique index of that name, ran the migration, watched it
+/// report SUCCESS, and then inserted `bob@corp.com` and `BOB@corp.com` side by side — the
+/// entire bypass, reopened by a migration that claimed to have closed it. Every other
+/// invariant in the file is machine-checked; this one was not.
+#[tokio::test]
+async fn migration_refuses_when_a_same_named_index_is_not_unique() {
+    let (pool, db) = fresh_db().await;
+    rewind_to_pre_migration(&pool).await;
+
+    // The landmine: right name, wrong uniqueness.
+    pool.execute(
+        "CREATE INDEX users_email_lower_unique_idx ON public.users (lower(email));",
+    )
+    .await
+    .expect("pre-create a non-unique index of the same name");
+
+    let err = pool
+        .execute(MIGRATION_SQL)
+        .await
+        .expect_err("the migration must refuse rather than report success without enforcing");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("MIGRATION 202609050010 STOPPED") && msg.contains("NOT UNIQUE"),
+        "the refusal must name the non-unique index specifically; got: {msg}"
+    );
+
+    // And it rolled back, so nothing half-applied.
+    let old: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pg_constraint WHERE conname = 'users_email_key'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(old.0, 1, "the pre-existing constraint survives the rollback");
+
+    // POSITIVE CONTROL — drop the landmine and the migration applies and DOES enforce.
+    pool.execute("DROP INDEX users_email_lower_unique_idx;")
+        .await
+        .expect("drop the landmine");
+    pool.execute(MIGRATION_SQL)
+        .await
+        .expect("with the landmine gone the migration applies");
+    assert_fixed_schema(&pool).await;
+    raw_insert(&pool, "bob", "bob@corp.com").await.expect("first");
+    assert!(
+        raw_insert(&pool, "bob2", "BOB@corp.com").await.is_err(),
+        "and uniqueness is genuinely enforced, not merely named"
+    );
 
     drop_db(&db).await;
 }

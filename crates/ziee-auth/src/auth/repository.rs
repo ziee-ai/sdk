@@ -426,7 +426,32 @@ impl AuthRepository {
         )
         .fetch_one(&mut *tx)
         .await
-        .map_err(AppError::database_error)?;
+        // A duplicate username/email must surface as 409, not a generic 500 — the mapping
+        // its two sibling creators have always had and this one did not.
+        //
+        // #251 made it reachable, so it is no longer academic: `find_user_by_email_for_linking`
+        // filters `is_active = true`, so when a DEACTIVATED local account holds the address
+        // the First-Broker-Login branch is skipped and the callback falls through to HERE —
+        // where `users_email_lower_unique_idx` now rejects any CASE or WHITESPACE variant,
+        // not just a byte-identical address. A blind audit reproduced the result: a
+        // `500 SYSTEM_DATABASE_ERROR` on an unauthenticated OAuth callback.
+        //
+        // The 409 is deliberately the SAME shape the active-external-account collision
+        // already returns from the callback, so the two are not distinguishable: a 500 here
+        // versus a successful signup was an existence oracle for deactivated accounts, which
+        // is the very signal the `is_active` filter above exists to suppress.
+        .map_err(|e| {
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.is_unique_violation()
+            {
+                return AppError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    "EMAIL_TAKEN_BY_EXTERNAL_ACCOUNT",
+                    "An account with this email already exists via another login method. Sign in with that method instead.",
+                );
+            }
+            AppError::database_error(e)
+        })?;
 
         sqlx::query!(
             r#"
