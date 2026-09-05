@@ -188,31 +188,48 @@ impl UserRepository {
     /// case-sensitive UNIQUE constraint and matching usernames more loosely than the
     /// constraint enforces would let one identifier resolve to a row it does not name.
     ///
-    /// # Why the ORDER BY is not decoration
+    /// # An AMBIGUOUS identifier resolves to NOBODY, and that is the whole point
     ///
-    /// `username` and `email` are separately unique but NOT disjoint: `validate_username`
+    /// `username` and `email` are separately unique but NOT disjoint. `validate_username`
     /// permits `@` and `.`, and registration imposes no `@` requirement on the email field,
-    /// so one identifier string can match a username on one row AND an email on another.
-    /// The predicate then returns TWO rows and `fetch_optional` silently keeps whichever the
-    /// planner produced first — meaning which principal the login boundary resolves to was
-    /// arbitrary. An attacker could exploit that deliberately: register with `email` set to
-    /// a victim's `username`, and the victim's own correct password gets verified against
-    /// the attacker's hash. A targeted, unauthenticated authentication denial-of-service.
+    /// so ONE identifier string can match a username on one row and an email on another.
+    /// Both directions are reachable by an unauthenticated attacker:
     ///
-    /// The ambiguity predates #251 (the byte-exact `OR email = $1` had the same shape), but
-    /// case-insensitivity strictly WIDENS the set of colliding spellings, so it is resolved
-    /// here rather than inherited: **an exact username match always wins**, then the oldest
-    /// row, then by id. Deterministic, and the reading a user typing their username expects.
-    /// `LIMIT 1` states the single-row intent that `fetch_optional` only implied.
+    /// * register `email` = a victim's USERNAME; or
+    /// * register `username` = a victim's EMAIL.
     ///
-    /// This makes the resolution well-defined; it does not make the collision *impossible*.
-    /// Refusing such a username at registration is the real fix and is tracked separately.
+    /// Whichever row this function then returns, the caller bcrypt-verifies the submitted
+    /// password against THAT row's hash. So if the attacker's row can win, the victim's own
+    /// correct credentials are checked against an attacker-chosen hash — a targeted,
+    /// unauthenticated authentication denial.
+    ///
+    /// **There is no safe way to PICK.** A previous revision ordered by
+    /// `(username = $1) DESC` on the reasoning that an exact username match is what a user
+    /// typing their username expects. A blind audit showed that merely chose which attack to
+    /// enable: it made the mirror direction — attacker registers `username` = victim's email
+    /// — resolve to the attacker DETERMINISTICALLY, upgrading a planner coin-flip into a
+    /// guaranteed hijack of the more guessable identifier. Preferring the email half is
+    /// symmetric and no better. Any total order over the two rows hands one of the two
+    /// attacks a reliable win.
+    ///
+    /// So this **fails closed**: if the identifier matches more than one row, it resolves to
+    /// `None` and the caller sees "no such user". Neither party gains anything, both retain
+    /// their own unambiguous identifier (the victim can always log in with the one the
+    /// attacker did not take), and the attacker's own account becomes equally unreachable by
+    /// that string — the attack is self-defeating rather than profitable.
+    ///
+    /// This makes the collision harmless; it does not make it impossible. Refusing a username
+    /// that collides with an existing address (and vice versa) at REGISTRATION is the real
+    /// fix and is tracked separately — it is a behavioural change to a public route and needs
+    /// a disposition for pre-existing rows, neither of which belongs in a security patch.
     pub async fn get_by_username_or_email(
         &self,
         identifier: &str,
     ) -> Result<Option<User>, AppError> {
         let identifier = crate::auth::email::trim_email_for_lookup(identifier);
-        sqlx::query_as!(
+        // LIMIT 2, not 1: the second row is not wanted, it is the AMBIGUITY DETECTOR. Asking
+        // for one row cannot distinguish "resolves uniquely" from "resolves arbitrarily".
+        let mut matches = sqlx::query_as!(
             User,
             r#"
             SELECT id, username, email, email_verified, password_hash, display_name,
@@ -220,14 +237,26 @@ impl UserRepository {
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
             WHERE username = $1 OR lower(email) = lower($1)
-            ORDER BY (username = $1) DESC, created_at, id
-            LIMIT 1
+            LIMIT 2
             "#,
             identifier
         )
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
-        .map_err(AppError::database_error)
+        .map_err(AppError::database_error)?;
+
+        if matches.len() > 1 {
+            // Deliberately not an error: the caller is an unauthenticated login attempt, and
+            // a distinguishable "that identifier is ambiguous" would confirm to an attacker
+            // that their squat landed. Logged for operators, who can then resolve it.
+            tracing::warn!(
+                "login identifier matches a username on one account and an email on another; \
+                 refusing to guess (issue #251). Resolve the collision to restore that login."
+            );
+            return Ok(None);
+        }
+
+        Ok(matches.pop())
     }
 
     /// List users with pagination

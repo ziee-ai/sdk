@@ -466,33 +466,37 @@ async fn update_trims_and_reports_an_email_collision_as_an_email_collision() {
     drop_db(&db).await;
 }
 
-/// The login resolver must be DETERMINISTIC when one identifier matches two rows.
+/// The login resolver must REFUSE an ambiguous identifier — in BOTH directions.
 ///
-/// `validate_username` permits `@`, and registration imposes no `@` requirement on the email
-/// field, so an attacker can register with `email` set to a victim's `username`. The
-/// predicate then matches two rows and `fetch_optional` keeps whichever the planner produced
-/// first — so the victim's own correct password could be verified against the attacker's
-/// hash. A blind audit reproduced the two-row state; case-insensitivity strictly WIDENS the
-/// set of colliding spellings, so the resolution is pinned here rather than inherited.
+/// # Why this test is shaped the way it is
+///
+/// Its predecessor was proven VACUOUS by two independent blind auditors: it seeded the
+/// victim FIRST, so an unordered sequential scan returned the victim anyway, and it stayed
+/// green with the entire ordering clause deleted — 5/5 and 4/4 runs. It observed seed order,
+/// not the resolver. So here the ATTACKER is seeded first in every arm; if the resolver
+/// stopped refusing and fell back to heap order, the attacker's row would come back and each
+/// assertion would fail.
+///
+/// And it covers BOTH directions, because the previous FIX covered only one. Ordering by
+/// `(username = $1) DESC` fixed "attacker's email shadows victim's username" and made the
+/// mirror — "attacker's username shadows victim's email" — resolve to the attacker
+/// deterministically, which is worse than the coin-flip it replaced: an invite-based product
+/// hands out email addresses, so the email is the more guessable identifier of the two.
 #[tokio::test]
-async fn login_resolver_prefers_an_exact_username_match_over_an_email_match() {
+async fn login_resolver_refuses_an_ambiguous_identifier_in_both_directions() {
     let (pool, db) = fresh_db().await;
     let auth = AuthRepository::new(pool.clone());
     let users = UserRepository::new(pool.clone());
 
-    // The victim, whose USERNAME is the contested identifier.
-    let victim = auth
-        .create_local_user_with_default_group("Admin", "realadmin@corp.com", None, None)
-        .await
-        .expect("victim");
-    // The attacker, whose EMAIL is that same string.
-    let attacker = auth
-        .create_local_user_with_default_group("atk001", "Admin", None, None)
+    // ── Direction 1: the attacker's EMAIL is the victim's USERNAME ───────────────────
+    // Attacker FIRST, so heap order favours them if the refusal is removed.
+    auth.create_local_user_with_default_group("atk001", "Admin", None, None)
         .await
         .expect("attacker");
+    auth.create_local_user_with_default_group("Admin", "realadmin@corp.com", None, None)
+        .await
+        .expect("victim");
 
-    // Both rows genuinely match the predicate — this is the ambiguous state, not a
-    // hypothetical one.
     let matches: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM users WHERE username = $1 OR lower(email) = lower($1)",
     )
@@ -502,29 +506,140 @@ async fn login_resolver_prefers_an_exact_username_match_over_an_email_match() {
     .expect("count matches");
     assert_eq!(matches.0, 2, "the seeded state must actually be ambiguous");
 
-    let resolved = users
-        .get_by_username_or_email("Admin")
-        .await
-        .expect("query ok")
-        .expect("resolves");
-    assert_eq!(
-        resolved.id, victim.id,
-        "an EXACT USERNAME match must win — otherwise an attacker can make a victim's login \
-         identifier resolve to the attacker's row, and the victim's correct password is \
-         checked against the wrong hash"
-    );
-    assert_ne!(resolved.id, attacker.id);
-
-    // The attacker can still reach their own account by their own username.
-    assert_eq!(
+    assert!(
         users
-            .get_by_username_or_email("atk001")
+            .get_by_username_or_email("Admin")
             .await
             .expect("query ok")
-            .expect("resolves")
-            .id,
-        attacker.id
+            .is_none(),
+        "an AMBIGUOUS identifier must resolve to NOBODY. Any total order over the two rows \
+         hands one of the two attacks a reliable win — the caller bcrypt-verifies the \
+         submitted password against whichever row comes back, so a victim's correct \
+         password would be checked against an attacker-chosen hash."
     );
+
+    // ── Direction 2: the attacker's USERNAME is the victim's EMAIL ───────────────────
+    // This is the direction the previous fix made WORSE. Attacker seeded first again.
+    auth.create_local_user_with_default_group("bob@corp.com", "atk@evil.test", None, None)
+        .await
+        .expect("attacker 2");
+    let victim2 = auth
+        .create_local_user_with_default_group("victim2", "bob@corp.com", None, None)
+        .await
+        .expect("victim 2");
+
+    assert!(
+        users
+            .get_by_username_or_email("bob@corp.com")
+            .await
+            .expect("query ok")
+            .is_none(),
+        "the MIRROR direction must be refused too — an ordering that prefers the exact \
+         username match resolves this to the attacker deterministically"
+    );
+    // A CASE VARIANT of that same identifier is NOT ambiguous, and resolves to the victim —
+    // because the username half stays byte-exact while the email half folds case, so
+    // `BOB@CORP.COM` matches only the email. Worth pinning: it means the attacker's squatted
+    // username cannot be reached through a case variant, and the genuine email holder can
+    // still log in with any casing of their own address.
+    assert_eq!(
+        users
+            .get_by_username_or_email("BOB@CORP.COM")
+            .await
+            .expect("query ok")
+            .expect("a case variant matches only the email, so it is unambiguous")
+            .id,
+        victim2.id
+    );
+
+    // ── POSITIVE CONTROLS — the refusal is scoped to the ambiguity, not to logins ────
+    // Without these, `is_none()` above would pass just as well against a resolver that
+    // returns None for everything.
+    assert_eq!(
+        users
+            .get_by_username_or_email("victim2")
+            .await
+            .expect("query ok")
+            .expect("an UNAMBIGUOUS username still resolves")
+            .id,
+        victim2.id,
+        "each party keeps the identifier the other did not take — the victim can always log \
+         in with their username, so the squat is a nuisance, not a lockout"
+    );
+    assert_eq!(
+        users
+            .get_by_username_or_email("realadmin@corp.com")
+            .await
+            .expect("query ok")
+            .expect("an UNAMBIGUOUS email still resolves")
+            .username,
+        "Admin"
+    );
+    assert_eq!(
+        users
+            .get_by_username_or_email("REALADMIN@CORP.COM")
+            .await
+            .expect("query ok")
+            .expect("and still case-insensitively — #251 must not be undone by the refusal")
+            .username,
+        "Admin"
+    );
+
+    drop_db(&db).await;
+}
+
+/// The ledger is APPEND-ONLY: a user parked twice gets two records.
+///
+/// A blind audit reproduced the loss: with `user_id` as the primary key and
+/// `ON CONFLICT (user_id) DO NOTHING`, the second parking was silently dropped, the ledger
+/// kept asserting a stale original, and following the table comment's reinstatement recipe
+/// restored a DIFFERENT PERSON'S address. The sequence is reachable because an operator
+/// reinstates a parked user under a corrected address, which can collide again later.
+#[tokio::test]
+async fn collision_ledger_is_append_only_across_repeated_parkings() {
+    let (pool, db) = fresh_db().await;
+    rewind_to_pre_migration(&pool).await;
+
+    seed(&pool, "vera", "VERA@corp.com", "2026-01-01T00:00:00Z", false, false).await;
+    seed(&pool, "other", "vera@corp.com", "2026-02-01T00:00:00Z", false, true).await;
+
+    pool.execute(MIGRATION_SQL).await.expect("first apply");
+    let first: (String,) = sqlx::query_as(
+        "SELECT l.original_email FROM users_email_collision_log l \
+           JOIN users u ON u.id = l.user_id WHERE u.username = 'vera'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("first ledger row");
+    assert_eq!(first.0, "VERA@corp.com");
+
+    // The operator reinstates vera under a CORRECTED address...
+    sqlx::query("UPDATE users SET email = 'Vera.Real@corp.com' WHERE username = 'vera'")
+        .execute(&pool)
+        .await
+        .expect("reinstate");
+    // ...which a later account then collides with.
+    rewind_to_pre_migration(&pool).await;
+    seed(&pool, "later", "vera.real@corp.com", "2026-03-01T00:00:00Z", false, true).await;
+    pool.execute(MIGRATION_SQL).await.expect("second apply");
+
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT l.original_email FROM users_email_collision_log l \
+           JOIN users u ON u.id = l.user_id WHERE u.username = 'vera' \
+          ORDER BY l.detected_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("ledger rows");
+    let rows: Vec<String> = rows.into_iter().map(|r| r.0).collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "BOTH parkings must be recorded — a ledger that drops the second one destroys \
+         `Vera.Real@corp.com` entirely while still claiming vera's original was \
+         `VERA@corp.com`, which is a different person's mailbox"
+    );
+    assert_eq!(rows, vec!["VERA@corp.com".to_string(), "Vera.Real@corp.com".to_string()]);
 
     drop_db(&db).await;
 }
@@ -601,10 +716,12 @@ async fn oauth_linking_lookup_resolves_case_and_whitespace_variants() {
 /// actually be built: drop the case-insensitive index, the trim CHECK and the ledger, and
 /// restore the case-SENSITIVE constraint that let the two principals coexist.
 async fn rewind_to_pre_migration(pool: &PgPool) {
+    // Deliberately does NOT drop `users_email_collision_log`: it is an APPEND-ONLY ledger
+    // that must outlive a re-apply, and dropping it here would hide exactly the record-loss
+    // that `collision_ledger_is_append_only_across_repeated_parkings` exists to catch.
     pool.execute(
         "DROP INDEX IF EXISTS users_email_lower_unique_idx; \
          ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_trimmed; \
-         DROP TABLE IF EXISTS users_email_collision_log; \
          ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);",
     )
     .await
@@ -645,7 +762,13 @@ async fn seed(
 }
 
 /// Nothing is deactivated, nothing is deleted, and every parked address is recoverable.
-async fn assert_non_destructive(pool: &PgPool, expected_rows: i64) {
+///
+/// Strengthened after a blind audit proved the first version vacuous: it JOINed FROM the
+/// ledger, so it was trivially true on an EMPTY ledger, and three of the four migration
+/// tests stayed GREEN with the ledger writes deleted entirely. The count equality below is
+/// what closes that — it fails if a parked row has no ledger record, which is exactly the
+/// direction the old form declined to check.
+async fn assert_non_destructive(pool: &PgPool, expected_rows: i64, expected_parked: i64) {
     let total: (i64,) = sqlx::query_as("SELECT count(*) FROM users")
         .fetch_one(pool)
         .await
@@ -663,15 +786,30 @@ async fn assert_non_destructive(pool: &PgPool, expected_rows: i64) {
          disable an innocent bystander"
     );
 
-    // Every ledger row still describes the user it names: the parked address is what the row
-    // actually holds, and the original is preserved verbatim beside it. That is what makes
-    // the resolution reversible — a RAISE NOTICE is not a record, because Postgres does not
-    // write NOTICE to the server log at the default `log_min_messages = WARNING`.
-    //
-    // Deliberately NOT asserted the other way round (every `dup.…@invalid` address is
-    // logged): an address that merely LOOKS like a parking target can be a bystander's real
-    // address, and `migration_converges_even_when_a_row_already_holds_a_parking_shaped_address`
-    // seeds exactly that row.
+    // EVERY parked row has a ledger record, and every ledger record describes the row it
+    // names. Both directions, by count — an empty ledger fails this.
+    let parked: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM users WHERE email ~ '^dup\\.[0-9a-f-]{36}\\.[0-9a-f-]{36}@invalid$'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count parked");
+    assert_eq!(
+        parked.0, expected_parked,
+        "exactly {expected_parked} address(es) should have been parked"
+    );
+
+    let logged: (i64,) = sqlx::query_as("SELECT count(*) FROM users_email_collision_log")
+        .fetch_one(pool)
+        .await
+        .expect("count ledger");
+    assert_eq!(
+        logged.0, expected_parked,
+        "the ledger must hold exactly one record per parking — a RAISE NOTICE is not a \
+         record (Postgres does not write NOTICE to the server log at the default \
+         log_min_messages), so if this is short the original address is simply gone"
+    );
+
     let stale: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM users_email_collision_log l \
            JOIN users u ON u.id = l.user_id \
@@ -682,56 +820,113 @@ async fn assert_non_destructive(pool: &PgPool, expected_rows: i64) {
     .expect("count stale ledger rows");
     assert_eq!(
         stale.0, 0,
-        "every users_email_collision_log row must name the address the user now holds and \
-         a DIFFERENT original — otherwise the ledger cannot reinstate anything"
+        "every ledger row must name the address the user now holds and a DIFFERENT \
+         original — otherwise the ledger cannot reinstate anything"
     );
 }
 
+/// The schema this migration is supposed to leave behind, asserted in one place.
+async fn assert_fixed_schema(pool: &PgPool) {
+    let unique: (bool,) = sqlx::query_as(
+        "SELECT i.indisunique FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid \
+         WHERE c.relname = 'users_email_lower_unique_idx'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("users_email_lower_unique_idx must exist");
+    assert!(unique.0, "and must be UNIQUE");
+
+    // The byte-identical non-unique duplicate created by 202607140050 must be GONE, or every
+    // users write maintains two identical btrees.
+    let redundant: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pg_indexes WHERE indexname = 'idx_users_lower_email'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count redundant index");
+    assert_eq!(redundant.0, 0, "the redundant idx_users_lower_email must be dropped");
+
+    let old: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pg_constraint WHERE conname = 'users_email_key'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count old constraint");
+    assert_eq!(old.0, 0, "the case-sensitive users_email_key must be gone");
+}
+
+/// `decided_by_evidence` for a seeded username's most recent parking.
+async fn parked_verdict(pool: &PgPool, username: &str) -> bool {
+    sqlx::query_as::<_, (bool,)>(
+        "SELECT l.decided_by_evidence FROM users_email_collision_log l \
+           JOIN users u ON u.id = l.user_id WHERE u.username = $1 \
+          ORDER BY l.detected_at DESC LIMIT 1",
+    )
+    .bind(username)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("ledger verdict for {username}: {e}"))
+    .0
+}
+
+/// NO EVIDENCE ⇒ NOBODY WINS. This is the case the two earlier versions got wrong.
+///
+/// Registration is open and unverified, so in the common collision nothing distinguishes the
+/// two accounts: neither is an admin, neither has a verified address, both are active. v1 and
+/// v2 of this migration both fell through to `created_at` there — and since the squatter in
+/// the #251 attack registers FIRST, that awarded the contested mailbox to the ATTACKER, which
+/// the new unique index then made permanent (the victim could not take it back through any
+/// route). Registration order is not evidence, so it no longer decides: every address in the
+/// group is parked and the ledger flags it for review.
 #[tokio::test]
-async fn migration_resolves_preexisting_collisions_without_failing() {
+async fn migration_awards_nothing_when_no_evidence_separates_the_colliders() {
     let (pool, db) = fresh_db().await;
     rewind_to_pre_migration(&pool).await;
 
-    // The exact artifact of the defect: three rows, one mailbox.
-    seed(&pool, "bob", "bob@corp.com", "2026-01-01T00:00:00Z", false, false).await;
-    seed(&pool, "bob_variant", "BOB@corp.com", "2026-02-01T00:00:00Z", false, false).await;
-    seed(&pool, "bob_padded", "\u{00A0}bob@corp.com", "2026-03-01T00:00:00Z", false, false).await;
-    // A bystander who must be left completely alone.
+    // The squatter registers FIRST, off a leaked invite link. The genuine invitee follows.
+    seed(&pool, "squatter", "BOB@corp.com", "2026-01-01T00:00:00Z", false, false).await;
+    seed(&pool, "bob", "bob@corp.com", "2026-02-01T00:00:00Z", false, false).await;
     seed(&pool, "carol", "carol@corp.com", "2026-01-15T00:00:00Z", false, false).await;
 
-    // Re-apply the migration over that state. It MUST succeed — a migration that fails at
-    // deploy on data the bug itself created is not a resolution.
     pool.execute(MIGRATION_SQL)
         .await
-        .expect("202609050010 must APPLY over pre-existing collisions, not fail at deploy");
+        .expect("202609050010 must APPLY, not fail at deploy");
 
-    // With no admin and no verified address, registration order is the only tiebreak left.
-    let winner = row_of(&pool, "bob").await;
-    assert_eq!(winner.0, "bob@corp.com", "the earliest row keeps the address");
-    assert!(winner.1, "and stays active");
+    // NEITHER holds the mailbox.
+    let held: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM users WHERE lower(email) = 'bob@corp.com'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count holders");
+    assert_eq!(
+        held.0, 0,
+        "with nothing to tell the two accounts apart, the migration must award the mailbox \
+         to NEITHER — awarding it on registration order hands the squatter a binding the \
+         new unique index then protects, and the victim cannot reclaim it"
+    );
 
-    for username in ["bob_variant", "bob_padded"] {
-        let loser = row_of(&pool, username).await;
+    for username in ["squatter", "bob"] {
+        let row = row_of(&pool, username).await;
+        assert!(row.0.ends_with("@invalid"), "{username} is parked");
+        assert!(row.1, "{username} keeps their account");
         assert!(
-            loser.0.starts_with("dup.") && loser.0.ends_with("@invalid"),
-            "{username} must be PARKED to the reserved form, got {:?}",
-            loser.0
-        );
-        assert!(
-            loser.1,
-            "{username} must stay ACTIVE — losing the address must not lose the account"
+            !parked_verdict(&pool, username).await,
+            "{username}'s ledger row must be flagged decided_by_evidence = false — it is \
+             the flag telling an operator a human must adjudicate this group"
         );
     }
 
+    // The bystander is untouched, so the resolution is scoped to the collision.
     let bystander = row_of(&pool, "carol").await;
     assert_eq!(bystander.0, "carol@corp.com");
     assert!(bystander.1);
 
-    assert_non_destructive(&pool, 4).await;
+    assert_non_destructive(&pool, 3, 2).await;
+    assert_fixed_schema(&pool).await;
 
-    // The originals are recoverable, verbatim, including the whitespace-normalized one.
-    // Ordered by the C collation, not the cluster's: en_US sorts case-insensitively, which
-    // would make this assertion's expected order depend on the deployment's locale.
+    // Both originals are recoverable, verbatim. Ordered by the C collation, not the
+    // cluster's: en_US sorts case-insensitively, which would make this depend on the locale.
     let originals: Vec<(String,)> = sqlx::query_as(
         "SELECT original_email FROM users_email_collision_log \
           ORDER BY original_email COLLATE \"C\"",
@@ -739,29 +934,61 @@ async fn migration_resolves_preexisting_collisions_without_failing() {
     .fetch_all(&pool)
     .await
     .expect("read the ledger");
-    let originals: Vec<String> = originals.into_iter().map(|r| r.0).collect();
     assert_eq!(
-        originals,
-        vec!["BOB@corp.com".to_string(), "bob@corp.com".to_string()],
-        "both parked originals are recorded VERBATIM (the padded row was whitespace-\
-         normalized to `bob@corp.com` by step 2 before being parked, so that is what the \
-         ledger holds for it)"
+        originals.into_iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec!["BOB@corp.com".to_string(), "bob@corp.com".to_string()]
     );
 
-    // And the schema ends up in the fixed shape regardless.
-    let unique: (bool,) = sqlx::query_as(
-        "SELECT i.indisunique FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid \
-         WHERE c.relname = 'users_email_lower_unique_idx'",
+    // Parking BOTH frees the mailbox — which is the intended outcome: nobody was awarded it,
+    // so it is available for whoever the operator decides owns it. What must NOT be possible
+    // is the collision itself recurring, so claim it once and assert the variant is then
+    // refused. (Asserting the first claim fails would be asserting the old, wrong semantics.)
+    raw_insert(&pool, "bob_reinstated", "bob@corp.com")
+        .await
+        .expect("the freed mailbox can be claimed once");
+    assert!(
+        raw_insert(&pool, "bob_again", "BOB@CORP.COM").await.is_err(),
+        "and the collision must then be unrecreatable — the index is doing its job"
+    );
+
+    drop_db(&db).await;
+}
+
+/// Whitespace normalization (step 2) feeds the collision pass (step 4): a padded twin must
+/// collide with its unpadded original rather than survive as a second principal.
+#[tokio::test]
+async fn migration_resolves_a_whitespace_padded_twin_as_a_collision() {
+    let (pool, db) = fresh_db().await;
+    rewind_to_pre_migration(&pool).await;
+
+    // The verified account is the evidenced winner, so this also exercises the decided branch.
+    seed(&pool, "bob", "bob@corp.com", "2026-01-01T00:00:00Z", false, true).await;
+    seed(&pool, "bob_padded", "\u{00A0}bob@corp.com", "2026-03-01T00:00:00Z", false, false).await;
+
+    pool.execute(MIGRATION_SQL).await.expect("must apply");
+
+    let winner = row_of(&pool, "bob").await;
+    assert_eq!(winner.0, "bob@corp.com", "the verified account keeps the address");
+    let loser = row_of(&pool, "bob_padded").await;
+    assert!(loser.0.ends_with("@invalid"), "the padded twin is parked");
+    assert!(
+        parked_verdict(&pool, "bob_padded").await,
+        "this parking WAS decided by evidence (email_verified), so the ledger must not flag \
+         it for adjudication"
+    );
+
+    // The ledger holds the WHITESPACE-NORMALIZED original, because step 2 ran first.
+    let original: (String,) = sqlx::query_as(
+        "SELECT l.original_email FROM users_email_collision_log l \
+           JOIN users u ON u.id = l.user_id WHERE u.username = 'bob_padded'",
     )
     .fetch_one(&pool)
     .await
-    .expect("the unique index exists after the resolution");
-    assert!(unique.0);
-    assert!(
-        raw_insert(&pool, "bob_again", "BOB@CORP.COM").await.is_err(),
-        "after the migration the collision must be unrecreatable"
-    );
+    .expect("ledger row");
+    assert_eq!(original.0, "bob@corp.com");
 
+    assert_non_destructive(&pool, 2, 1).await;
+    assert_fixed_schema(&pool).await;
     drop_db(&db).await;
 }
 
@@ -801,7 +1028,13 @@ async fn migration_never_parks_the_admin_even_when_the_squatter_registered_first
     let squatter = row_of(&pool, "squatter").await;
     assert!(squatter.0.ends_with("@invalid"), "the squatter is parked");
     assert!(squatter.1, "but keeps their account");
-    assert_non_destructive(&pool, 2).await;
+    assert_non_destructive(&pool, 2, 1).await;
+    assert_fixed_schema(&pool).await;
+    assert!(
+        parked_verdict(&pool, "squatter").await,
+        "this parking was decided by EVIDENCE (is_admin), so it must not be flagged for \\
+         adjudication"
+    );
 
     drop_db(&db).await;
 }
@@ -828,7 +1061,55 @@ async fn migration_prefers_the_verified_address_over_the_earlier_one() {
     );
     let squatter = row_of(&pool, "squatter").await;
     assert!(squatter.0.ends_with("@invalid"));
-    assert_non_destructive(&pool, 2).await;
+    assert!(parked_verdict(&pool, "squatter").await, "decided by evidence");
+    assert_non_destructive(&pool, 2, 1).await;
+    assert_fixed_schema(&pool).await;
+
+    drop_db(&db).await;
+}
+
+/// `is_active` is part of the evidence, so a DEACTIVATED account cannot outrank a live one.
+///
+/// An earlier ranking omitted it, and an audit reproduced the consequence: a BANNED squatter
+/// that registered first kept the mailbox while the active legitimate account was parked.
+/// Being disabled is at least as strong an anti-signal as registration order is a signal.
+#[tokio::test]
+async fn migration_does_not_let_a_deactivated_account_outrank_a_live_one() {
+    let (pool, db) = fresh_db().await;
+    rewind_to_pre_migration(&pool).await;
+
+    seed(&pool, "banned", "BOB@corp.com", "2026-01-01T00:00:00Z", false, false).await;
+    sqlx::query("UPDATE users SET is_active = false WHERE username = 'banned'")
+        .execute(&pool)
+        .await
+        .expect("ban the squatter");
+    seed(&pool, "legit", "bob@corp.com", "2026-02-01T00:00:00Z", false, false).await;
+
+    pool.execute(MIGRATION_SQL).await.expect("must apply");
+
+    let legit = row_of(&pool, "legit").await;
+    assert_eq!(
+        legit.0, "bob@corp.com",
+        "the ACTIVE account keeps the address even though the banned one registered first"
+    );
+    assert!(legit.1);
+    let banned = row_of(&pool, "banned").await;
+    assert!(banned.0.ends_with("@invalid"), "the banned squatter is parked");
+    assert!(
+        parked_verdict(&pool, "banned").await,
+        "is_active uniquely separated them, so this parking WAS decided by evidence"
+    );
+    assert!(!banned.1, "and the migration did not reactivate it either");
+
+    // `assert_non_destructive` deliberately not used here: it asserts nobody is deactivated,
+    // and this fixture starts with a legitimately deactivated user. The properties that
+    // matter are asserted directly instead.
+    let total: (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(total.0, 2, "nothing deleted");
+    assert_fixed_schema(&pool).await;
 
     drop_db(&db).await;
 }
@@ -875,7 +1156,9 @@ async fn migration_converges_even_when_a_row_already_holds_a_parking_shaped_addr
         "a bystander whose address merely LOOKS like a parking target must be untouched"
     );
     assert!(landmine.1);
-    assert_non_destructive(&pool, 3).await;
+    // No evidence separates bob from victim, so BOTH are parked: 2 parkings, 3 rows.
+    assert_non_destructive(&pool, 3, 2).await;
+    assert_fixed_schema(&pool).await;
 
     drop_db(&db).await;
 }
