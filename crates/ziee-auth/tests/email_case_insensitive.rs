@@ -751,17 +751,63 @@ async fn oauth_provisioning_over_a_deactivated_holder_is_a_clean_conflict_not_a_
             )
             .await
             .expect_err("the address is taken, so provisioning must be refused");
+
+        // Assert the STATUS, through the exact conversion the handler uses.
+        //
+        // A first version only grepped `{err:?}` for the error_code, and two auditors proved
+        // that could not see the defect it was written for: mutating the mapped status from
+        // CONFLICT to OK left the whole suite green, and — worse — the shipped handler was
+        // separately overwriting the 409 with a hardcoded 500, so the test was green while
+        // the HTTP response still said "server broke" and the BODY newly confirmed the
+        // address was taken. Going through `to_api_error` is what ties this assertion to the
+        // wire status rather than to a string.
+        let (status, err) = err.to_api_error();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "the refusal must reach the wire as the SAME 409 the ACTIVE-account collision \
+             returns — a 500 is opaque, and a 500 carrying an 'email already exists' body is \
+             an existence oracle for deactivated accounts, which is the signal the is_active \
+             filter exists to suppress"
+        );
         let msg = format!("{err:?}");
         assert!(
             msg.contains("EMAIL_TAKEN_BY_EXTERNAL_ACCOUNT"),
-            "the refusal must be the same 409 the ACTIVE-account collision returns — a 500 \
-             is both opaque and an existence oracle for deactivated accounts; got: {msg}"
+            "and must carry the same error code; got: {msg}"
         );
         assert!(
             !msg.contains("SYSTEM_DATABASE_ERROR"),
             "and must not be a raw database error; got: {msg}"
         );
     }
+
+    // NEGATIVE CONTROL — a USERNAME collision on a completely FREE address must NOT be
+    // reported as "an account with this email already exists".
+    //
+    // `is_unique_violation()` alone is not email-specific: this INSERT writes `username` too,
+    // and `ensure_unique_username` pre-checks outside the transaction, so a concurrent
+    // provision losing that race hit the same arm. An auditor reproduced the result — a user
+    // told to sign in with a login method that does not exist, for an address nobody holds.
+    // This control also kills the broader mutation (mapping EVERY database error to
+    // "email taken"), which the success path alone could not see.
+    let dup_username = auth
+        .provision_external_user_atomic(
+            "bob", // already taken by the local user above
+            Some("totally.free@elsewhere.test"),
+            true,
+            "Ext",
+            provider_id(),
+            "ext-dupname",
+            None,
+        )
+        .await
+        .expect_err("a duplicate username must still be refused");
+    let dup_msg = format!("{dup_username:?}");
+    assert!(
+        !dup_msg.contains("EMAIL_TAKEN_BY_EXTERNAL_ACCOUNT"),
+        "a USERNAME collision must not claim the EMAIL is taken — the address \
+         totally.free@elsewhere.test is not registered at all; got: {dup_msg}"
+    );
 
     // POSITIVE CONTROL — provisioning a genuinely free address still works, so the refusals
     // above are specific to the collision and not to provisioning being broken.
@@ -870,7 +916,8 @@ async fn rewind_to_pre_migration(pool: &PgPool) {
     pool.execute(
         "DROP INDEX IF EXISTS users_email_lower_unique_idx; \
          ALTER TABLE users DROP CONSTRAINT IF EXISTS users_email_trimmed; \
-         ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email);",
+         ALTER TABLE users ADD CONSTRAINT users_email_key UNIQUE (email); \
+         CREATE INDEX IF NOT EXISTS idx_users_lower_email ON public.users (lower(email));",
     )
     .await
     .expect("rewind to the pre-migration schema");
@@ -1131,59 +1178,161 @@ async fn migration_refuses_a_whitespace_padded_twin_as_a_collision() {
 }
 
 // TEST-25 (issue #251) — the single enforcement statement cannot silently not-enforce.
-/// `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME ONLY.
+/// `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME ONLY, and the name is the one thing a
+/// landmine controls.
 ///
-/// A blind audit pre-created a NON-unique index of that name, ran the migration, watched it
-/// report SUCCESS, and then inserted `bob@corp.com` and `BOB@corp.com` side by side — the
-/// entire bypass, reopened by a migration that claimed to have closed it. Every other
-/// invariant in the file is machine-checked; this one was not.
+/// A first version of this test seeded ONE landmine — a non-unique index on the right
+/// expression — which is exactly the predicate the first version of the guard checked. It
+/// therefore MIRRORED THE IMPLEMENTATION and was structurally blind to the guard's
+/// incompleteness: a later audit walked through that guard four ways and this test stayed
+/// green through all of them, while the migration committed with the bypass wide open. A test
+/// whose shape is copied from the guard cannot find the guard's gaps.
+///
+/// So the landmines below are shapes the guard does NOT name: right name but unique on the
+/// wrong COLUMN, right name but PARTIAL, right name but byte-exact on `email` (the shape an
+/// operator hand-rolling the fix produces). Each must be refused, each must leave the schema
+/// untouched, and each must apply-and-enforce once the impostor is gone.
 #[tokio::test]
-async fn migration_refuses_when_a_same_named_index_is_not_unique() {
+async fn migration_refuses_every_impostor_index_shape() {
+    for (label, landmine) in [
+        (
+            "non-unique on the right expression",
+            "CREATE INDEX users_email_lower_unique_idx ON public.users (lower(email));",
+        ),
+        (
+            "unique but on the wrong column",
+            "CREATE UNIQUE INDEX users_email_lower_unique_idx ON public.users (username);",
+        ),
+        (
+            "unique on the right expression but PARTIAL",
+            "CREATE UNIQUE INDEX users_email_lower_unique_idx ON public.users (lower(email)) WHERE is_active;",
+        ),
+        (
+            "unique but byte-exact on email, not lower(email)",
+            "CREATE UNIQUE INDEX users_email_lower_unique_idx ON public.users (email);",
+        ),
+    ] {
+        let (pool, db) = fresh_db().await;
+        rewind_to_pre_migration(&pool).await;
+        pool.execute(landmine)
+            .await
+            .unwrap_or_else(|e| panic!("plant the landmine ({label}): {e}"));
+
+        let err = pool.execute(MIGRATION_SQL).await.expect_err(
+            "the landmine must be REFUSED — otherwise the migration reports success while \
+             case-insensitive uniqueness is not enforced at all",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("MIGRATION 202609050010 STOPPED"),
+            "landmine {label:?} must be REFUSED with the migration's own diagnostic — \
+             otherwise it reports success while case-insensitive uniqueness is not enforced \
+             at all; got: {msg}"
+        );
+
+        // Rolled back completely — every constraint the file touches, not just one.
+        for (what, sql, expected) in [
+            ("users_email_key survives",
+             "SELECT count(*) FROM pg_constraint WHERE conname = 'users_email_key'", 1i64),
+            ("step 4b's DROP rolled back",
+             "SELECT count(*) FROM pg_indexes WHERE indexname = 'idx_users_lower_email'", 1),
+            ("the new CHECK was not added",
+             "SELECT count(*) FROM pg_constraint WHERE conname = 'users_email_trimmed'", 0),
+        ] {
+            let got: (i64,) = sqlx::query_as(sql).fetch_one(&pool).await.expect("count");
+            assert_eq!(got.0, expected, "{label}: {what}");
+        }
+
+        // POSITIVE CONTROL — drop the impostor and the migration applies AND enforces.
+        pool.execute("DROP INDEX users_email_lower_unique_idx;")
+            .await
+            .expect("drop the landmine");
+        pool.execute(MIGRATION_SQL)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: must apply once the impostor is gone: {e}"));
+        assert_fixed_schema(&pool).await;
+        raw_insert(&pool, "bob", "bob@corp.com").await.expect("first");
+        assert!(
+            raw_insert(&pool, "bob2", "BOB@corp.com").await.is_err(),
+            "{label}: and uniqueness is genuinely ENFORCED, not merely named"
+        );
+
+        drop_db(&db).await;
+    }
+}
+
+// TEST-27 (issue #251) — the reported id list is capped, and the remainder counted.
+/// An audit removed the cap outright, and separately made the "and N more" count wrong, and
+/// the suite stayed green both times: no test seeded more than two colliding rows, so neither
+/// the boundary nor the overflow branch was exercised at all.
+#[tokio::test]
+async fn migration_caps_the_reported_id_list_and_counts_the_remainder() {
     let (pool, db) = fresh_db().await;
     rewind_to_pre_migration(&pool).await;
 
-    // The landmine: right name, wrong uniqueness.
-    pool.execute(
-        "CREATE INDEX users_email_lower_unique_idx ON public.users (lower(email));",
-    )
-    .await
-    .expect("pre-create a non-unique index of the same name");
+    // 60 accounts, one mailbox: 50 named, 10 counted.
+    //
+    // Each address must be a DISTINCT byte string (the pre-migration `users_email_key` is
+    // still byte-exact here) that nonetheless folds to the same `lower(email)`. Case-permuting
+    // the six letters of the local part gives 64 distinct spellings of one mailbox — which is
+    // #251's whole point, expressed as a fixture.
+    let local = "bobbie";
+    for n in 0u32..60 {
+        let cased: String = local
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if n >> i & 1 == 1 {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        seed(
+            &pool,
+            &format!("u{n}"),
+            &format!("{cased}@corp.com"),
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+    }
 
     let err = pool
         .execute(MIGRATION_SQL)
         .await
-        .expect_err("the migration must refuse rather than report success without enforcing");
+        .expect_err("60 colliding accounts must be refused");
     let msg = format!("{err}");
+
     assert!(
-        msg.contains("MIGRATION 202609050010 STOPPED") && msg.contains("NOT UNIQUE"),
-        "the refusal must name the non-unique index specifically; got: {msg}"
+        msg.contains("STOPPED: 60 user account(s)"),
+        "the TOTAL must be reported, not the capped count; got: {msg}"
+    );
+    assert!(
+        msg.contains("(and 10 more)"),
+        "and the remainder beyond the cap must be counted correctly (60 - 50); got: {msg}"
     );
 
-    // And it rolled back, so nothing half-applied.
-    let old: (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM pg_constraint WHERE conname = 'users_email_key'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("count");
-    assert_eq!(old.0, 1, "the pre-existing constraint survives the rollback");
-
-    // POSITIVE CONTROL — drop the landmine and the migration applies and DOES enforce.
-    pool.execute("DROP INDEX users_email_lower_unique_idx;")
-        .await
-        .expect("drop the landmine");
-    pool.execute(MIGRATION_SQL)
-        .await
-        .expect("with the landmine gone the migration applies");
-    assert_fixed_schema(&pool).await;
-    raw_insert(&pool, "bob", "bob@corp.com").await.expect("first");
+    // Exactly 50 uuids named: an uncapped list would name all 60, and at ~3.8 MB per 100k
+    // rows an uncapped field is unusable in any error surface.
+    let named: Vec<&str> = msg.matches("-4").collect();
     assert!(
-        raw_insert(&pool, "bob2", "BOB@corp.com").await.is_err(),
-        "and uniqueness is genuinely enforced, not merely named"
+        !msg.contains("(and 0 more)"),
+        "the remainder suffix must be omitted, not rendered as zero; got: {msg}"
+    );
+    let uuid_like = msg
+        .split(|c: char| !c.is_ascii_hexdigit() && c != '-')
+        .filter(|t| t.len() == 36 && t.matches('-').count() == 4)
+        .count();
+    assert_eq!(
+        uuid_like, 50,
+        "exactly 50 ids must be named (saw {uuid_like}; {} uuid-v4 markers) in: {msg}",
+        named.len()
     );
 
     drop_db(&db).await;
 }
+
 
 /// The clean path: no collisions, so the migration applies and leaves the fixed schema.
 /// This is the POSITIVE CONTROL for the three refusal tests above — without it they would

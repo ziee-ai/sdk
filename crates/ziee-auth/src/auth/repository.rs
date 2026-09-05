@@ -441,15 +441,36 @@ impl AuthRepository {
         // versus a successful signup was an existence oracle for deactivated accounts, which
         // is the very signal the `is_active` filter above exists to suppress.
         .map_err(|e| {
+            // Discriminate on the CONSTRAINT, not on the violation class. `is_unique_violation()`
+            // alone was wrong: this INSERT also writes `username`, and `ensure_unique_username`
+            // pre-checks outside the transaction, so a concurrent provision losing that race
+            // was told "an account with this email already exists" about an address that is
+            // completely free — a factually false statement pointing the user at a login
+            // method that does not exist.
             if let sqlx::Error::Database(db_err) = &e
                 && db_err.is_unique_violation()
+                && db_err.constraint() == Some("users_email_lower_unique_idx")
             {
+                // Deliberately byte-identical to the ACTIVE-external-account collision the
+                // callback already returns, so those two cases are indistinguishable.
+                //
+                // Honest scope: this does NOT make a taken address indistinguishable from a
+                // FREE one — a refusal versus a successful signup is inherent to enforcing
+                // uniqueness at all, and pre-#251 the "no signal" alternative was precisely
+                // the duplicate-principal bug. What it does close is the narrower leak that
+                // singled out DEACTIVATED holders (a 500 where an active holder got a 409),
+                // which is the distinction `find_user_by_email_for_linking`'s `is_active`
+                // filter cares about.
                 return AppError::new(
                     axum::http::StatusCode::CONFLICT,
                     "EMAIL_TAKEN_BY_EXTERNAL_ACCOUNT",
                     "An account with this email already exists via another login method. Sign in with that method instead.",
                 );
             }
+            // Everything else keeps `database_error`, which is the ONLY thing that emits the
+            // `tracing::error!(%trace_id, ...)` line and attaches `details.trace_id`. An
+            // earlier version returned before it for every unique violation, leaving the
+            // misattributed username race unlogged and uncorrelatable server-side.
             AppError::database_error(e)
         })?;
 

@@ -1562,7 +1562,13 @@ async fn oauth_complete_inner(
             Some(&auth_result.metadata),
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        // `to_api_error`, NOT a hardcoded 500: `(StatusCode, AppError)` renders with the
+        // TUPLE's status (axum overwrites the body's), so wrapping every error as
+        // INTERNAL_SERVER_ERROR silently discarded the 409 the repository returns for an
+        // address that is already held — the response stayed a 500 while only the JSON
+        // error_code changed, which made the leak WORSE rather than closing it: the body now
+        // confirmed the address was taken while the status still said "server broke".
+        .map_err(AppError::to_api_error)?;
 
     let user = ctx
         .user()

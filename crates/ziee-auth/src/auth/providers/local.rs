@@ -52,10 +52,22 @@ impl LocalAuthProvider {
     ///
     /// #251's fix is unaffected: the invitation binding and registration's collision
     /// pre-check both go through `get_by_email` directly, not through any login resolver.
+    ///
+    /// One property this delegation gives up, stated because it is a real trade and not an
+    /// oversight: the old two-step deterministically preferred the USERNAME row when one row
+    /// matched by username and a different row by email. The shared resolver is a single
+    /// `OR` with `fetch_optional` and no `ORDER BY`, so that choice is planner-dependent —
+    /// which is precisely the pre-#251 behaviour DEC-15 restored, and precisely the
+    /// ambiguity tracked as its own issue. Deterministically preferring the username row is
+    /// NOT the safe direction (it is the direction that lets an attacker registering
+    /// `username` = a victim's email win every time), so restoring it here would reintroduce
+    /// the attack DEC-15 removed. Having ONE resolver, with one known ambiguity, beats two
+    /// resolvers that disagree.
     /// Test seam for the crate-scoped integration suite (TEST-24): the resolver itself is
     /// private, but the property that BOTH local resolvers agree is exactly what needs
     /// asserting, and asserting it through `authenticate` would confound it with password
     /// verification.
+    #[doc(hidden)]
     pub async fn get_user_for_test(&self, username: &str) -> Result<Option<User>, AuthError> {
         self.get_user(username).await
     }

@@ -264,26 +264,54 @@ $$;
 CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx
     ON public.users (lower(email));
 
---    ...and PROVE it is unique. `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME ONLY, so
---    a pre-existing NON-unique index of this name makes the statement a silent no-op: an
---    audit pre-created one, ran this migration, watched it report SUCCESS, and then inserted
---    `bob@corp.com` and `BOB@corp.com` side by side. That is the whole bypass, reopened by a
---    migration that claims to have closed it. This is the single enforcement statement in the
---    file; it is the one that must not be able to quietly not-enforce.
+--    ...and PROVE the PROPERTY, not the name.
+--
+--    `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME ONLY, so a pre-existing index of
+--    this name makes the statement a silent no-op: an audit pre-created one, ran this
+--    migration, watched it report SUCCESS, and then inserted `bob@corp.com` and
+--    `BOB@corp.com` side by side. That is the whole bypass, reopened by a migration claiming
+--    to have closed it.
+--
+--    A FIRST attempt at this guard checked `relname = 'users_email_lower_unique_idx' AND
+--    indisunique` -- and a later audit walked straight through it, four ways: a UNIQUE index
+--    of that name on `users(email)` (the shape an operator hand-rolling the fix produces);
+--    one on `users(username)`; a PARTIAL unique index on `lower(email) WHERE is_active`; and
+--    a same-named unique index on an unrelated table in ANOTHER SCHEMA. Every one made the
+--    migration commit and report success with the bypass wide open. Checking a NAME is not
+--    checking a property, and the name is the one thing an attacker-shaped landmine controls.
+--
+--    So this asserts what actually has to be true, and says nothing about naming: SOME index
+--    on `public.users` that is UNIQUE, VALID, READY, NOT PARTIAL, single-key, and whose key
+--    expression is exactly `lower(email)`. Any index satisfying that enforces the invariant,
+--    whatever it is called; nothing that fails it does.
 DO $$
+DECLARE
+    found_def text;
 BEGIN
-    IF NOT EXISTS (SELECT 1
-                     FROM pg_class c
-                     JOIN pg_index i ON i.indexrelid = c.oid
-                    WHERE c.relname = 'users_email_lower_unique_idx'
-                      AND i.indisunique) THEN
+    SELECT pg_get_indexdef(i.indexrelid)
+      INTO found_def
+      FROM pg_index i
+     WHERE i.indrelid = 'public.users'::regclass
+       AND i.indisunique
+       AND i.indisvalid
+       AND i.indisready
+       AND i.indpred IS NULL            -- not partial: must cover every row
+       AND i.indnkeyatts = 1            -- single key, not a composite that merely includes it
+       AND pg_get_expr(i.indexprs, i.indrelid) = 'lower((email)::text)'
+     LIMIT 1;
+
+    IF found_def IS NULL THEN
         RAISE EXCEPTION
             USING MESSAGE =
-                'MIGRATION 202609050010 STOPPED: an index named users_email_lower_unique_idx '
-                'already existed and is NOT UNIQUE, so CREATE UNIQUE INDEX IF NOT EXISTS was '
-                'a no-op and case-insensitive uniqueness is NOT enforced. Drop that index and '
-                're-run. NOTHING HAS BEEN MODIFIED: this migration is a single transaction '
-                'and has rolled back.';
+                'MIGRATION 202609050010 STOPPED: after CREATE UNIQUE INDEX there is still no '
+                'UNIQUE, VALID, non-partial, single-key index on public.users over '
+                'lower(email) -- so case-insensitive uniqueness is NOT enforced and issue '
+                '#251 is NOT closed. The usual cause is a pre-existing index already named '
+                'users_email_lower_unique_idx, which makes CREATE UNIQUE INDEX IF NOT EXISTS '
+                'a silent no-op regardless of what that index actually indexes. Inspect with: '
+                'SELECT indexname, indexdef FROM pg_indexes WHERE tablename = ''users''; '
+                'drop the impostor and re-run. NOTHING HAS BEEN MODIFIED: this migration is a '
+                'single transaction and has rolled back.';
     END IF;
 END
 $$;
