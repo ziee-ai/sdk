@@ -753,15 +753,19 @@ async fn oauth_provisioning_over_a_deactivated_holder_is_a_clean_conflict_not_a_
             .await
             .expect_err("the address is taken, so provisioning must be refused");
 
-        // Assert the STATUS, through the exact conversion the handler uses.
+        // Assert the STATUS the repository produces, via the same conversion the handler
+        // applies. A first version only grepped `{err:?}` for the error_code, and two
+        // auditors proved that could not see the defect it was written for: mutating the
+        // mapped status from CONFLICT to OK left the whole suite green.
         //
-        // A first version only grepped `{err:?}` for the error_code, and two auditors proved
-        // that could not see the defect it was written for: mutating the mapped status from
-        // CONFLICT to OK left the whole suite green, and — worse — the shipped handler was
-        // separately overwriting the 409 with a hardcoded 500, so the test was green while
-        // the HTTP response still said "server broke" and the BODY newly confirmed the
-        // address was taken. Going through `to_api_error` is what ties this assertion to the
-        // wire status rather than to a string.
+        // HONEST SCOPE, because an earlier version of this comment overclaimed and a later
+        // audit caught it: this asserts what the REPOSITORY returns. It does NOT reach the
+        // handler, so it cannot catch the handler re-wrapping the error in a hardcoded
+        // status — which is exactly the defect that shipped once (`(INTERNAL_SERVER_ERROR,
+        // e)` discards this 409, because axum renders the tuple's status). Reverting that
+        // line still leaves this suite green. Driving `oauth_complete` needs a mock IdP
+        // fixture that does not exist in this crate; tracked as its own issue rather than
+        // papered over here.
         let (status, err) = err.to_api_error();
         assert_eq!(
             status,
