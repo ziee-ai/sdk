@@ -147,8 +147,24 @@ impl UserRepository {
         .map_err(AppError::database_error)
     }
 
-    /// Get user by email
+    /// Get user by email. CASE-INSENSITIVE (issue #251).
+    ///
+    /// `lower(email) = lower($1)` matches the `users_email_lower_key` unique index
+    /// (`202609050010`) exactly, which is what makes this both correct and index-using: the
+    /// functional index is only consulted when the query repeats its expression verbatim.
+    ///
+    /// Before #251 this was `WHERE email = $1` against a case-SENSITIVE unique constraint, so
+    /// `bob@corp.com` and `BOB@corp.com` were two principals and an invitation issued to one
+    /// was satisfied by the other. Every caller here — the registration pre-check, login by
+    /// identifier, the admin create-user pre-check, invite-by-email member lookup — is asking
+    /// "is there a principal at this mailbox?", and the case-insensitive answer is the one
+    /// they all want.
+    ///
+    /// The input is trimmed in RUST and case-folded in POSTGRES, and neither side does the
+    /// other's job — see [`crate::auth::email`] for why that split is load-bearing rather
+    /// than stylistic.
     pub async fn get_by_email(&self, email: &str) -> Result<Option<User>, AppError> {
+        let email = crate::auth::email::trim_email_for_lookup(email);
         sqlx::query_as!(
             User,
             r#"
@@ -156,7 +172,7 @@ impl UserRepository {
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
-            WHERE email = $1
+            WHERE lower(email) = lower($1)
             "#,
             email
         )
@@ -165,11 +181,17 @@ impl UserRepository {
         .map_err(AppError::database_error)
     }
 
-    /// Get user by username or email
+    /// Get user by username or email.
+    ///
+    /// The EMAIL half is case-insensitive (issue #251, as [`Self::get_by_email`]); the
+    /// USERNAME half stays byte-exact, because `users_username_key` is still a
+    /// case-sensitive UNIQUE constraint and matching usernames loosely than the constraint
+    /// enforces would let one identifier resolve to a row it does not name.
     pub async fn get_by_username_or_email(
         &self,
         identifier: &str,
     ) -> Result<Option<User>, AppError> {
+        let identifier = crate::auth::email::trim_email_for_lookup(identifier);
         sqlx::query_as!(
             User,
             r#"
@@ -177,7 +199,7 @@ impl UserRepository {
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
-            WHERE username = $1 OR email = $1
+            WHERE username = $1 OR lower(email) = lower($1)
             "#,
             identifier
         )
@@ -226,6 +248,13 @@ impl UserRepository {
         display_name: Option<String>,
         permissions: Option<Vec<String>>,
     ) -> Result<User, AppError> {
+        // Trim at the WRITE (issue #251). The `users_email_lower_key` unique index does not
+        // trim, so an untrimmed row would sit beside its trimmed twin as a second principal
+        // and the bypass would survive via a leading/trailing Unicode-whitespace variant.
+        // `str::trim` here and `btrim(<the same 25 code points>)` in the migration's CHECK
+        // are asserted equal by test; see `crate::auth::email`.
+        let email = &crate::auth::email::normalize_email_for_storage(email)?;
+
         // A transaction (was a single pool write) so the in-transaction
         // user-created hook (gap G-AUTHEVT) is atomic with the insert. This is
         // the admin-create + first-run/setup path (the app's user handlers call

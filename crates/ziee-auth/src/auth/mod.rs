@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 pub mod context;
 pub mod cookie;
+pub mod email;
 pub mod events;
 pub mod jwt;
 pub mod password;

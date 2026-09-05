@@ -46,6 +46,13 @@ impl AuthRepository {
         password_hash: Option<String>,
         display_name: Option<String>,
     ) -> Result<User, AppError> {
+        // Trim at the WRITE (issue #251): the `users_email_lower_key` unique index
+        // (`202609050010`) case-folds but does NOT trim, so an untrimmed row could sit beside
+        // its trimmed twin as a second principal. `crate::auth::email` explains why the trim
+        // lives in Rust and the case-fold lives in Postgres, and why neither does the other's
+        // job.
+        let email = &crate::auth::email::normalize_email_for_storage(email)?;
+
         let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
 
         let user = sqlx::query_as!(
@@ -327,6 +334,11 @@ impl AuthRepository {
         &self,
         email: &str,
     ) -> Result<Option<Uuid>, AppError> {
+        // Trimmed in Rust (issue #251) so a provider-supplied address padded with Unicode
+        // whitespace still resolves to the existing local user and takes the First-Broker-Login
+        // branch, instead of falling through to auto-provision and creating a duplicate. The
+        // `LOWER()` below stays the sole case-fold; nothing here lowercases.
+        let email = crate::auth::email::trim_email_for_lookup(email);
         let row = sqlx::query!(
             r#"
             SELECT id FROM users
@@ -375,6 +387,19 @@ impl AuthRepository {
         external_id: &str,
         external_data: Option<&serde_json::Value>,
     ) -> Result<Uuid, AppError> {
+        // Trim at the WRITE (issue #251): the `users_email_lower_key` unique index
+        // (`202609050010`) case-folds but does NOT trim, so an untrimmed row could sit beside
+        // its trimmed twin as a second principal. `crate::auth::email` explains why the trim
+        // lives in Rust and the case-fold lives in Postgres, and why neither does the other's
+        // job.
+        // The provider-supplied address is trimmed the same way the local path trims, so a
+        // provider that hands back a padded or differently-cased form resolves to — and
+        // stores as — the same principal rather than provisioning a duplicate.
+        let email = email
+            .map(crate::auth::email::normalize_email_for_storage)
+            .transpose()?;
+        let email = email.as_deref();
+
         let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
         let new_user_id = Uuid::new_v4();
 
@@ -531,6 +556,15 @@ impl AuthRepository {
         email: Option<String>,
         display_name: &str,
     ) -> Result<Uuid, AppError> {
+        // Trim at the WRITE (issue #251): the `users_email_lower_key` unique index
+        // (`202609050010`) case-folds but does NOT trim, so an untrimmed row could sit beside
+        // its trimmed twin as a second principal. `crate::auth::email` explains why the trim
+        // lives in Rust and the case-fold lives in Postgres, and why neither does the other's
+        // job.
+        let email = email
+            .map(|e| crate::auth::email::normalize_email_for_storage(&e))
+            .transpose()?;
+
         let new_user_id = Uuid::new_v4();
 
         // A transaction (was a single pool write) so the in-transaction
@@ -572,6 +606,15 @@ impl AuthRepository {
         provider_id: Uuid,
         external_id: &str,
     ) -> Result<Uuid, AppError> {
+        // Trim at the WRITE (issue #251): the `users_email_lower_key` unique index
+        // (`202609050010`) case-folds but does NOT trim, so an untrimmed row could sit beside
+        // its trimmed twin as a second principal. `crate::auth::email` explains why the trim
+        // lives in Rust and the case-fold lives in Postgres, and why neither does the other's
+        // job.
+        let email = email
+            .map(|e| crate::auth::email::normalize_email_for_storage(&e))
+            .transpose()?;
+
         // All three writes (user row, auth link, default-group assignment) must
         // be atomic: a failure after the user INSERT would otherwise leave an
         // orphan user with no auth link (unable to log in, blocking the

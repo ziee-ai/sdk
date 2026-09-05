@@ -104,12 +104,20 @@ pub async fn register(
     let username = req.username.trim().to_string();
     crate::auth::username::validate_username(&username).map_err(AppError::to_api_error)?;
     req.username = username;
-    if req.email.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            AppError::bad_request("INVALID_EMAIL", "Email cannot be empty"),
-        ));
-    }
+    // Normalize the address ONCE (issue #251) and use that one value for BOTH the
+    // already-taken pre-check below and the INSERT. Two different spellings reaching those
+    // two steps is exactly how a case/whitespace variant slipped past the pre-check and then
+    // created a second principal for the same mailbox.
+    //
+    // Normalization here is TRIM ONLY — the case-fold belongs to Postgres (`lower(email) =
+    // lower($1)` in the lookup, `users_email_lower_key` in the index), and the stored value
+    // keeps the casing the user typed for display and SMTP. `crate::auth::email` explains why
+    // the two jobs are split rather than shared.
+    //
+    // Empty-after-trim keeps the pre-existing `400 INVALID_EMAIL` / "Email cannot be empty"
+    // response verbatim; `normalize_email_for_storage` is the same refusal moved, not a new one.
+    req.email = crate::auth::email::normalize_email_for_storage(&req.email)
+        .map_err(AppError::to_api_error)?;
     if let Err(msg) = password::validate_password_strength(&req.password) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -124,6 +132,15 @@ pub async fn register(
     // generic "ACCOUNT_EXISTS" response, leaking nothing about which
     // field collided. Server-side logs still record which one for
     // operator debugging.
+    //
+    // The email side is now CASE-INSENSITIVE (issue #251): `get_by_email` compares
+    // `lower(email) = lower($1)`, matching the `users_email_lower_key` unique index, so
+    // `BOB@corp.com` is refused when `bob@corp.com` exists. That refusal MUST stay inside
+    // this collapse — a distinguishable "that case variant is taken" would trade the
+    // invitation bypass for a user-enumeration oracle, which is a worse deal. The refusal is
+    // asserted BYTE-IDENTICAL across the username, exact-email, case-variant-email and
+    // Unicode-whitespace-variant collisions (cytoanalyst `tests/auth/email_case_insensitive.rs`),
+    // by raw body comparison rather than by status code.
     let username_taken = ctx.user()
         .get_by_username(&req.username)
         .await
