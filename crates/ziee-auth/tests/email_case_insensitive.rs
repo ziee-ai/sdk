@@ -20,6 +20,7 @@ use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 use ziee_auth::auth::AuthRepository;
 use ziee_auth::auth::hash_password;
+use ziee_auth::auth::providers::AuthProviderTrait;
 use ziee_auth::user::UserRepository;
 
 /// The migration under test, embedded at COMPILE time so a rename is a build error rather
@@ -802,11 +803,26 @@ async fn oauth_provisioning_over_a_deactivated_holder_is_a_clean_conflict_not_a_
         )
         .await
         .expect_err("a duplicate username must still be refused");
+    let (dup_status, dup_username) = dup_username.to_api_error();
     let dup_msg = format!("{dup_username:?}");
     assert!(
         !dup_msg.contains("EMAIL_TAKEN_BY_EXTERNAL_ACCOUNT"),
         "a USERNAME collision must not claim the EMAIL is taken — the address \
          totally.free@elsewhere.test is not registered at all; got: {dup_msg}"
+    );
+    // ...and it must be a 409 naming the USERNAME, not a 500. The doc on this function has
+    // always promised "a duplicate username/email must surface as 409, not a generic 500",
+    // and narrowing the email arm without adding this one silently broke that half — which
+    // now reaches the wire verbatim, because the call site derives the status from the error.
+    assert_eq!(
+        dup_status,
+        axum::http::StatusCode::CONFLICT,
+        "a duplicate username is an ordinary, expected conflict — not a server error; \
+         got {dup_status}: {dup_msg}"
+    );
+    assert!(
+        dup_msg.contains("Username"),
+        "and must name the USERNAME as the thing that collided; got: {dup_msg}"
     );
 
     // POSITIVE CONTROL — provisioning a genuinely free address still works, so the refusals
@@ -827,13 +843,20 @@ async fn oauth_provisioning_over_a_deactivated_holder_is_a_clean_conflict_not_a_
 }
 
 // TEST-24 (issue #251) — the SECOND local-login resolver agrees with the first.
-/// `LocalAuthProvider::get_user` is the other local-password resolver, reached when an
-/// operator adds an `auth_providers` row of type `local` under a name other than `"local"`.
-/// It used to try `get_by_username` and then `get_by_email` — so #251 silently made it
-/// case-insensitive on the email half, the exact property DEC-15 reverted from
-/// `get_by_username_or_email` because two attempts to keep it were each reproduced as a
-/// worse attack. The two resolvers disagreed about who an identifier named. Now there is one
-/// resolver behind both.
+/// `LocalAuthProvider` is the other local-password resolver, reached when an operator adds an
+/// `auth_providers` row of type `local` under a name other than `"local"`. It used to try
+/// `get_by_username` and then `get_by_email` — so #251 silently made it case-insensitive on
+/// the email half, the exact property DEC-15 reverted from `get_by_username_or_email`, plus
+/// the username-first ordering DEC-15 names as the attack. The two resolvers disagreed about
+/// who an identifier named: with a user stored as `Bob@Corp.com`,
+/// `authenticate("bob@corp.com", pw)` SUCCEEDED here while the other returned `None`.
+///
+/// Driven through `authenticate` — the real production entry point — rather than through a
+/// test seam. An earlier version added `pub async fn get_user_for_test` to make the private
+/// resolver reachable; an audit pointed out that `#[doc(hidden)]` is cosmetic and that this
+/// shipped, on a library crate, an unauthenticated identifier→`User` lookup whose returned
+/// struct carries a `pub password_hash`. The seam is deleted. Going through `authenticate`
+/// is also the stronger test: it proves the behaviour on the path that actually runs.
 #[tokio::test]
 async fn both_local_login_resolvers_agree_on_who_an_identifier_names() {
     let (pool, db) = fresh_db().await;
@@ -870,36 +893,40 @@ async fn both_local_login_resolvers_agree_on_who_an_identifier_names() {
             .get_by_username_or_email(identifier)
             .await
             .expect("query ok")
-            .map(|u| u.id);
-        let via_provider = local
-            .get_user_for_test(identifier)
+            .is_some();
+        let via_login = local
+            .authenticate(identifier, "userPassw0rd!")
             .await
-            .expect("query ok")
-            .map(|u| u.id);
+            .is_ok();
         assert_eq!(
-            via_repo, via_provider,
-            "the two local-password resolvers must agree about {identifier:?} — they \
-             disagreed before #251's revert reached this one, so `bob@corp.com` \
-             authenticated through one and resolved to nobody through the other"
+            via_repo, via_login,
+            "the two local-password paths must agree about {identifier:?} — they disagreed \
+             before DEC-15's revert reached this one, so `bob@corp.com` AUTHENTICATED through \
+             one while resolving to nobody through the other"
         );
     }
 
     // ...and the agreed answer is the byte-exact one (DEC-15).
-    assert_eq!(
+    assert!(
         local
-            .get_user_for_test("Bob@Corp.com")
+            .authenticate("Bob@Corp.com", "userPassw0rd!")
             .await
-            .expect("query ok")
-            .map(|u| u.id),
-        Some(bob.id)
+            .is_ok(),
+        "the exact stored address authenticates"
     );
     assert!(
         local
-            .get_user_for_test("bob@corp.com")
+            .authenticate("bob@corp.com", "userPassw0rd!")
             .await
-            .expect("query ok")
-            .is_none(),
-        "a case variant must NOT authenticate — that is the property DEC-15 restored"
+            .is_err(),
+        "a case VARIANT must NOT authenticate — that is the property DEC-15 restored, and \
+         making it case-insensitive here is what every login attack in this issue needed"
+    );
+    // NEGATIVE CONTROL — the right identifier with the wrong password still fails, so the
+    // assertions above are about resolution and not about authentication being broken.
+    assert!(
+        local.authenticate("bob", "wrongPassw0rd!").await.is_err(),
+        "a wrong password must fail even for a resolvable identifier"
     );
 
     drop_db(&db).await;
@@ -1177,23 +1204,25 @@ async fn migration_refuses_a_whitespace_padded_twin_as_a_collision() {
     drop_db(&db).await;
 }
 
-// TEST-25 (issue #251) — the single enforcement statement cannot silently not-enforce.
-/// `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME ONLY, and the name is the one thing a
-/// landmine controls.
+// TEST-25 (issue #251) — the enforcement statement cannot silently not-enforce.
+/// Whatever index already occupies the name, the migration REPLACES it and uniqueness is
+/// genuinely enforced afterwards.
 ///
-/// A first version of this test seeded ONE landmine — a non-unique index on the right
-/// expression — which is exactly the predicate the first version of the guard checked. It
-/// therefore MIRRORED THE IMPLEMENTATION and was structurally blind to the guard's
-/// incompleteness: a later audit walked through that guard four ways and this test stayed
-/// green through all of them, while the migration committed with the bypass wide open. A test
-/// whose shape is copied from the guard cannot find the guard's gaps.
+/// # Why this asserts replacement rather than refusal
 ///
-/// So the landmines below are shapes the guard does NOT name: right name but unique on the
-/// wrong COLUMN, right name but PARTIAL, right name but byte-exact on `email` (the shape an
-/// operator hand-rolling the fix produces). Each must be refused, each must leave the schema
-/// untouched, and each must apply-and-enforce once the impostor is gone.
+/// Two earlier shapes of step 4 used `CREATE UNIQUE INDEX IF NOT EXISTS` plus a guard that
+/// tried to DETECT the resulting hazard, and both guards were broken by audits — the first
+/// checked a NAME (evaded four ways), the second checked the property but was name-agnostic,
+/// so the index that satisfied it could be the one step 4b then dropped (migration COMMITS,
+/// reports success, leaves a non-unique index and three rows for one mailbox). Step 4 is now
+/// an unconditional DROP-then-CREATE, which cannot no-op — so there is no guard left to
+/// evade, and the thing to assert is the OUTCOME.
+///
+/// The shapes below are the ones the guards were evaded with. Each must end with the
+/// migration applied, the correct index in place, and a real case-variant insert refused —
+/// which is the property, not a proxy for it.
 #[tokio::test]
-async fn migration_refuses_every_impostor_index_shape() {
+async fn migration_replaces_any_impostor_index_and_enforces_uniqueness() {
     for (label, landmine) in [
         (
             "non-unique on the right expression",
@@ -1211,6 +1240,14 @@ async fn migration_refuses_every_impostor_index_shape() {
             "unique but byte-exact on email, not lower(email)",
             "CREATE UNIQUE INDEX users_email_lower_unique_idx ON public.users (email);",
         ),
+        (
+            "composite that merely INCLUDES the expression",
+            "CREATE UNIQUE INDEX users_email_lower_unique_idx ON public.users (lower(email), id);",
+        ),
+        (
+            "an operator's correctly-shaped index under ANOTHER name",
+            "CREATE UNIQUE INDEX operator_hand_rolled_ci_email ON public.users (lower(email));",
+        ),
     ] {
         let (pool, db) = fresh_db().await;
         rewind_to_pre_migration(&pool).await;
@@ -1218,43 +1255,28 @@ async fn migration_refuses_every_impostor_index_shape() {
             .await
             .unwrap_or_else(|e| panic!("plant the landmine ({label}): {e}"));
 
-        let err = pool.execute(MIGRATION_SQL).await.expect_err(
-            "the landmine must be REFUSED — otherwise the migration reports success while \
-             case-insensitive uniqueness is not enforced at all",
-        );
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("MIGRATION 202609050010 STOPPED"),
-            "landmine {label:?} must be REFUSED with the migration's own diagnostic — \
-             otherwise it reports success while case-insensitive uniqueness is not enforced \
-             at all; got: {msg}"
-        );
-
-        // Rolled back completely — every constraint the file touches, not just one.
-        for (what, sql, expected) in [
-            ("users_email_key survives",
-             "SELECT count(*) FROM pg_constraint WHERE conname = 'users_email_key'", 1i64),
-            ("step 4b's DROP rolled back",
-             "SELECT count(*) FROM pg_indexes WHERE indexname = 'idx_users_lower_email'", 1),
-            ("the new CHECK was not added",
-             "SELECT count(*) FROM pg_constraint WHERE conname = 'users_email_trimmed'", 0),
-        ] {
-            let got: (i64,) = sqlx::query_as(sql).fetch_one(&pool).await.expect("count");
-            assert_eq!(got.0, expected, "{label}: {what}");
-        }
-
-        // POSITIVE CONTROL — drop the impostor and the migration applies AND enforces.
-        pool.execute("DROP INDEX users_email_lower_unique_idx;")
-            .await
-            .expect("drop the landmine");
         pool.execute(MIGRATION_SQL)
             .await
-            .unwrap_or_else(|e| panic!("{label}: must apply once the impostor is gone: {e}"));
+            .unwrap_or_else(|e| panic!("{label}: the migration must APPLY, replacing the impostor: {e}"));
+
+        // The schema is the fixed one, whatever was there before.
         assert_fixed_schema(&pool).await;
-        raw_insert(&pool, "bob", "bob@corp.com").await.expect("first");
+
+        // ...and the property actually holds. This is the assertion that matters: every
+        // guard-shaped version of this test could pass while uniqueness was unenforced.
+        raw_insert(&pool, "bob", "bob@corp.com")
+            .await
+            .unwrap_or_else(|e| panic!("{label}: first insert: {e}"));
         assert!(
             raw_insert(&pool, "bob2", "BOB@corp.com").await.is_err(),
-            "{label}: and uniqueness is genuinely ENFORCED, not merely named"
+            "{label}: a case variant must be REFUSED — the migration reported success, so if \
+             this insert lands the bypass is open and nothing noticed"
+        );
+        assert!(
+            raw_insert(&pool, "bob3", "bob@corp.com").await.is_err(),
+            "{label}: and byte-exact uniqueness must not have been lost either — step 1 drops \
+             users_email_key, so a step 4 that failed to enforce leaves the table with LESS \
+             uniqueness than it started with"
         );
 
         drop_db(&db).await;

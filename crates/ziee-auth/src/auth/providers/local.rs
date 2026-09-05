@@ -63,15 +63,6 @@ impl LocalAuthProvider {
     /// `username` = a victim's email win every time), so restoring it here would reintroduce
     /// the attack DEC-15 removed. Having ONE resolver, with one known ambiguity, beats two
     /// resolvers that disagree.
-    /// Test seam for the crate-scoped integration suite (TEST-24): the resolver itself is
-    /// private, but the property that BOTH local resolvers agree is exactly what needs
-    /// asserting, and asserting it through `authenticate` would confound it with password
-    /// verification.
-    #[doc(hidden)]
-    pub async fn get_user_for_test(&self, username: &str) -> Result<Option<User>, AuthError> {
-        self.get_user(username).await
-    }
-
     async fn get_user(&self, username: &str) -> Result<Option<User>, AuthError> {
         let users = UserRepository::new(self.pool.clone());
         users

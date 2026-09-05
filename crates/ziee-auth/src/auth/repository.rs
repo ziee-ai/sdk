@@ -447,6 +447,22 @@ impl AuthRepository {
             // was told "an account with this email already exists" about an address that is
             // completely free — a factually false statement pointing the user at a login
             // method that does not exist.
+            // A duplicate USERNAME is also a 409, not a 500 — the doc above promises it and
+            // the two sibling creators have always done it. An earlier narrowing to the email
+            // case alone left username collisions falling through to `database_error`, which
+            // (now that the call site derives the status from the error) reached the wire as
+            // a 500 for an ordinary, expected conflict.
+            if let sqlx::Error::Database(db_err) = &e
+                && db_err.is_unique_violation()
+                && db_err.constraint() == Some("users_username_key")
+            {
+                return AppError::conflict("Username");
+            }
+            // Attribution by constraint NAME is sound because step 4 of `202609050010` does an
+            // unconditional DROP-then-CREATE, so after that migration the enforcing index is
+            // always exactly this one. (When the migration merely asserted that SOME suitable
+            // index existed, an operator's differently-named equivalent could catch the
+            // violation instead and this arm silently missed — reproduced by an audit.)
             if let sqlx::Error::Database(db_err) = &e
                 && db_err.is_unique_violation()
                 && db_err.constraint() == Some("users_email_lower_unique_idx")

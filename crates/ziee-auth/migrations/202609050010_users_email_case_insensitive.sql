@@ -256,69 +256,46 @@ $$;
 -- 4. The fix. Two addresses differing only by case are now ONE principal, enforced by the
 --    DATABASE rather than by an application pre-check that a race can slip past.
 --
+--    DROP-THEN-CREATE, and NO GUARD. This is the third shape of this step, and the first two
+--    are worth recording because the lesson is not about indexes.
+--
+--      v1  `CREATE UNIQUE INDEX IF NOT EXISTS`. That matches on NAME ONLY, so a pre-existing
+--          index of this name made the statement a silent no-op: an audit pre-created one,
+--          ran the migration, watched it report SUCCESS, and then inserted `bob@corp.com` and
+--          `BOB@corp.com` side by side.
+--      v2  the same, plus a guard asserting afterwards that a suitable index exists. The
+--          first guard checked a NAME (evaded four ways). The second checked the PROPERTY and
+--          was name-agnostic -- which introduced a worse failure: the index that SATISFIED
+--          the guard could be `idx_users_lower_email`, which the very next statement DROPS.
+--          Reproduced end to end: migration COMMITS reporting success, leaving a NON-unique
+--          index, `users_email_key` already dropped by step 1, and three rows for one mailbox
+--          -- #251 reopened AND the byte-exact uniqueness that existed beforehand lost.
+--          Strictly worse than v1's guard, which would have refused that state.
+--
+--    Each guard was an attempt to DETECT a hazard introduced by `IF NOT EXISTS`. Removing
+--    `IF NOT EXISTS` removes the hazard, and with it every evasion of every guard: an
+--    unconditional DROP-then-CREATE cannot no-op, cannot be satisfied by an index something
+--    else is about to drop, and needs nothing asserted about it afterwards. If a same-named
+--    index already exists -- an operator's hand-rolled equivalent, or an impostor -- it is
+--    replaced by the correct one, which is strictly better than refusing. If a CONSTRAINT
+--    owns that name, `DROP INDEX` fails loudly rather than proceeding. And re-running the
+--    file is still idempotent, which is why `IF NOT EXISTS` was reached for in the first place.
+--
+--    It also restores an invariant the name-agnostic guard had quietly broken: after this
+--    step the enforcing index is ALWAYS `users_email_lower_unique_idx`, which is what lets
+--    the Rust error mappers attribute a unique violation to the email rather than guessing.
+--
 --    Named `..._unique_idx`, not `..._key`: Postgres reserves the `_key` suffix by convention
 --    for UNIQUE CONSTRAINTS created via ALTER TABLE, and this is necessarily a bare index (an
 --    expression cannot back a UNIQUE constraint). A `_key` name would be absent from
---    `pg_constraint` while reading as if it were there, and `ON CONFLICT ON CONSTRAINT` would
---    fail at runtime.
-CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique_idx
-    ON public.users (lower(email));
-
---    ...and PROVE the PROPERTY, not the name.
---
---    `CREATE UNIQUE INDEX IF NOT EXISTS` matches on NAME ONLY, so a pre-existing index of
---    this name makes the statement a silent no-op: an audit pre-created one, ran this
---    migration, watched it report SUCCESS, and then inserted `bob@corp.com` and
---    `BOB@corp.com` side by side. That is the whole bypass, reopened by a migration claiming
---    to have closed it.
---
---    A FIRST attempt at this guard checked `relname = 'users_email_lower_unique_idx' AND
---    indisunique` -- and a later audit walked straight through it, four ways: a UNIQUE index
---    of that name on `users(email)` (the shape an operator hand-rolling the fix produces);
---    one on `users(username)`; a PARTIAL unique index on `lower(email) WHERE is_active`; and
---    a same-named unique index on an unrelated table in ANOTHER SCHEMA. Every one made the
---    migration commit and report success with the bypass wide open. Checking a NAME is not
---    checking a property, and the name is the one thing an attacker-shaped landmine controls.
---
---    So this asserts what actually has to be true, and says nothing about naming: SOME index
---    on `public.users` that is UNIQUE, VALID, READY, NOT PARTIAL, single-key, and whose key
---    expression is exactly `lower(email)`. Any index satisfying that enforces the invariant,
---    whatever it is called; nothing that fails it does.
-DO $$
-DECLARE
-    found_def text;
-BEGIN
-    SELECT pg_get_indexdef(i.indexrelid)
-      INTO found_def
-      FROM pg_index i
-     WHERE i.indrelid = 'public.users'::regclass
-       AND i.indisunique
-       AND i.indisvalid
-       AND i.indisready
-       AND i.indpred IS NULL            -- not partial: must cover every row
-       AND i.indnkeyatts = 1            -- single key, not a composite that merely includes it
-       AND pg_get_expr(i.indexprs, i.indrelid) = 'lower((email)::text)'
-     LIMIT 1;
-
-    IF found_def IS NULL THEN
-        RAISE EXCEPTION
-            USING MESSAGE =
-                'MIGRATION 202609050010 STOPPED: after CREATE UNIQUE INDEX there is still no '
-                'UNIQUE, VALID, non-partial, single-key index on public.users over '
-                'lower(email) -- so case-insensitive uniqueness is NOT enforced and issue '
-                '#251 is NOT closed. The usual cause is a pre-existing index already named '
-                'users_email_lower_unique_idx, which makes CREATE UNIQUE INDEX IF NOT EXISTS '
-                'a silent no-op regardless of what that index actually indexes. Inspect with: '
-                'SELECT indexname, indexdef FROM pg_indexes WHERE tablename = ''users''; '
-                'drop the impostor and re-run. NOTHING HAS BEEN MODIFIED: this migration is a '
-                'single transaction and has rolled back.';
-    END IF;
-END
-$$;
+--    `pg_constraint` while reading as if it were there.
+DROP INDEX IF EXISTS public.users_email_lower_unique_idx;
+CREATE UNIQUE INDEX users_email_lower_unique_idx ON public.users (lower(email));
 
 -- 4b. `202607140050` already created `idx_users_lower_email` on the byte-identical expression
 --     `lower(email)`. It is now strictly redundant -- every write would maintain two identical
---     btrees -- so it goes.
+--     btrees -- so it goes. Ordered AFTER step 4 deliberately: when a guard sat here instead,
+--     the index it accepted could be the one this statement then destroyed.
 DROP INDEX IF EXISTS public.idx_users_lower_email;
 
 -- 5. Defence in depth: the stored address is trimmed. Every in-crate writer trims in Rust
