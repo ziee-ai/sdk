@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 pub mod context;
 pub mod cookie;
+pub mod email;
 pub mod events;
 pub mod jwt;
 pub mod password;
@@ -59,6 +60,7 @@ pub use context::{
     AuthSyncWiring, NoopAuthEventSink, NoopAuthSyncSink, declare_auth_sync,
     declare_auth_sync_inert, declared_auth_sync, install_auth_sync_sink, resolve_auth_sync,
 };
+pub use email::{fold_email, normalize_email, normalize_optional_email};
 pub use jwt::JwtService;
 #[allow(unused_imports)]
 pub use password::hash_password;

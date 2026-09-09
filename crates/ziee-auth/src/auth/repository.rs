@@ -46,6 +46,13 @@ impl AuthRepository {
         password_hash: Option<String>,
         display_name: Option<String>,
     ) -> Result<User, AppError> {
+        // #251: the stored address is the NORMALISED one at every write path.
+        // `users_email_key` is a plain `UNIQUE (email)`, so an un-normalised
+        // write creates a second principal for the same mailbox; the
+        // `users_email_is_lowercase` CHECK (202609090010) would refuse it, and
+        // this is where the value is made refusable-proof instead.
+        let email = &crate::auth::email::normalize_email(email)?;
+
         let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
 
         let user = sqlx::query_as!(
@@ -327,6 +334,12 @@ impl AuthRepository {
         &self,
         email: &str,
     ) -> Result<Option<Uuid>, AppError> {
+        // Fold the CALLER's value with the same rule the writers use (#251),
+        // so a provider-supplied `  Bob@Corp.com ` resolves to the row stored
+        // as `bob@corp.com`. The `LOWER(email)` on the column side is kept as
+        // defence in depth for rows written before 202609090010.
+        let email = &crate::auth::email::fold_email(email);
+
         let row = sqlx::query!(
             r#"
             SELECT id FROM users
@@ -375,6 +388,14 @@ impl AuthRepository {
         external_id: &str,
         external_data: Option<&serde_json::Value>,
     ) -> Result<Uuid, AppError> {
+        // #251 normalisation, before anything is written. The provider's
+        // casing is not authoritative: an IdP that hands back `BOB@CORP.COM`
+        // for the mailbox `bob@corp.com` must not become a second principal.
+        // The SAME value is threaded into `user_auth_links.external_email`
+        // below, so the two columns cannot drift apart.
+        let email = crate::auth::email::normalize_optional_email(email)?;
+        let email = email.as_deref();
+
         let mut tx = self.pool.begin().await.map_err(AppError::database_error)?;
         let new_user_id = Uuid::new_v4();
 
@@ -531,6 +552,9 @@ impl AuthRepository {
         email: Option<String>,
         display_name: &str,
     ) -> Result<Uuid, AppError> {
+        // #251 normalisation — see `create_local_user_with_default_group`.
+        let email = crate::auth::email::normalize_optional_email(email.as_deref())?;
+
         let new_user_id = Uuid::new_v4();
 
         // A transaction (was a single pool write) so the in-transaction
@@ -572,6 +596,11 @@ impl AuthRepository {
         provider_id: Uuid,
         external_id: &str,
     ) -> Result<Uuid, AppError> {
+        // #251 normalisation — see `create_local_user_with_default_group`.
+        // Applies to the LDAP first-login path too: a directory that returns
+        // `Bob@Corp.com` must resolve to the same principal as `bob@corp.com`.
+        let email = crate::auth::email::normalize_optional_email(email.as_deref())?;
+
         // All three writes (user row, auth link, default-group assignment) must
         // be atomic: a failure after the user INSERT would otherwise leave an
         // orphan user with no auth link (unable to log in, blocking the
