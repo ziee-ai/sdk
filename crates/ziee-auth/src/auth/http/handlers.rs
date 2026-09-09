@@ -115,7 +115,7 @@ pub async fn register(
     // write the normalised form back onto the request so the pre-check and the
     // INSERT see the same value. Without this the pre-check looked up
     // `BOB@CORP.COM`, missed the stored `bob@corp.com`, and the INSERT created
-    // a SECOND PRINCIPAL for the same mailbox — an invitation issued to that
+    // a SECOND PRINCIPAL for the same mailbox — an invite issued to that
     // address was then redeemable by whichever of the two the attacker held.
     //
     // The gate also refuses non-ASCII (#260): the `users_email_is_lowercase`
