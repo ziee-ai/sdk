@@ -171,7 +171,7 @@ mod tests {
             "İgor@corp.com",   // U+0130 — 1 char in PG lower, 2 in Rust
             "i\u{307}gor@corp.com", // the Rust fold's own output for the above
             "ÄNNA@corp.com",   // folds differently under a C-locale cluster
-            "bob\u{a0}@corp.com", // NBSP: Rust `trim` strips it, PG `btrim` does not
+            "bob\u{a0}@corp.com", // NBSP — invisible, and PG `btrim` would not strip it
             "bob@corp.com\u{200e}", // bidi mark
             "bob b@corp.com",  // interior space
             "bob\n@corp.com",

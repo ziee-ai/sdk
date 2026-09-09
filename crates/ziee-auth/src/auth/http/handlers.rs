@@ -1544,7 +1544,13 @@ async fn oauth_complete_inner(
             Some(&auth_result.metadata),
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        // Carry the error's OWN status instead of stamping 500 on it. #251's
+        // normalisation gave this call a reachable 4xx — a provider-asserted
+        // address outside printable ASCII is refused at the write boundary
+        // (#260) — and forcing that to `500 SYSTEM_DATABASE_ERROR` on an
+        // unauthenticated callback is exactly the mis-reported-refusal shape
+        // #283 was filed for. A genuine database error still carries 500.
+        .map_err(AppError::to_api_error)?;
 
     let user = ctx
         .user()
