@@ -149,6 +149,18 @@ impl UserRepository {
 
     /// Get user by email
     pub async fn get_by_email(&self, email: &str) -> Result<Option<User>, AppError> {
+        // #251: stored addresses are normalised (202609090010's
+        // `users_email_is_lowercase` CHECK guarantees it), so the lookup folds
+        // the CALLER's value with the same rule and compares exactly. Without
+        // this the register handler's pre-check missed a case variant, the
+        // INSERT then created a SECOND PRINCIPAL for the same mailbox, and an
+        // invitation issued to that address was redeemable by either of them.
+        //
+        // Folding rather than `lower(email) = lower($1)` on the column keeps
+        // the comparison on the plain `UNIQUE (email)` / `idx_users_email`
+        // btree and keeps ONE fold in the crate (see `auth::email`).
+        let email = &crate::auth::email::fold_email(email);
+
         sqlx::query_as!(
             User,
             r#"
@@ -165,11 +177,37 @@ impl UserRepository {
         .map_err(AppError::database_error)
     }
 
-    /// Get user by username or email
+    /// Get user by username or email — the resolver `POST /api/auth/login`
+    /// uses to turn a typed identifier into a principal.
+    ///
+    /// Two properties, both load-bearing, both of which this must share with
+    /// the OTHER local resolver (`LocalAuthProvider::get_user`), because two
+    /// resolvers that disagree about who an identifier names is an
+    /// authentication bug wearing a lookup's clothes:
+    ///
+    /// * **The email half folds** (#251). Stored addresses are normalised, so
+    ///   an exact comparison against a raw identifier would refuse to log in
+    ///   every user who types their own address the way they registered it
+    ///   (`Bob@Corp.com`). `LocalAuthProvider::get_user` inherits the same fold
+    ///   through `get_by_email`.
+    /// * **Username wins, explicitly.** An identifier CAN match one row's
+    ///   username and a different row's email — usernames admit `@` and `.`.
+    ///   This used to be a bare `OR` read with `fetch_optional`, i.e. whichever
+    ///   row Postgres happened to return: not merely undefined, but capable of
+    ///   returning a different principal than `LocalAuthProvider` (username
+    ///   first) for the same input. The `ORDER BY` states the tie-break
+    ///   instead of leaving it to the plan, and matches the other resolver
+    ///   exactly. It does not widen anything: for an ambiguous identifier the
+    ///   username holder is the row the other resolver already returned.
+    ///
+    /// Resolving a row is not authorising it — the caller still verifies the
+    /// password against whichever principal comes back.
     pub async fn get_by_username_or_email(
         &self,
         identifier: &str,
     ) -> Result<Option<User>, AppError> {
+        let folded = &crate::auth::email::fold_email(identifier);
+
         sqlx::query_as!(
             User,
             r#"
@@ -177,9 +215,12 @@ impl UserRepository {
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
-            WHERE username = $1 OR email = $1
+            WHERE username = $1 OR email = $2
+            ORDER BY (username = $1) DESC
+            LIMIT 1
             "#,
-            identifier
+            identifier,
+            folded
         )
         .fetch_optional(&self.pool)
         .await
@@ -226,6 +267,10 @@ impl UserRepository {
         display_name: Option<String>,
         permissions: Option<Vec<String>>,
     ) -> Result<User, AppError> {
+        // #251 normalisation — the admin-create / first-run-setup path writes
+        // `users.email` too, so it carries the same rule as every other writer.
+        let email = &crate::auth::email::normalize_email(email)?;
+
         // A transaction (was a single pool write) so the in-transaction
         // user-created hook (gap G-AUTHEVT) is atomic with the insert. This is
         // the admin-create + first-run/setup path (the app's user handlers call
@@ -287,6 +332,14 @@ impl UserRepository {
         display_name: Option<String>,
         permissions: Option<Vec<String>>,
     ) -> Result<User, AppError> {
+        // #251 normalisation on the admin edit path. `None` means "leave the
+        // address alone" and must stay `None` — normalising it would rewrite
+        // the column with an empty string via the COALESCE.
+        let email = match email {
+            None => None,
+            Some(e) => Some(crate::auth::email::normalize_email(&e)?),
+        };
+
         sqlx::query_as!(
             User,
             r#"
@@ -311,10 +364,21 @@ impl UserRepository {
         .await
         // A username/email collision that slips past the caller's pre-check
         // (the pre-check is a TOCTOU window) is caught by the DB UNIQUE
-        // constraint and surfaced as a 409 — not a raw 500. Mirrors the
-        // mapping `update_profile` below has always had.
+        // constraint and surfaced as a 409 — not a raw 500.
+        //
+        // The message names BOTH candidate fields, matching `create` above.
+        // It used to say "Username", which is a FALSE STATEMENT on an email
+        // collision — it sends an operator to look at a username that is fine
+        // (#285) — and #251 makes email collisions reachable here for the
+        // first time via a case variant. Discriminating would mean matching on
+        // a constraint NAME, which is precisely the unsound mechanism #283
+        // documents: a same-shape index under another name has a lower OID and
+        // is the one Postgres reports, so the match misses. There is no name to
+        // rely on and none is reserved, so the mapper does not claim to know.
         .map_err(|e| match e {
-            sqlx::Error::Database(db) if db.is_unique_violation() => AppError::conflict("Username"),
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                AppError::conflict("Username or email")
+            }
             other => AppError::database_error(other),
         })
     }

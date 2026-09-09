@@ -449,13 +449,21 @@ async fn email_lookup_for_linking_is_case_insensitive_and_active_only() {
         .await
         .unwrap();
 
-    // Canonical lowercase form matches the mixed-case stored email.
-    assert_eq!(
-        repo.find_user_by_email_for_linking("erin@corp.com")
-            .await
-            .unwrap(),
-        Some(user.id)
-    );
+    // #251: the mixed-case input is NORMALISED on the way in, so what is
+    // stored is already canonical (`users_email_is_lowercase` makes that an
+    // invariant, not a habit).
+    assert_eq!(user.email, "erin@corp.com");
+
+    // The lookup resolves the same principal whatever case the caller has —
+    // an OAuth provider handing back any variant must not miss the FBL branch
+    // and silently auto-provision a duplicate account.
+    for variant in ["erin@corp.com", "Erin@Corp.com", "ERIN@CORP.COM", "  erin@corp.com  "] {
+        assert_eq!(
+            repo.find_user_by_email_for_linking(variant).await.unwrap(),
+            Some(user.id),
+            "FBL lookup must resolve {variant:?}"
+        );
+    }
 
     // Deactivating the user hides them from the FBL lookup (security posture).
     sqlx::query("UPDATE users SET is_active = false WHERE id = $1")

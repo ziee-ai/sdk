@@ -111,12 +111,20 @@ pub async fn register(
     let username = req.username.trim().to_string();
     crate::auth::username::validate_username(&username).map_err(AppError::to_api_error)?;
     req.username = username;
-    if req.email.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            AppError::bad_request("INVALID_EMAIL", "Email cannot be empty"),
-        ));
-    }
+    // #251: normalise the address HERE, before the collision pre-check, and
+    // write the normalised form back onto the request so the pre-check and the
+    // INSERT see the same value. Without this the pre-check looked up
+    // `BOB@CORP.COM`, missed the stored `bob@corp.com`, and the INSERT created
+    // a SECOND PRINCIPAL for the same mailbox — an invitation issued to that
+    // address was then redeemable by whichever of the two the attacker held.
+    //
+    // The gate also refuses non-ASCII (#260): the `users_email_is_lowercase`
+    // CHECK folds in Postgres while this folds in Rust, and outside printable
+    // ASCII the two disagree. Refusing at the boundary makes that a 400 rather
+    // than a 500 from a CHECK violation deeper in. The repositories run the
+    // same gate, so this is the friendly-status layer, not the enforcement.
+    req.email = crate::auth::email::normalize_email(&req.email)
+        .map_err(AppError::to_api_error)?;
     if let Err(msg) = password::validate_password_strength(&req.password) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1584,7 +1592,13 @@ async fn oauth_complete_inner(
             Some(&auth_result.metadata),
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        // Carry the error's OWN status instead of stamping 500 on it. #251's
+        // normalisation gave this call a reachable 4xx — a provider-asserted
+        // address outside printable ASCII is refused at the write boundary
+        // (#260) — and forcing that to `500 SYSTEM_DATABASE_ERROR` on an
+        // unauthenticated callback is exactly the mis-reported-refusal shape
+        // #283 was filed for. A genuine database error still carries 500.
+        .map_err(AppError::to_api_error)?;
 
     let user = ctx
         .user()
