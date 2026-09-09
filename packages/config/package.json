@@ -24,7 +24,7 @@
     "ziee-kit-manifest": "./src/lint/kit-manifest.mjs"
   },
   "scripts": {
-    "test": "node --test scripts/config.test.mjs src/lint/settings-field.test.mjs src/lint/logical-direction.test.mjs"
+    "test": "node ../../scripts/run-node-tests.mjs --min 3"
   },
   "peerDependencies": {
     "typescript": "*"

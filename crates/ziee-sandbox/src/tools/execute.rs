@@ -5,6 +5,9 @@
 //! `StagedMount`s through to `build_bwrap_argv`. Every other caller
 //! continues to use the no-mounts `execute_command` and is unaffected.
 
+// Only the test module references StatusCode now that the not-initialized guard
+// routes through `config::not_initialized_error()`.
+#[cfg(test)]
 use axum::http::StatusCode;
 use serde_json::json;
 
@@ -57,6 +60,53 @@ pub async fn execute_command(
     execute_command_with_mounts(ctx, command, flavor, &[], None).await
 }
 
+/// Replace known HOST absolute-path prefixes in captured sandbox output with
+/// sandbox-relative placeholders — upholding the no-host-path-leak invariant on
+/// the SUCCESS (`isError:false`) result path (the JSON-RPC 5xx error path is
+/// already covered by `map_tool_error`). bwrap's OWN setup-failure diagnostics
+/// (a dead mount → "Can't mount … <host path>") land on stderr and are returned
+/// as a normal result; without this the host bind-source paths would reach the
+/// model verbatim.
+///
+/// It scrubs EVERY host path bwrap binds and can therefore name in a
+/// setup-failure message: the per-conversation `workspace_root` (which also
+/// covers its `<conv>` subdir and the identity dir under it), the rootfs
+/// `mount_dir`, and each `extra_host_source` — the workflow/provider mount
+/// sources (`StagedMount.host_path`, e.g. a desktop host folder) and the
+/// caller-injected read-only binds (`ctx.extra_ro_binds`, e.g. the `/lit`
+/// full-text view). bwrap echoes the argv path verbatim in its errors, so
+/// matching the configured strings covers that vector. No-op on legitimate
+/// command output — the workload's own stdout only ever references the in-sandbox
+/// paths (`/home/sandboxuser`, `/`), never these host sources.
+///
+/// `pub` so the consuming server crate can acceptance-test the no-host-path-leak
+/// invariant through the `code_sandbox::tools::execute` re-export (the same seam
+/// it uses to call `execute_command`); it is a pure, side-effect-free transform.
+pub fn redact_host_paths(
+    text: &str,
+    workspace_root: &std::path::Path,
+    rootfs_mount_dir: &std::path::Path,
+    extra_host_sources: &[&str],
+) -> String {
+    let mut out = text.to_string();
+    if let Some(ws) = workspace_root.to_str()
+        && !ws.is_empty()
+    {
+        out = out.replace(ws, "<sandbox-workspace>");
+    }
+    if let Some(rf) = rootfs_mount_dir.to_str()
+        && !rf.is_empty()
+    {
+        out = out.replace(rf, "<sandbox-rootfs>");
+    }
+    for src in extra_host_sources {
+        if !src.is_empty() {
+            out = out.replace(*src, "<sandbox-mount>");
+        }
+    }
+    out
+}
+
 /// `execute_command` with additional per-call bwrap binds (workflow
 /// runner integration; B4) + an optional live-progress sink. Mounts are
 /// partitioned by mode in `build_bwrap_argv` (RO → `--ro-bind`, RW →
@@ -72,13 +122,7 @@ pub async fn execute_command_with_mounts(
     extra_mounts: &[StagedMount],
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 ) -> Result<serde_json::Value, AppError> {
-    let state = config::get_state().ok_or_else(|| {
-        AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "SANDBOX_NOT_INITIALIZED",
-            "code_sandbox state not initialized; module disabled or not yet booted",
-        )
-    })?;
+    let state = config::get_state().ok_or_else(config::not_initialized_error)?;
 
     // Per-conversation workspace dir lives directly under the
     // workspace root (see handlers.rs::workspace_for).
@@ -171,9 +215,33 @@ pub async fn execute_command_with_mounts(
         )
         .await?;
 
+    // Uphold the no-host-path-leak invariant on the SUCCESS path too. bwrap's
+    // OWN setup-failure diagnostics (e.g. a dead mount →
+    // "bwrap: Can't mount … <host path>") are captured on stderr and returned
+    // with isError:false; scrub EVERY host bind-source bwrap can name so a host
+    // path never reaches the model. No-op on legitimate output (the workload only
+    // ever sees /home/sandboxuser and /usr).
+    let mut extra_host_sources: Vec<&str> = all_mounts
+        .iter()
+        .filter_map(|m| m.host_path.to_str())
+        .collect();
+    extra_host_sources.extend(ctx.extra_ro_binds.iter().map(|(src, _dst)| src.as_str()));
+    let stdout = redact_host_paths(
+        &result.stdout,
+        &state.workspace_root,
+        &ensure.mount_dir,
+        &extra_host_sources,
+    );
+    let stderr = redact_host_paths(
+        &result.stderr,
+        &state.workspace_root,
+        &ensure.mount_dir,
+        &extra_host_sources,
+    );
+
     let mut response = json!({
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "stdout": stdout,
+        "stderr": stderr,
         "exit_code": result.exit_code,
         "timed_out": result.timed_out,
         "duration_ms": result.duration_ms,
@@ -390,5 +458,93 @@ mod tests {
             CONVERSATION_FLAVOR.get(&conv).is_none(),
             "the early SANDBOX_NOT_INITIALIZED return must not pin a flavor lock"
         );
+    }
+
+    // TEST-2 [acceptance INV-1]: the SANDBOX_NOT_INITIALIZED error carries the
+    // ACTUAL recorded reason from init_status().explain(), and never the false
+    // "module disabled or not yet booted" clause the old message asserted.
+    #[tokio::test]
+    async fn uninitialized_error_states_the_real_reason() {
+        if config::get_state().is_some() {
+            return; // another in-process test booted the sandbox; skip.
+        }
+        let conv = Uuid::new_v4();
+        let ctx = ctx_for(conv);
+
+        let err = execute_command(&ctx, "echo hi", "minimal")
+            .await
+            .expect_err("uninitialized sandbox must return an error");
+        let msg = err.to_string();
+
+        // The real reason (default status in a lib-test process is
+        // NotInitialized) must be present…
+        assert!(
+            msg.contains(config::init_status().explain()),
+            "message must include the recorded reason; got: {msg}"
+        );
+        // …and the misleading guessed clauses must be gone.
+        assert!(
+            !msg.contains("not yet booted") && !msg.contains("module disabled"),
+            "message must not assert a guessed cause; got: {msg}"
+        );
+        CONVERSATION_FLAVOR.remove(&conv);
+    }
+
+    // TEST-4 [acceptance INV-3]: redact_host_paths replaces the host workspace
+    // root, rootfs mount-dir, AND every extra bind source (workflow/provider
+    // mounts + caller ro-binds) with sandbox-relative placeholders, and is a
+    // no-op when the text carries no host path.
+    #[test]
+    fn redact_host_paths_scrubs_known_roots_and_is_noop_otherwise() {
+        let ws = PathBuf::from("/var/lib/ziee/sandboxes");
+        let rootfs = PathBuf::from("/var/cache/ziee/sandbox-rootfs/v3-minimal/mount");
+        // A provider host-folder mount + a caller ro-bind (the /lit view) — the
+        // two families the first cut of the fix missed.
+        let extra = ["/home/alice/Documents", "/data/lit-cache/view/conv-abc"];
+
+        let text = "opened /var/lib/ziee/sandboxes/abc/data.txt from \
+                    /var/cache/ziee/sandbox-rootfs/v3-minimal/mount/usr/bin/cat, \
+                    /home/alice/Documents/report.pdf and \
+                    /data/lit-cache/view/conv-abc/paper.xml";
+        let out = redact_host_paths(text, &ws, &rootfs, &extra);
+        assert!(!out.contains("/var/lib/ziee/sandboxes"), "workspace root scrubbed: {out}");
+        assert!(!out.contains("/var/cache/ziee/sandbox-rootfs"), "rootfs root scrubbed: {out}");
+        assert!(!out.contains("/home/alice/Documents"), "provider mount source scrubbed: {out}");
+        assert!(!out.contains("/data/lit-cache"), "caller ro-bind source scrubbed: {out}");
+        assert!(out.contains("<sandbox-workspace>") && out.contains("<sandbox-rootfs>"));
+        assert!(out.contains("<sandbox-mount>"), "extra mount placeholder present: {out}");
+
+        // Legitimate in-sandbox output carries no host path → unchanged.
+        let clean = "hello from /home/sandboxuser working in /usr/bin";
+        assert_eq!(redact_host_paths(clean, &ws, &rootfs, &[]), clean);
+    }
+
+    // TEST-5 [acceptance INV-3]: a simulated bwrap dead-mount stderr line — the
+    // exact shape a dead mount produces, which a workload never emits — no longer
+    // contains the host absolute path after redaction, for BOTH a rootfs mount
+    // and a provider host-folder mount.
+    #[test]
+    fn redact_host_paths_scrubs_bwrap_dead_mount_stderr() {
+        let ws = PathBuf::from("/data/ziee/sandboxes");
+        let rootfs = PathBuf::from("/data/ziee/rootfs-cache/current/mount");
+        let extra = ["/home/bob/secret-project"];
+
+        let rootfs_stderr = "bwrap: Can't mount /data/ziee/rootfs-cache/current/mount/usr \
+                             on /newroot/usr: Transport endpoint is not connected";
+        let out = redact_host_paths(rootfs_stderr, &ws, &rootfs, &extra);
+        assert!(
+            !out.contains("/data/ziee/rootfs-cache"),
+            "the host rootfs path must not survive into the model-facing result: {out}"
+        );
+        assert!(out.contains("<sandbox-rootfs>/usr"), "placeholder in place: {out}");
+
+        let mount_stderr = "bwrap: Can't find source path \
+                            /home/bob/secret-project: No such file or directory";
+        let out2 = redact_host_paths(mount_stderr, &ws, &rootfs, &extra);
+        assert!(
+            !out2.contains("/home/bob/secret-project"),
+            "a dead provider/extra mount source must not leak to the model: {out2}"
+        );
+        assert!(out2.contains("<sandbox-mount>"), "extra mount placeholder present: {out2}");
     }
 }

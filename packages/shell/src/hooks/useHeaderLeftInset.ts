@@ -1,14 +1,10 @@
-import { appLayoutSeam } from '../app-store-seams'
+import { appLayoutChrome } from '../app-store-seams'
 
 /**
  * SEAM: reads `Stores.AppLayout.isSidebarCollapsed` through a typed view (never
  * the app's concrete store type); the cast preserves the live proxy so the read
  * stays reactive. Mirrors the AppLayout / DivScrollY seams.
  */
-interface InsetSeam {
-  isSidebarCollapsed: boolean
-}
-
 /**
  * The header's LEFT padding (px) that reserves space for the fixed
  * `SidebarToggleButton` (the sidebar collapse/expand button, which floats over
@@ -23,7 +19,6 @@ export function useHeaderLeftInset(): number {
   // Optional read: a header can render in a store-LESS context (an isolated
   // gallery overlay, a layout-less route) where the AppLayout seam is absent.
   // Fall back to the not-collapsed inset rather than throwing.
-  const isSidebarCollapsed =
-    (appLayoutSeam.peek() as InsetSeam | null)?.isSidebarCollapsed ?? false
+  const { isSidebarCollapsed } = appLayoutChrome()
   return isSidebarCollapsed ? 48 : 12
 }

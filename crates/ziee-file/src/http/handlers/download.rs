@@ -16,6 +16,7 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use super::super::context::FileContext;
 use crate::get_file_storage;
 use crate::permissions::{FilesDownload, FilesGenerateToken};
+use crate::seams::FileAccess;
 use crate::types::{
     DownloadTokenClaims, DownloadTokenGenQuery, DownloadTokenResponse, DOWNLOAD_TOKEN_AUDIENCE,
 };
@@ -105,11 +106,12 @@ pub async fn download_file<R: IdentityResolver<User = User, Group = Group>>(
 ) -> ApiResult<Response> {
     let user_id = auth.user.id;
 
-    // Get file and verify ownership
-    let file = ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    // Resolve the file FOR this principal: owner scope AND the host's access
+    // policy. This route hands over the original bytes, so it asks for
+    // `ReadContent`.
+    let file = ctx
+        .authorized_file(user_id, file_id, FileAccess::ReadContent)
+        .await?;
 
     // Extract extension
     let extension = file
@@ -158,11 +160,19 @@ pub async fn generate_download_token<R: IdentityResolver<User = User, Group = Gr
 ) -> ApiResult<Json<DownloadTokenResponse>> {
     let user_id = auth.user.id;
 
-    // Verify file exists and user owns it
-    ctx.files
-        .get_by_id_and_user(file_id, user_id)
-        .await?
-        .ok_or_else(|| AppError::not_found("File"))?;
+    // A download token is a durable, transferable capability for the original
+    // bytes, redeemed by a route the HOST mounts, which honours the signature
+    // without re-consulting this policy. Minting is therefore gated as
+    // `ReadContent`, exactly like the download itself.
+    //
+    // RESIDUE, stated plainly: this gate stops a principal from minting a NEW
+    // token after their access is revoked. It cannot revoke one already minted —
+    // a token issued a second before revocation stays redeemable for the rest of
+    // `TOKEN_EXPIRY`. A host that mounts a redeeming route and needs revocation
+    // to be immediate MUST re-consult `FileAccessPolicy` at redemption; the
+    // signature alone is not an authorization.
+    ctx.authorized_file(user_id, file_id, FileAccess::ReadContent)
+        .await?;
 
     // If a version was requested, verify it exists (and is owned) before
     // baking it into the signed claims.

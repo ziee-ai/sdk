@@ -36,11 +36,15 @@ function CopyButton({ copyable }: { copyable: Copyable }) {
       aria-label={copyable.label}
       data-testid={copyable.testId}
       onClick={() => {
+        // A denied/unavailable clipboard rejects (NotAllowedError) — swallow it
+        // exactly as the sibling Table copy path does (table.tsx `onKeyDown`),
+        // so a permission denial is never an uncaught rejection. `done` stays
+        // false on failure, so no false "copied" checkmark is shown.
         void navigator.clipboard?.writeText(copyable.text).then(() => {
           setDone(true)
           clearTimeout(timer.current)
           timer.current = setTimeout(() => setDone(false), 1500)
-        })
+        }).catch(() => {})
       }}
       className="relative ms-1 inline-flex align-middle opacity-60 hover:opacity-100 focus-visible:outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
     >

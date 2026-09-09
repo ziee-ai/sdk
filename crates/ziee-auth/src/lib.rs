@@ -15,6 +15,13 @@ pub mod user;
 
 pub use models::{Group, User};
 
+// The injectable in-transaction user-created hook (gap G-AUTHEVT). Re-exported
+// at the crate root so a consumer installs it as `ziee_auth::install_user_created_hook(..)`,
+// mirroring the ergonomics of `ziee_auth::auth::install_auth_sync_sink`.
+pub use user::hook::{
+    NoopUserCreatedHook, UserCreatedHook, install_user_created_hook, user_created_hook,
+};
+
 /// The auth module's own migrations (structural auth-table DDL), embedded at
 /// build time. The app composes these ∪ its remaining migrations into one
 /// version-sorted merged set for BOTH its runtime `migrate` and its build-DB

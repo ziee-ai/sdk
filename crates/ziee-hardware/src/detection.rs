@@ -145,6 +145,12 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
     // Try NVML first
     match nvml_wrapper::Nvml::init() {
         Ok(nvml) => {
+            // Hoisted out of the per-device loop below: this is a
+            // driver-wide fact, and each call does its own Nvml init/shutdown.
+            // Inside the loop it was O(number of GPUs) redundant inits — eight
+            // on this class of machine.
+            let cuda_version = get_cuda_version();
+
             if let Ok(device_count) = nvml.device_count() {
                 for i in 0..device_count {
                     if let Ok(device) = nvml.device_by_index(i) {
@@ -152,10 +158,24 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
                         let memory = device.memory_info().ok().map(|mem| mem.total);
                         let driver_version = nvml.sys_driver_version().ok();
 
-                        let cuda_version = device
-                            .cuda_compute_capability()
-                            .ok()
-                            .map(|cap| format!("{}.{}", cap.major, cap.minor));
+                        // The CUDA RUNTIME version the driver supports — which
+                        // is what a field named `cuda_version` means, and what
+                        // `HardwareSettings.tsx` renders as "CUDA ✓ (x.y)".
+                        //
+                        // This previously used `device.cuda_compute_capability()`,
+                        // which is the SM COMPUTE CAPABILITY: an H200 reported
+                        // "9.0" and the UI displayed it as if it were a CUDA
+                        // version. Two different quantities were sharing one
+                        // field, depending only on whether NVML happened to
+                        // initialise. `get_cuda_version()` below already had
+                        // the correct source (`sys_cuda_driver_version`); it
+                        // was simply not used on this path.
+                        //
+                        // Compute capability is no longer surfaced. Restoring
+                        // it needs its own schema field + UI, which is a
+                        // separate change.
+                        //
+                        // `cuda_version` is computed once above the loop.
 
                         gpu_devices.push(GPUDevice {
                             device_id: format!("cuda:{}", i),
@@ -165,7 +185,7 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
                             driver_version,
                             compute_capabilities: GPUComputeCapabilities {
                                 cuda_support: true,
-                                cuda_version,
+                                cuda_version: cuda_version.clone(),
                                 metal_support: false,
                                 opencl_support: true,
                                 vulkan_support: Some(true),
@@ -186,28 +206,74 @@ fn detect_nvidia_gpus() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
     Ok(gpu_devices)
 }
 
+/// Extract a **validated** CUDA version string from `nvidia-smi`, trying the
+/// same surfaces (and the same shared parser) ziee's backend detection uses.
+///
+/// Returns a normalised `"13.3"`, never a raw token — so `N/A`, `Deprecated,`
+/// or a stray table glyph can no longer reach `HardwareSettings.tsx`, which
+/// renders this value verbatim.
+///
+/// Split out from its caller purely so the parsing half is unit-testable; the
+/// impure half is the `trusted_command` calls.
+///
+/// **Deliberately only TWO surfaces, unlike ziee's backend detection, which
+/// tries three.** Nothing in this crate has a subprocess timeout — every call
+/// here is a bare blocking `cmd.output()` — so a wedged `nvidia-smi` (a known
+/// failure mode with a hung driver) blocks for as long as it hangs, once per
+/// probe. `--version` covers modern drivers and the bare banner covers
+/// pre-R6xx; `-q` would add a third call for no host the first two miss.
+///
+/// Being accurate about the trade rather than flattering it: the old code made
+/// **one** call for the version scrape, and this path now makes **three** in
+/// total (`--version`, the banner, and the separate `--query-gpu` below), so
+/// worst-case hang exposure went UP by roughly half — it was not held constant.
+/// Dropping `-q` limits the increase; it does not erase it.
+///
+/// Reached synchronously from `GET /hardware` → `detect_gpu_devices`, and only
+/// on the NVML-**failed** branch. It is NOT on the 2s SSE monitoring tick — that
+/// calls `get_gpu_usage_data`, which never reaches here.
+///
+/// The missing timeout is a real pre-existing defect in this crate — ziee's
+/// `gpu_detect` has `probe_command_with_timeout` and this does not — but
+/// porting it touches every probe here and belongs in its own change.
+#[cfg(feature = "gpu-detect")]
+fn cuda_version_from_smi() -> Option<String> {
+    for args in [vec!["--version"], vec![]] {
+        if let Some(mut cmd) = trusted_command("nvidia-smi")
+            && let Ok(output) = cmd.args(&args).output()
+            && output.status.success()
+            && let Some(version) = crate::gpu_version::parse_cuda_smi_version(
+                &String::from_utf8_lossy(&output.stdout),
+            )
+        {
+            // NOT `version.to_string()`: `Display` renders an unknown minor as
+            // `13.x`, which this crate's consumer (`HardwareSettings.tsx`)
+            // would render verbatim as "CUDA ✓ (13.x)". Emit the bare major
+            // instead, so the value is always a plain version string that
+            // round-trips through the parser.
+            return Some(match version.minor {
+                Some(minor) => format!("{}.{}", version.major, minor),
+                None => version.major.to_string(),
+            });
+        }
+    }
+    None
+}
+
 // Fallback NVIDIA GPU detection using nvidia-smi
 #[cfg(feature = "gpu-detect")]
 fn detect_nvidia_gpus_nvidia_smi() -> Result<Vec<GPUDevice>, Box<dyn std::error::Error>> {
     let mut gpu_devices = Vec::new();
 
-    // First, get CUDA version from nvidia-smi header
-    let mut cuda_version = None;
-    if let Some(mut cmd) = trusted_command("nvidia-smi")
-    && let Ok(output) = cmd.output()
-        && output.status.success() {
-            let output_str = String::from_utf8_lossy(&output.stdout);
-            for line in output_str.lines() {
-                if line.contains("CUDA Version:")
-                    && let Some(version_part) = line.split("CUDA Version:").nth(1) {
-                        cuda_version = version_part
-                            .split_whitespace()
-                            .next()
-                            .map(|v| v.to_string());
-                        break;
-                    }
-            }
-        }
+    // First, get the CUDA version from nvidia-smi.
+    //
+    // This used to scrape the literal `"CUDA Version:"` and store whatever
+    // token followed it, unvalidated — the same bug (and the same broken byte
+    // sequence) as ziee's `llm_local_runtime::utils::gpu_detect`. Driver 610
+    // prints `CUDA UMD Version: 13.3`, so the scrape found nothing; and when
+    // it did match, `N/A` was rendered to the user verbatim. Both call the
+    // shared parser now, so the two cannot drift apart again.
+    let cuda_version = cuda_version_from_smi();
 
     // Query GPU information
     if let Some(mut cmd) = trusted_command("nvidia-smi")
@@ -767,6 +833,24 @@ fn get_cuda_version() -> Option<String> {
     None
 }
 
+/// macOS counterpart, so the symbol exists on every target.
+///
+/// Required because `detect_nvidia_gpus` is gated on the `gpu-detect` FEATURE
+/// with no OS gate, so it is compiled on macOS too and its body must resolve.
+/// The pre-existing caller at the top of this file sits inside a
+/// `#[cfg(not(target_os = "macos"))]` block and so never needed this; the
+/// NVML call site added for the compute-capability fix does.
+///
+/// Without it, `desktop-release.yml`'s `aarch64-apple-darwin` /
+/// `x86_64-apple-darwin` legs fail to compile — and macOS CI runs no Rust at
+/// all (it is TypeScript-only), so the break would first appear at a release
+/// tag. There is no Apple hardware for NVML to talk to anyway, so `None` is
+/// also the correct answer, not merely a compiling one.
+#[cfg(target_os = "macos")]
+fn get_cuda_version() -> Option<String> {
+    None
+}
+
 fn check_opencl_support() -> bool {
     #[cfg(feature = "gpu-detect")]
     {
@@ -856,6 +940,91 @@ mod tests {
             if let Some(mem) = d.memory {
                 assert!(mem > 0, "reported memory must be positive: {d:?}");
             }
+        }
+    }
+
+    /// TEST-35 — the nvidia-smi fallback path yields a VALIDATED version
+    /// string, never a raw token. `HardwareSettings.tsx` renders this value
+    /// verbatim, so `N/A` or a table glyph reaching it is a user-visible
+    /// defect. Self-skips where nvidia-smi is absent.
+    #[cfg(feature = "gpu-detect")]
+    #[test]
+    fn smi_cuda_version_is_validated_not_a_raw_token() {
+        // The skip condition must be "nvidia-smi is absent", NOT "no version
+        // came back". Collapsing the two makes this test skip GREEN on exactly
+        // the bug it exists to guard: a present, working nvidia-smi whose
+        // version cannot be parsed is the reported defect, and an earlier
+        // version of this test reported that as a skip.
+        // Three states, not two, and the middle one is why the first attempt
+        // at this test was wrong in BOTH directions:
+        //   1. binary absent                      → skip
+        //   2. binary present, driver not working → skip (a container without
+        //      /dev/nvidia*, a GPU in reset, `nvidia-smi` exiting non-zero with
+        //      "couldn't communicate with the NVIDIA driver"). NOT a bug here.
+        //   3. binary present, driver answering, still no version → FAIL, that
+        //      is the reported defect.
+        // Skipping on 2+3 together hides the bug; failing on 2+3 together turns
+        // a healthy-but-driverless host red.
+        let Some(mut probe) = trusted_command("nvidia-smi") else {
+            eprintln!("SKIP: nvidia-smi is not installed on this host");
+            return;
+        };
+        let answering = probe
+            .args(["--query-gpu=name", "--format=csv,noheader"])
+            .output()
+            .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+            .unwrap_or(false);
+        if !answering {
+            eprintln!("SKIP: nvidia-smi is present but enumerated no GPU (driver not working)");
+            return;
+        }
+
+        let version = cuda_version_from_smi().expect(
+            "nvidia-smi is present and enumerating GPUs, but no CUDA version could be \
+             parsed — that is the reported bug, not a reason to skip",
+        );
+        // Must round-trip through the shared parser: anything the parser
+        // rejects can no longer be produced here.
+        assert!(
+            crate::gpu_version::parse_cuda_smi_version(&format!("CUDA Version: {version}"))
+                .is_some(),
+            "emitted {version:?}, which is not a parseable version"
+        );
+        assert!(
+            version.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "emitted {version:?}, which is not digit-led"
+        );
+    }
+
+    /// TEST-36 — `cuda_version` must carry the CUDA RUNTIME version, not the
+    /// SM compute capability.
+    ///
+    /// Before this change the NVML path wrote `cuda_compute_capability()` into
+    /// the field, so an H200 reported `"9.0"` and the UI rendered it as
+    /// "CUDA ✓ (9.0)". The two quantities shared one field depending only on
+    /// whether NVML initialised. Self-skips where no NVIDIA device is present.
+    #[cfg(feature = "gpu-detect")]
+    #[test]
+    fn nvml_cuda_version_is_the_runtime_version_not_compute_capability() {
+        let devices = detect_gpu_devices();
+        let Some(nvidia) = devices.iter().find(|d| d.vendor == "NVIDIA") else {
+            eprintln!("SKIP: no NVIDIA device detected on this host");
+            return;
+        };
+        let Some(reported) = nvidia.compute_capabilities.cuda_version.as_deref() else {
+            eprintln!("SKIP: no cuda_version reported for {}", nvidia.name);
+            return;
+        };
+        eprintln!("device={} cuda_version={reported}", nvidia.name);
+
+        // Cross-check against nvidia-smi, the independent source. If both
+        // agree we know the field means what its name says.
+        if let Some(from_smi) = cuda_version_from_smi() {
+            assert_eq!(
+                reported, from_smi,
+                "cuda_version must match the driver's CUDA runtime version from nvidia-smi, \
+                 not the SM compute capability"
+            );
         }
     }
 

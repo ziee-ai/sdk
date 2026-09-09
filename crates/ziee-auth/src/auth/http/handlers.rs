@@ -433,7 +433,8 @@ async fn login_with_provider(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         // Fetch the newly created user
-        ctx.user()
+        let created = ctx
+            .user()
             .get_by_id(new_user_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -442,7 +443,14 @@ async fn login_with_provider(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     AppError::internal_error("Failed to fetch newly created user"),
                 )
-            })?
+            })?;
+
+        // Emit UserCreated — the LDAP/external first-login creation path used to
+        // drop this event, firing only on local register (gap G-AUTHEVT).
+        ctx.events.emit_user(UserEvent::Created {
+            user: created.clone(),
+        });
+        created
     };
 
     // Check if user is active
@@ -876,6 +884,15 @@ pub async fn update_profile<R: IdentityResolver<User = User, Group = Group>>(
         if t.is_empty() { None } else { Some(t) }
     });
 
+    // Bound + charset gate on the trimmed value. This path previously had NO
+    // display_name validation at all, so a 256-character name overflowed the
+    // varchar(255) column and a name containing U+0000 could not be stored at
+    // all — both reached the client as a generic 500 SYSTEM_DATABASE_ERROR.
+    // Validated AFTER trimming so the bound applies to what is actually stored.
+    if let Some(ref d) = display_name {
+        crate::auth::username::validate_display_name(d).map_err(AppError::to_api_error)?;
+    }
+
     // Username uniqueness friendly pre-check: only a *different* user
     // holding the name is a conflict — re-submitting your own current
     // username is a no-op. The DB UNIQUE constraint (mapped to 409 inside
@@ -922,7 +939,9 @@ pub fn update_profile_docs(op: TransformOperation) -> TransformOperation {
         .tag("auth")
         .response::<200, Json<User>>()
         .response_with::<409, (), _>(|r| r.description("Username already taken"))
-        .response_with::<400, (), _>(|r| r.description("Username is empty"))
+        .response_with::<400, (), _>(|r| {
+            r.description("Username or display name failed validation")
+        })
 }
 
 /// POST /api/auth/password
@@ -1567,7 +1586,8 @@ async fn oauth_complete_inner(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    let user = ctx.user()
+    let user = ctx
+        .user()
         .get_by_id(new_user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
@@ -1577,6 +1597,11 @@ async fn oauth_complete_inner(
                 AppError::internal_error("Failed to fetch newly created user"),
             )
         })?;
+
+    // Emit UserCreated — the OAuth first-login creation path used to drop this
+    // event, firing only on local register (gap G-AUTHEVT).
+    ctx.events
+        .emit_user(UserEvent::Created { user: user.clone() });
 
     let minted =
         mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)

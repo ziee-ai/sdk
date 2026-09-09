@@ -62,6 +62,17 @@ interface NotificationItemProps {
  *
  * The content uses a role="button" clickable div (NOT a `<button>`) so a kind's
  * `actions` buttons never nest inside another button — invalid HTML.
+ *
+ * CONTAINMENT: the content COLUMN — not the fallback `Text`s — carries
+ * `min-w-0 wrap-anywhere`, and that placement is load-bearing. What fills the
+ * column is whatever an app's REGISTERED kind renderer returns (ziee's
+ * `modules/notification/kinds.tsx` registers every scheduler kind, so the
+ * fallback block below is NOT what the common rows use). A wrap rule on the
+ * fallback would therefore leave every registered kind overflowing.
+ * `overflow-wrap: anywhere` inherits into the renderer's subtree and, unlike
+ * `break-word`, also shrinks the column's min-content contribution — so a long
+ * unbroken token (a PMC id, a DOI, a filename) can neither overflow the row nor
+ * force the flex row wider than the popover panel that contains it.
  */
 export function NotificationItem({
   n,
@@ -73,8 +84,8 @@ export function NotificationItem({
   const content = renderContent(n, ctx)
 
   return (
-    <Flex className="w-full flex-col gap-2">
-      <Flex className="w-full items-start gap-2">
+    <Flex className="w-full min-w-0 flex-col gap-2">
+      <Flex className="w-full min-w-0 items-start gap-2">
         {!n.read_at && (
           <span
             className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary"
@@ -94,12 +105,12 @@ export function NotificationItem({
                 onSelect()
               }
             }}
-            className="flex min-w-0 flex-1 cursor-pointer flex-col items-start gap-0.5 text-start"
+            className="flex min-w-0 flex-1 cursor-pointer flex-col items-start gap-0.5 wrap-anywhere text-start"
           >
             {content}
           </div>
         ) : (
-          <div className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
+          <div className="flex min-w-0 flex-1 flex-col items-start gap-0.5 wrap-anywhere">
             {content}
           </div>
         )}
@@ -125,7 +136,18 @@ export function NotificationItem({
         </Flex>
       </Flex>
       {renderer?.actions ? (
-        <Flex className="gap-2 pl-4">
+        // `ps-4` (logical), not `pl-4` — DESIGN_SYSTEM.md's RTL-ready rule.
+        // NOTE the repo's `npm run lint:logical-direction` does NOT reach this
+        // file: it diffs the PARENT repo and filters to
+        // `src-app/{ui,desktop/ui}/src/`, so a change inside the `sdk` submodule
+        // is invisible to it (the parent sees only a pointer bump). The actual
+        // enforcement for this package is the rendered-DOM sweep in
+        // `src-app/ui/src/modules/notification/components/NotificationBellPopover.test.tsx`
+        // (TEST-7), which mounts this component and fails on any
+        // physical-direction layout class anywhere in the subtree.
+        // `flex-wrap` so a kind's action buttons wrap onto a second line in a
+        // narrow panel instead of widening the row past it.
+        <Flex className="w-full min-w-0 flex-wrap gap-2 ps-4">
           {renderer.actions(n as unknown as AppNotification, ctx)}
         </Flex>
       ) : null}

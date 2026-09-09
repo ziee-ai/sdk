@@ -123,6 +123,10 @@ async fn create_seeds_v1_head_view() {
 
 /// Owner-scoped reads: a foreign user never sees another user's file (single +
 /// batch), while the owner does.
+/// TEST-11 (fix/ziee-file-authz) — REGRESSION PIN. The authorization seam added
+/// `list_ids_by_user` + `list_by_user_filtered` alongside these queries and
+/// rewired every HTTP handler through a choke point. The store's own owner
+/// scoping must be unchanged by that, and this is the test that says so.
 #[tokio::test]
 async fn reads_are_owner_scoped() {
     let (pool, db) = fresh_db().await;
@@ -157,6 +161,11 @@ async fn reads_are_owner_scoped() {
 /// `list_by_user` paginates one row per file (newest first) and clamps
 /// `per_page` into `[1, 100]` so neither `0` nor an enormous value escapes the
 /// bound.
+// Exercises the deprecated unfiltered lister ON PURPOSE: the method still has
+// legitimate non-request callers, so its paging/clamping behaviour stays pinned.
+// The deprecation steers ROUTE authors to `FileContext::authorized_list`; it does
+// not mean the method is untested.
+#[allow(deprecated)]
 #[tokio::test]
 async fn list_by_user_paginates_and_clamps_per_page() {
     let (pool, db) = fresh_db().await;

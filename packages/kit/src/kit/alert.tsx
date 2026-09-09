@@ -42,13 +42,17 @@ export type AlertProps =
   | (AlertCommon & { onClose?: undefined; closeLabel?: never })
   | (AlertCommon & { onClose: () => void; closeLabel: string })
 
-export function Alert({ tone = 'info', title, description, icon, className, children, 'data-testid': testid, ...rest }: AlertProps) {
+export function Alert({ tone = 'info', title, description, icon, className, children, 'data-testid': testid, onClose, closeLabel, ...rest }: AlertProps) {
   const Icon = toneIcon[tone]
   const role = tone === 'error' || tone === 'warning' ? 'alert' : 'status'
-  const onClose = (rest as { onClose?: () => void }).onClose
-  const closeLabel = (rest as { closeLabel?: string }).closeLabel
   return (
-    <Base role={role} className={cn(toneCls[tone], onClose && 'pe-10', 'relative', className)} data-testid={testid}>
+    // `...rest` MUST be spread onto the root. Everything named is destructured
+    // above, so `rest` can only hold pass-through DOM attributes — `data-*` /
+    // `aria-*` (hyphenated JSX attributes skip excess-property checking, so TS
+    // accepts them silently). Dropping it made those attributes vanish with no
+    // type error and no runtime warning: a caller marking an alert with a
+    // `data-*` cause saw it simply never reach the DOM.
+    <Base {...rest} role={role} className={cn(toneCls[tone], onClose && 'pe-10', 'relative', className)} data-testid={testid}>
       {/* Render the caller's icon as a DIRECT child (an <svg>), never wrapped in
           a <span>: the shadcn Alert base switches to its 2-column icon layout via
           `has-[>svg]` + `*:[svg]:row-span-2`, which only matches a direct svg. A

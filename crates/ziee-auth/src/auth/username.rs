@@ -1,4 +1,4 @@
-//! Shared username validation.
+//! Shared username + display-name validation.
 //!
 //! `users.username` is `character varying(100) NOT NULL` (see
 //! `migrations/202607140050_auth_schema.sql`). Before this module the bound was
@@ -27,6 +27,11 @@ pub const USERNAME_MIN_CHARS: usize = 3;
 /// `chars()`, not bytes (a byte bound would spuriously reject a legitimate
 /// 40-character CJK username).
 pub const USERNAME_MAX_CHARS: usize = 100;
+
+/// Upper bound for `display_name`, in characters. Matches the
+/// `users.display_name character varying(255)` column exactly, and is counted
+/// in `chars()` for the same reason as [`USERNAME_MAX_CHARS`].
+pub const DISPLAY_NAME_MAX_CHARS: usize = 255;
 
 /// True for Unicode bidirectional-control / zero-width / format characters that
 /// `char::is_control()` (category Cc only) misses. These enable Trojan-source /
@@ -98,12 +103,113 @@ pub fn validate_username(username: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Validate a user-supplied display name.
+///
+/// Unlike a username this is free-form prose (spaces, punctuation and any
+/// script are fine), so the rules are only the two the storage layer and the
+/// renderer actually require:
+///
+/// * **length** — `users.display_name` is `character varying(255)`, and every
+///   write path before this function left the bound entirely to Postgres. A
+///   256-character name therefore raised `22001 value too long` which
+///   `AppError::database_error` flattened into a generic 500
+///   `SYSTEM_DATABASE_ERROR` on `POST /api/auth/profile` and `POST /api/users`.
+/// * **control / bidi / zero-width characters** — U+0000 in particular cannot
+///   be stored in a Postgres text column at all (`22021 invalid byte sequence`,
+///   another 500), and the bidi overrides are the same Trojan-source display
+///   spoof [`validate_username`] rejects.
+///
+/// The caller is expected to have trimmed the value; a blank name is the
+/// caller's "clear it" signal, not an error, so emptiness is NOT rejected here.
+pub fn validate_display_name(display_name: &str) -> Result<(), AppError> {
+    if display_name.chars().count() > DISPLAY_NAME_MAX_CHARS {
+        return Err(AppError::bad_request(
+            "INVALID_DISPLAY_NAME",
+            format!("Display name must be at most {DISPLAY_NAME_MAX_CHARS} characters"),
+        ));
+    }
+
+    if display_name
+        .chars()
+        .any(|c| c.is_control() || is_bidi_or_zero_width(c))
+    {
+        return Err(AppError::bad_request(
+            "INVALID_DISPLAY_NAME",
+            "Display name cannot contain control or text-direction characters",
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn err_of(u: &str) -> AppError {
         validate_username(u).expect_err("expected rejection")
+    }
+
+    fn display_err_of(d: &str) -> AppError {
+        validate_display_name(d).expect_err("expected rejection")
+    }
+
+    // ─── display name ───────────────────────────────────────────
+
+    #[test]
+    fn display_name_accepts_free_form_prose() {
+        for d in [
+            "",
+            "Admin User",
+            "Ada Lovelace-Byron, Jr.",
+            "山田 太郎",
+            "😀 emoji name",
+        ] {
+            assert!(validate_display_name(d).is_ok(), "input {d:?}");
+        }
+    }
+
+    #[test]
+    fn display_name_accepts_exactly_the_column_bound() {
+        assert!(validate_display_name(&"d".repeat(DISPLAY_NAME_MAX_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn display_name_rejects_over_the_column_bound() {
+        // The reproduced 500: 256 chars overflowed varchar(255) as a raw 22001.
+        for d in ["d".repeat(DISPLAY_NAME_MAX_CHARS + 1), "d".repeat(5000)] {
+            let e = display_err_of(&d);
+            assert_eq!(e.error_code(), "INVALID_DISPLAY_NAME");
+            assert_eq!(e.status_code(), 400);
+        }
+    }
+
+    #[test]
+    fn display_name_bound_is_counted_in_characters_not_bytes() {
+        // 255 astral chars = 1020 bytes. A byte bound would wrongly reject this
+        // even though varchar(255) stores it fine.
+        let astral = "😀".repeat(DISPLAY_NAME_MAX_CHARS);
+        assert_eq!(astral.chars().count(), DISPLAY_NAME_MAX_CHARS);
+        assert!(astral.len() > DISPLAY_NAME_MAX_CHARS);
+        assert!(validate_display_name(&astral).is_ok());
+    }
+
+    #[test]
+    fn display_name_rejects_nul_and_other_control_characters() {
+        // U+0000 cannot be stored in a Postgres text column at all — it was a
+        // raw 22021 -> 500 on every display-name write path.
+        for d in ["abc\u{0}def", "line\u{7}bell", "a\nb"] {
+            let e = display_err_of(d);
+            assert_eq!(e.error_code(), "INVALID_DISPLAY_NAME", "input {d:?}");
+            assert_eq!(e.status_code(), 400, "input {d:?}");
+        }
+    }
+
+    #[test]
+    fn display_name_rejects_bidi_and_zero_width_spoofs() {
+        for d in ["spoof\u{202E}ed", "zero\u{200B}width"] {
+            assert_eq!(display_err_of(d).error_code(), "INVALID_DISPLAY_NAME");
+        }
     }
 
     // ─── length bound ───────────────────────────────────────────

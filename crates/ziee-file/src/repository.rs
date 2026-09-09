@@ -316,6 +316,22 @@ impl FileRepository {
 
     /// List files for user with pagination (head views). One row per file —
     /// the head join attaches head metadata, so versioned files appear once.
+    /// **Unfiltered owner-scoped listing — NOT the route path.**
+    ///
+    /// `GET /files` goes through [`crate::http::FileContext::authorized_list`],
+    /// which filters through the host's [`crate::seams::FileAccessPolicy`] before
+    /// paging. This method applies no policy at all, so wiring a route to it
+    /// re-opens the enumeration this seam exists to close — the same hazard
+    /// [`crate::http::FileContext::authorize`]'s doc records for
+    /// [`Self::get_by_id`].
+    ///
+    /// It is kept for callers that legitimately need the full owner footprint
+    /// with no principal to authorize (administrative sweeps, quota/footprint
+    /// accounting). If you are serving a request, you want `authorized_list`.
+    #[deprecated(
+        since = "0.0.0",
+        note = "unfiltered: use FileContext::authorized_list for anything serving a request"
+    )]
     pub async fn list_by_user(
         &self,
         user_id: Uuid,
@@ -356,6 +372,84 @@ impl FileRepository {
             LIMIT $2 OFFSET $3
             "#,
             user_id,
+            per_page64,
+            offset
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::database_error)?;
+
+        Ok((files, total))
+    }
+
+    /// Every file id owned by `user_id`, newest first — the candidate set an
+    /// authorization policy filters before the list is paged.
+    ///
+    /// Ids only: this runs on every list request, so it stays a narrow index-ish
+    /// scan rather than materializing rows that will mostly be paged away.
+    pub async fn list_ids_by_user(&self, user_id: Uuid) -> Result<Vec<Uuid>, AppError> {
+        sqlx::query_scalar!(
+            r#"SELECT id as "id!" FROM files WHERE user_id = $1 ORDER BY created_at DESC"#,
+            user_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::database_error)
+    }
+
+    /// [`Self::list_by_user`] restricted to an explicit id allow-list.
+    ///
+    /// Both the page AND the `total` are computed over the restricted set, so a
+    /// filtered listing cannot report a count that includes what it withheld.
+    /// Passing an empty allow-list yields an empty page and a `total` of 0 — a
+    /// principal with no readable files is indistinguishable from one with no
+    /// files.
+    ///
+    /// `user_id` is retained as a conjunct alongside the allow-list: the ids come
+    /// from a host policy, and the store does not take a caller-supplied id set
+    /// as permission to leave its own owner scope.
+    pub async fn list_by_user_filtered(
+        &self,
+        user_id: Uuid,
+        allowed: &[Uuid],
+        page: i32,
+        per_page: i32,
+    ) -> Result<(Vec<File>, i64), AppError> {
+        let page64 = (page as i64).max(1);
+        // Same clamp as `list_by_user` — `?per_page=100000000` must not force an
+        // unbounded LIMIT.
+        let per_page64 = (per_page as i64).clamp(1, 100i64);
+        let offset = (page64 - 1).saturating_mul(per_page64);
+
+        let total: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) as "count!" FROM files
+               WHERE user_id = $1 AND id = ANY($2)"#,
+            user_id,
+            allowed
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(AppError::database_error)?;
+
+        let files = sqlx::query_as!(
+            File,
+            r#"
+            SELECT f.id, f.user_id, f.filename, f.file_size, f.mime_type, f.checksum,
+                   f.has_thumbnail, f.preview_page_count, f.text_page_count,
+                   f.processing_metadata as "processing_metadata!: _",
+                   f.created_by,
+                   f.created_at as "created_at: _",
+                   f.updated_at as "updated_at: _",
+                   fv.version, f.current_version_id as "current_version_id!",
+                   fv.blob_version_id
+            FROM files f
+            JOIN file_versions fv ON fv.id = f.current_version_id
+            WHERE f.user_id = $1 AND f.id = ANY($2)
+            ORDER BY f.created_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+            user_id,
+            allowed,
             per_page64,
             offset
         )

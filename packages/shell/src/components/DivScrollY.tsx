@@ -4,7 +4,7 @@ import {
   type OverlayScrollbarsComponentProps,
   type OverlayScrollbarsComponentRef,
 } from 'overlayscrollbars-react'
-import { appLayoutSeam } from '../app-store-seams'
+import { appLayoutChrome } from '../app-store-seams'
 
 export interface DivScrollYProps
   extends Omit<OverlayScrollbarsComponentProps, 'options'> {
@@ -31,9 +31,7 @@ export const DivScrollY = forwardRef<
   // crashing the whole subtree. Read via a typed view so the shell doesn't
   // depend on the app's app-layout store type; runtime is identical to reading
   // `Stores.AppLayout` directly.
-  const { nativeScroll } =
-    (appLayoutSeam.peek() as { nativeScroll?: boolean } | null) ??
-    {}
+  const { nativeScroll } = appLayoutChrome()
 
   if (nativeFlow && nativeScroll) {
     // Same flex wrapper as the scroller path (below) minus overflow-y-auto, so

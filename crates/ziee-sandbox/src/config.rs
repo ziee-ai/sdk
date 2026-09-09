@@ -32,6 +32,54 @@ pub enum SandboxAvailability {
     NotInitialized,
 }
 
+impl SandboxAvailability {
+    /// A precise, operator-facing explanation of WHY the sandbox is (or isn't)
+    /// available — used to build the `SANDBOX_NOT_INITIALIZED` error so the
+    /// message names the ACTUAL recorded cause instead of guessing.
+    ///
+    /// `init()` is a set-once `OnceCell`, so on a live server the status never
+    /// changes after boot: there is no "not yet booted, try later" state to
+    /// report — hence no such phrasing here.
+    pub fn explain(self) -> &'static str {
+        match self {
+            SandboxAvailability::Ready => "the sandbox is initialized and ready",
+            SandboxAvailability::DisabledInConfig => {
+                "code_sandbox is disabled in config (code_sandbox.enabled: false)"
+            }
+            SandboxAvailability::HostUnsupported => {
+                "the host does not support the sandbox (on Linux this means bwrap \
+                 is not installed or not on PATH)"
+            }
+            SandboxAvailability::CloudImdsRefused => {
+                "registration was refused because a cloud instance-metadata \
+                 endpoint is reachable and allow_cloud_imds_reachable is not set"
+            }
+            SandboxAvailability::WorkspaceInitFailed => {
+                "the per-conversation workspace root could not be created at boot"
+            }
+            SandboxAvailability::PoolMissing => {
+                "the sandbox state carries no database pool (an in-process test edge case)"
+            }
+            SandboxAvailability::NotInitialized => {
+                "code_sandbox has not been initialized (init() has not run for this process)"
+            }
+        }
+    }
+}
+
+/// Build the standard `SANDBOX_NOT_INITIALIZED` (503) error with the ACTUAL
+/// recorded reason from [`init_status`] embedded — so a caller sees the real
+/// cause (a host gate, disabled-in-config, workspace-init failure, …) instead
+/// of the old guessed "module disabled or not yet booted". One honest source of
+/// truth shared by every `get_state()`-guard call site (SDK + server).
+pub fn not_initialized_error() -> ziee_core::AppError {
+    ziee_core::AppError::new(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "SANDBOX_NOT_INITIALIZED",
+        format!("code_sandbox is not available: {}", init_status().explain()),
+    )
+}
+
 static STATE: OnceCell<Arc<CodeSandboxState>> = OnceCell::new();
 
 /// Records WHY `init()` finished the way it did. Set once per process at every
@@ -106,5 +154,41 @@ mod tests {
         // write-wins behavior is exercised by the integration harness (each test
         // is its own server subprocess) rather than mutated here.
         assert_eq!(init_status(), SandboxAvailability::NotInitialized);
+    }
+
+    // TEST-1 [acceptance INV-1]: every variant explains itself accurately, and
+    // NO variant's reason contains the false "not yet booted" clause the old
+    // message asserted (init() is set-once — it can never boot later).
+    #[test]
+    fn explain_gives_a_specific_honest_reason_per_variant() {
+        let all = [
+            SandboxAvailability::Ready,
+            SandboxAvailability::DisabledInConfig,
+            SandboxAvailability::HostUnsupported,
+            SandboxAvailability::CloudImdsRefused,
+            SandboxAvailability::WorkspaceInitFailed,
+            SandboxAvailability::PoolMissing,
+            SandboxAvailability::NotInitialized,
+        ];
+        for v in all {
+            let reason = v.explain();
+            assert!(!reason.is_empty(), "{v:?} must explain itself");
+            assert!(
+                !reason.contains("not yet booted"),
+                "{v:?}: the false 'not yet booted' clause must be gone: {reason}"
+            );
+        }
+        // The specific reason that misled the investigator (a missing host dep)
+        // must name the host gate, not a guessed disjunction.
+        let host = SandboxAvailability::HostUnsupported.explain();
+        assert!(
+            host.contains("bwrap") && (host.contains("PATH") || host.contains("host")),
+            "HostUnsupported must name the bwrap/host gate: {host}"
+        );
+        // The disabled reason must NOT be reported for a host-gate failure.
+        assert!(
+            !host.contains("disabled"),
+            "HostUnsupported must not guess 'disabled': {host}"
+        );
     }
 }

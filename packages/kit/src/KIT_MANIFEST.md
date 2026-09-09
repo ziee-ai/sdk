@@ -25,13 +25,14 @@ Cross-cutting rules every agent must follow:
 | `data-testid` | `string` |  |
 | `items` | `AccordionItemDef[]` |  |
 
-<details><summary>Optional props (6)</summary>
+<details><summary>Optional props (7)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `className` | `string | undefined` |  |
 | `defaultValue` | `string | string[] | undefined` |  |
 | `ghost` | `boolean | undefined` |  |
+| `keepMounted` | `boolean | undefined` |  |
 | `onValueChange` | `((v: string) => void) | ((v: string[]) => void) | undefined` |  |
 | `type` | `"multiple" | "single" | undefined` |  |
 | `value` | `string | string[] | undefined` |  |
@@ -192,8 +193,8 @@ _No always-required props._
 |---|---|---|
 | `aria-label` | `string | undefined` | Defines a string value that labels the current element. |
 | `block` | `boolean | undefined` | Full-width block button (legacy `block`). |
+| `destructive` | `boolean | undefined` | THIS BUTTON DESTROYS SOMETHING. It is not a look — `variant="destructive"` already implies it — it is a DECLARATION for the machinery tha… |
 | `href` | `string | undefined` | Render as an <a> styled as a button (pair with variant="link" for a text link). |
-| `destructive` | `boolean | undefined` | THIS BUTTON DESTROYS SOMETHING. Not a look (`variant="destructive"` already implies it) — a declaration, so an overlay's initial focus… |
 | `icon` | `ReactNode` | Leading icon (legacy `icon`); rendered before children, replaced by the spinner while loading. |
 | `loading` | `boolean | undefined` |  |
 | `size` | `"default" | "lg" | "icon" | undefined` |  |
@@ -242,13 +243,63 @@ _No always-required props._
 |---|---|---|
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). |
 
-<details><summary>Optional props (16)</summary>
+<details><summary>Optional props (67)</summary>
 
 | prop | type | notes |
 |---|---|---|
+| `aria-activedescendant` | `UnforwardedAria | undefined` |  |
+| `aria-atomic` | `UnforwardedAria | undefined` |  |
+| `aria-autocomplete` | `UnforwardedAria | undefined` |  |
+| `aria-braillelabel` | `UnforwardedAria | undefined` |  |
+| `aria-brailleroledescription` | `UnforwardedAria | undefined` |  |
+| `aria-busy` | `UnforwardedAria | undefined` |  |
+| `aria-checked` | `UnforwardedAria | undefined` |  |
+| `aria-colcount` | `UnforwardedAria | undefined` |  |
+| `aria-colindex` | `UnforwardedAria | undefined` |  |
+| `aria-colindextext` | `UnforwardedAria | undefined` |  |
+| `aria-colspan` | `UnforwardedAria | undefined` |  |
+| `aria-controls` | `UnforwardedAria | undefined` |  |
+| `aria-current` | `UnforwardedAria | undefined` |  |
 | `aria-describedby` | `string | undefined` |  |
+| `aria-description` | `UnforwardedAria | undefined` |  |
+| `aria-details` | `UnforwardedAria | undefined` |  |
+| `aria-disabled` | `UnforwardedAria | undefined` |  |
+| `aria-dropeffect` | `UnforwardedAria | undefined` |  |
+| `aria-errormessage` | `UnforwardedAria | undefined` |  |
+| `aria-expanded` | `UnforwardedAria | undefined` |  |
+| `aria-flowto` | `UnforwardedAria | undefined` |  |
+| `aria-grabbed` | `UnforwardedAria | undefined` |  |
+| `aria-haspopup` | `UnforwardedAria | undefined` |  |
+| `aria-hidden` | `UnforwardedAria | undefined` |  |
+| `aria-invalid` | `UnforwardedAria | undefined` |  |
+| `aria-keyshortcuts` | `UnforwardedAria | undefined` |  |
 | `aria-label` | `string | undefined` |  |
 | `aria-labelledby` | `string | undefined` |  |
+| `aria-level` | `UnforwardedAria | undefined` |  |
+| `aria-live` | `UnforwardedAria | undefined` |  |
+| `aria-modal` | `UnforwardedAria | undefined` |  |
+| `aria-multiline` | `UnforwardedAria | undefined` |  |
+| `aria-multiselectable` | `UnforwardedAria | undefined` |  |
+| `aria-orientation` | `UnforwardedAria | undefined` |  |
+| `aria-owns` | `UnforwardedAria | undefined` |  |
+| `aria-placeholder` | `UnforwardedAria | undefined` |  |
+| `aria-posinset` | `UnforwardedAria | undefined` |  |
+| `aria-pressed` | `UnforwardedAria | undefined` |  |
+| `aria-readonly` | `UnforwardedAria | undefined` |  |
+| `aria-relevant` | `UnforwardedAria | undefined` |  |
+| `aria-required` | `boolean | undefined` | Marks the control required for assistive tech. `FormField required` INJECTS this (via cloneElement, untyped), so a control that neither d… |
+| `aria-roledescription` | `UnforwardedAria | undefined` |  |
+| `aria-rowcount` | `UnforwardedAria | undefined` |  |
+| `aria-rowindex` | `UnforwardedAria | undefined` |  |
+| `aria-rowindextext` | `UnforwardedAria | undefined` |  |
+| `aria-rowspan` | `UnforwardedAria | undefined` |  |
+| `aria-selected` | `UnforwardedAria | undefined` |  |
+| `aria-setsize` | `UnforwardedAria | undefined` |  |
+| `aria-sort` | `UnforwardedAria | undefined` |  |
+| `aria-valuemax` | `UnforwardedAria | undefined` |  |
+| `aria-valuemin` | `UnforwardedAria | undefined` |  |
+| `aria-valuenow` | `UnforwardedAria | undefined` |  |
+| `aria-valuetext` | `UnforwardedAria | undefined` |  |
 | `checked` | `boolean | undefined` |  |
 | `className` | `string | undefined` |  |
 | `defaultChecked` | `boolean | undefined` |  |
@@ -261,6 +312,7 @@ _No always-required props._
 | `onBlur` | `(() => void) | undefined` |  |
 | `onChange` | `((checked: boolean) => void) | ((checked: boolean) => void) | ((checked: boolean) => vo…` |  |
 | `onCheckedChange` | `((checked: boolean) => void) | ((checked: boolean) => void) | ((checked: boolean) => vo…` |  |
+| `unavailableReason` | `string | undefined` | WHY this checkbox is unavailable. Presence means unavailable — the string IS the reason, rather than a boolean plus a separate message th… |
 | `value` | `boolean | undefined` |  |
 
 </details>
@@ -276,14 +328,64 @@ _No always-required props._
 | `options` | `ComboboxOption[]` |  |
 | `placeholder` | `string` | Field text when nothing is selected (required — caller owns it for i18n). |
 
-<details><summary>Optional props (19)</summary>
+<details><summary>Optional props (69)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `allowStyle` | `true | undefined` |  |
+| `aria-activedescendant` | `UnforwardedAria | undefined` |  |
+| `aria-atomic` | `UnforwardedAria | undefined` |  |
+| `aria-autocomplete` | `UnforwardedAria | undefined` |  |
+| `aria-braillelabel` | `UnforwardedAria | undefined` |  |
+| `aria-brailleroledescription` | `UnforwardedAria | undefined` |  |
+| `aria-busy` | `UnforwardedAria | undefined` |  |
+| `aria-checked` | `UnforwardedAria | undefined` |  |
+| `aria-colcount` | `UnforwardedAria | undefined` |  |
+| `aria-colindex` | `UnforwardedAria | undefined` |  |
+| `aria-colindextext` | `UnforwardedAria | undefined` |  |
+| `aria-colspan` | `UnforwardedAria | undefined` |  |
+| `aria-controls` | `UnforwardedAria | undefined` |  |
+| `aria-current` | `UnforwardedAria | undefined` |  |
 | `aria-describedby` | `string | undefined` |  |
+| `aria-description` | `UnforwardedAria | undefined` |  |
+| `aria-details` | `UnforwardedAria | undefined` |  |
+| `aria-disabled` | `UnforwardedAria | undefined` |  |
+| `aria-dropeffect` | `UnforwardedAria | undefined` |  |
+| `aria-errormessage` | `UnforwardedAria | undefined` |  |
+| `aria-expanded` | `UnforwardedAria | undefined` |  |
+| `aria-flowto` | `UnforwardedAria | undefined` |  |
+| `aria-grabbed` | `UnforwardedAria | undefined` |  |
+| `aria-haspopup` | `UnforwardedAria | undefined` |  |
+| `aria-hidden` | `UnforwardedAria | undefined` |  |
+| `aria-invalid` | `UnforwardedAria | undefined` |  |
+| `aria-keyshortcuts` | `UnforwardedAria | undefined` |  |
 | `aria-label` | `string | undefined` |  |
 | `aria-labelledby` | `string | undefined` |  |
+| `aria-level` | `UnforwardedAria | undefined` |  |
+| `aria-live` | `UnforwardedAria | undefined` |  |
+| `aria-modal` | `UnforwardedAria | undefined` |  |
+| `aria-multiline` | `UnforwardedAria | undefined` |  |
+| `aria-multiselectable` | `UnforwardedAria | undefined` |  |
+| `aria-orientation` | `UnforwardedAria | undefined` |  |
+| `aria-owns` | `UnforwardedAria | undefined` |  |
+| `aria-placeholder` | `UnforwardedAria | undefined` |  |
+| `aria-posinset` | `UnforwardedAria | undefined` |  |
+| `aria-pressed` | `UnforwardedAria | undefined` |  |
+| `aria-readonly` | `UnforwardedAria | undefined` |  |
+| `aria-relevant` | `UnforwardedAria | undefined` |  |
+| `aria-required` | `boolean | undefined` | Marks the control required for assistive tech. `FormField required` INJECTS this (via cloneElement, untyped), so a control that neither d… |
+| `aria-roledescription` | `UnforwardedAria | undefined` |  |
+| `aria-rowcount` | `UnforwardedAria | undefined` |  |
+| `aria-rowindex` | `UnforwardedAria | undefined` |  |
+| `aria-rowindextext` | `UnforwardedAria | undefined` |  |
+| `aria-rowspan` | `UnforwardedAria | undefined` |  |
+| `aria-selected` | `UnforwardedAria | undefined` |  |
+| `aria-setsize` | `UnforwardedAria | undefined` |  |
+| `aria-sort` | `UnforwardedAria | undefined` |  |
+| `aria-valuemax` | `UnforwardedAria | undefined` |  |
+| `aria-valuemin` | `UnforwardedAria | undefined` |  |
+| `aria-valuenow` | `UnforwardedAria | undefined` |  |
+| `aria-valuetext` | `UnforwardedAria | undefined` |  |
 | `className` | `string | undefined` |  |
 | `defaultValue` | `string | undefined` |  |
 | `disabled` | `boolean | undefined` |  |
@@ -319,10 +421,10 @@ _No always-required props._
 | prop | type | notes |
 |---|---|---|
 | `children` | `ReactElement<unknown, string | JSXElementConstructor<any>> | undefined` | The trigger element. Optional when driving the dialog via `open`/`onOpenChange`. |
-| `initialFocus` | `string | RefObject<HTMLElement | null> | false | undefined` | Where focus lands when the prompt opens. Defaults to the first tabbable that is not destructive — which, for an "are you sure?", is… |
 | `danger` | `boolean | undefined` |  |
 | `description` | `ReactNode` |  |
-| `okButtonProps` | `{ danger?: boolean | undefined; disabled?: boolean | undefined; } | undefined` | Extra props forwarded to the confirm button (legacy `okButtonProps`), e.g. { danger: true }. |
+| `initialFocus` | `InitialFocus` | Where focus lands when the prompt opens. Defaults to the first tabbable that is not destructive — which, for an "are you sure?", is Cancel. |
+| `okButtonProps` | `{ danger?: boolean | undefined; disabled?: boolean | undefined; } | undefined` | Extra props forwarded to the confirm button (legacy `okButtonProps`), e.g. { danger: true }. `disabled` here is the LAST reason-less refu… |
 | `okUnavailableReason` | `string | undefined` | WHY the confirm cannot be pressed. Presence means unavailable; the string IS the reason. |
 | `onCancel` | `(() => void) | undefined` | Called when the user cancels/dismisses (legacy `onCancel`). |
 | `onOpenChange` | `((open: boolean) => void) | undefined` | Fires when the open state should change (pairs with `open`). |
@@ -340,14 +442,63 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). |
 | `placeholder` | `string` | Trigger text when nothing is selected (required — caller owns it for i18n). |
 
-<details><summary>Optional props (22)</summary>
+<details><summary>Optional props (71)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `allowStyle` | `true | undefined` |  |
+| `aria-activedescendant` | `UnforwardedAria | undefined` |  |
+| `aria-atomic` | `UnforwardedAria | undefined` |  |
+| `aria-autocomplete` | `UnforwardedAria | undefined` |  |
+| `aria-braillelabel` | `UnforwardedAria | undefined` |  |
+| `aria-brailleroledescription` | `UnforwardedAria | undefined` |  |
+| `aria-busy` | `UnforwardedAria | undefined` |  |
+| `aria-checked` | `UnforwardedAria | undefined` |  |
+| `aria-colcount` | `UnforwardedAria | undefined` |  |
+| `aria-colindex` | `UnforwardedAria | undefined` |  |
+| `aria-colindextext` | `UnforwardedAria | undefined` |  |
+| `aria-colspan` | `UnforwardedAria | undefined` |  |
+| `aria-controls` | `UnforwardedAria | undefined` |  |
+| `aria-current` | `UnforwardedAria | undefined` |  |
 | `aria-describedby` | `string | undefined` |  |
+| `aria-description` | `UnforwardedAria | undefined` |  |
+| `aria-details` | `UnforwardedAria | undefined` |  |
+| `aria-disabled` | `UnforwardedAria | undefined` |  |
+| `aria-dropeffect` | `UnforwardedAria | undefined` |  |
+| `aria-errormessage` | `UnforwardedAria | undefined` |  |
+| `aria-expanded` | `UnforwardedAria | undefined` |  |
+| `aria-flowto` | `UnforwardedAria | undefined` |  |
+| `aria-grabbed` | `UnforwardedAria | undefined` |  |
+| `aria-haspopup` | `UnforwardedAria | undefined` |  |
+| `aria-hidden` | `UnforwardedAria | undefined` |  |
+| `aria-invalid` | `UnforwardedAria | undefined` |  |
+| `aria-keyshortcuts` | `UnforwardedAria | undefined` |  |
 | `aria-labelledby` | `string | undefined` |  |
+| `aria-level` | `UnforwardedAria | undefined` |  |
+| `aria-live` | `UnforwardedAria | undefined` |  |
+| `aria-modal` | `UnforwardedAria | undefined` |  |
+| `aria-multiline` | `UnforwardedAria | undefined` |  |
+| `aria-multiselectable` | `UnforwardedAria | undefined` |  |
+| `aria-orientation` | `UnforwardedAria | undefined` |  |
+| `aria-owns` | `UnforwardedAria | undefined` |  |
+| `aria-placeholder` | `UnforwardedAria | undefined` |  |
+| `aria-posinset` | `UnforwardedAria | undefined` |  |
+| `aria-pressed` | `UnforwardedAria | undefined` |  |
+| `aria-readonly` | `UnforwardedAria | undefined` |  |
+| `aria-relevant` | `UnforwardedAria | undefined` |  |
 | `aria-required` | `boolean | undefined` |  |
+| `aria-roledescription` | `UnforwardedAria | undefined` |  |
+| `aria-rowcount` | `UnforwardedAria | undefined` |  |
+| `aria-rowindex` | `UnforwardedAria | undefined` |  |
+| `aria-rowindextext` | `UnforwardedAria | undefined` |  |
+| `aria-rowspan` | `UnforwardedAria | undefined` |  |
+| `aria-selected` | `UnforwardedAria | undefined` |  |
+| `aria-setsize` | `UnforwardedAria | undefined` |  |
+| `aria-sort` | `UnforwardedAria | undefined` |  |
+| `aria-valuemax` | `UnforwardedAria | undefined` |  |
+| `aria-valuemin` | `UnforwardedAria | undefined` |  |
+| `aria-valuenow` | `UnforwardedAria | undefined` |  |
+| `aria-valuetext` | `UnforwardedAria | undefined` |  |
 | `className` | `string | undefined` |  |
 | `defaultValue` | `string | Date | undefined` |  |
 | `disabled` | `boolean | undefined` |  |
@@ -401,15 +552,16 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto the dialog content <root> (i18n-safe). |
 | `title` | `ReactNode` | Accessible name — required (Radix Dialog must be labelled). |
 
-<details><summary>Optional props (9)</summary>
+<details><summary>Optional props (10)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `children` | `ReactNode` |  |
 | `className` | `string | undefined` |  |
+| `closeLabel` | `string | undefined` | Accessible name AND hover text for the corner ×. Defaults to 'Close' — the word this component has always hardcoded — so it is optional; … |
 | `description` | `ReactNode` |  |
 | `footer` | `ReactNode` |  |
-| `initialFocus` | `string | RefObject<HTMLElement | null> | false | undefined` | WHERE FOCUS LANDS when the dialog opens — a `data-testid`, a ref, or `false`. Omitting it is safe: the default skips anything marked… |
+| `initialFocus` | `InitialFocus` | WHERE FOCUS LANDS when the dialog opens — a `data-testid`, a ref, or `false` for "leave it on the popup". OMITTING IT IS SAFE: the defaul… |
 | `onOpenChange` | `((open: boolean) => void) | undefined` |  |
 | `open` | `boolean | undefined` |  |
 | `size` | `"default" | "sm" | "lg" | "xl" | undefined` |  |
@@ -769,16 +921,65 @@ _No always-required props._
 | `removeLabel` | `(label: string) => string` | Builds the accessible name for a tag's remove button, e.g. (label) => `Remove ${label}`. |
 | `searchPlaceholder` | `string` |  |
 
-<details><summary>Optional props (21)</summary>
+<details><summary>Optional props (70)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `allowCreate` | `boolean | undefined` | Allow adding free-text values not in `options` (legacy Select mode="tags"). |
 | `allowStyle` | `true | undefined` |  |
+| `aria-activedescendant` | `UnforwardedAria | undefined` |  |
+| `aria-atomic` | `UnforwardedAria | undefined` |  |
+| `aria-autocomplete` | `UnforwardedAria | undefined` |  |
+| `aria-braillelabel` | `UnforwardedAria | undefined` |  |
+| `aria-brailleroledescription` | `UnforwardedAria | undefined` |  |
+| `aria-busy` | `UnforwardedAria | undefined` |  |
+| `aria-checked` | `UnforwardedAria | undefined` |  |
+| `aria-colcount` | `UnforwardedAria | undefined` |  |
+| `aria-colindex` | `UnforwardedAria | undefined` |  |
+| `aria-colindextext` | `UnforwardedAria | undefined` |  |
+| `aria-colspan` | `UnforwardedAria | undefined` |  |
+| `aria-controls` | `UnforwardedAria | undefined` |  |
+| `aria-current` | `UnforwardedAria | undefined` |  |
 | `aria-describedby` | `string | undefined` |  |
+| `aria-description` | `UnforwardedAria | undefined` |  |
+| `aria-details` | `UnforwardedAria | undefined` |  |
+| `aria-disabled` | `UnforwardedAria | undefined` |  |
+| `aria-dropeffect` | `UnforwardedAria | undefined` |  |
+| `aria-errormessage` | `UnforwardedAria | undefined` |  |
+| `aria-expanded` | `UnforwardedAria | undefined` |  |
+| `aria-flowto` | `UnforwardedAria | undefined` |  |
+| `aria-grabbed` | `UnforwardedAria | undefined` |  |
+| `aria-haspopup` | `UnforwardedAria | undefined` |  |
+| `aria-hidden` | `UnforwardedAria | undefined` |  |
+| `aria-invalid` | `UnforwardedAria | undefined` |  |
+| `aria-keyshortcuts` | `UnforwardedAria | undefined` |  |
 | `aria-label` | `string | undefined` |  |
 | `aria-labelledby` | `string | undefined` |  |
+| `aria-level` | `UnforwardedAria | undefined` |  |
+| `aria-live` | `UnforwardedAria | undefined` |  |
+| `aria-modal` | `UnforwardedAria | undefined` |  |
+| `aria-multiline` | `UnforwardedAria | undefined` |  |
+| `aria-multiselectable` | `UnforwardedAria | undefined` |  |
+| `aria-orientation` | `UnforwardedAria | undefined` |  |
+| `aria-owns` | `UnforwardedAria | undefined` |  |
+| `aria-placeholder` | `UnforwardedAria | undefined` |  |
+| `aria-posinset` | `UnforwardedAria | undefined` |  |
+| `aria-pressed` | `UnforwardedAria | undefined` |  |
+| `aria-readonly` | `UnforwardedAria | undefined` |  |
+| `aria-relevant` | `UnforwardedAria | undefined` |  |
 | `aria-required` | `boolean | undefined` |  |
+| `aria-roledescription` | `UnforwardedAria | undefined` |  |
+| `aria-rowcount` | `UnforwardedAria | undefined` |  |
+| `aria-rowindex` | `UnforwardedAria | undefined` |  |
+| `aria-rowindextext` | `UnforwardedAria | undefined` |  |
+| `aria-rowspan` | `UnforwardedAria | undefined` |  |
+| `aria-selected` | `UnforwardedAria | undefined` |  |
+| `aria-setsize` | `UnforwardedAria | undefined` |  |
+| `aria-sort` | `UnforwardedAria | undefined` |  |
+| `aria-valuemax` | `UnforwardedAria | undefined` |  |
+| `aria-valuemin` | `UnforwardedAria | undefined` |  |
+| `aria-valuenow` | `UnforwardedAria | undefined` |  |
+| `aria-valuetext` | `UnforwardedAria | undefined` |  |
 | `className` | `string | undefined` |  |
 | `createLabel` | `((query: string) => string) | undefined` | Label for the "create" affordance. Falls back to `Create "<query>"`. |
 | `defaultValue` | `string[] | undefined` |  |
@@ -849,12 +1050,6 @@ _No always-required props._
 </details>
 
 ## PasswordInput
-
-> **`maxLength` is BANNED here** (omitted from the props type *and* stripped at runtime). A cap
-> enforced by discarding the overflow is undetectable on a masked field, and a confirm field with
-> the same cap hides even the mismatch — so the app ships a credential the user never chose. State
-> a length limit and REFUSE past it; never truncate a secret. (`<Input type="password">` is the
-> same hazard through a different door — the consuming app lints for it.)
 
 **Required:**
 
@@ -932,13 +1127,63 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). |
 | `options` | `RadioOption[]` |  |
 
-<details><summary>Optional props (14)</summary>
+<details><summary>Optional props (64)</summary>
 
 | prop | type | notes |
 |---|---|---|
+| `aria-activedescendant` | `UnforwardedAria | undefined` |  |
+| `aria-atomic` | `UnforwardedAria | undefined` |  |
+| `aria-autocomplete` | `UnforwardedAria | undefined` |  |
+| `aria-braillelabel` | `UnforwardedAria | undefined` |  |
+| `aria-brailleroledescription` | `UnforwardedAria | undefined` |  |
+| `aria-busy` | `UnforwardedAria | undefined` |  |
+| `aria-checked` | `UnforwardedAria | undefined` |  |
+| `aria-colcount` | `UnforwardedAria | undefined` |  |
+| `aria-colindex` | `UnforwardedAria | undefined` |  |
+| `aria-colindextext` | `UnforwardedAria | undefined` |  |
+| `aria-colspan` | `UnforwardedAria | undefined` |  |
+| `aria-controls` | `UnforwardedAria | undefined` |  |
+| `aria-current` | `UnforwardedAria | undefined` |  |
 | `aria-describedby` | `string | undefined` |  |
+| `aria-description` | `UnforwardedAria | undefined` |  |
+| `aria-details` | `UnforwardedAria | undefined` |  |
+| `aria-disabled` | `UnforwardedAria | undefined` |  |
+| `aria-dropeffect` | `UnforwardedAria | undefined` |  |
+| `aria-errormessage` | `UnforwardedAria | undefined` |  |
+| `aria-expanded` | `UnforwardedAria | undefined` |  |
+| `aria-flowto` | `UnforwardedAria | undefined` |  |
+| `aria-grabbed` | `UnforwardedAria | undefined` |  |
+| `aria-haspopup` | `UnforwardedAria | undefined` |  |
+| `aria-hidden` | `UnforwardedAria | undefined` |  |
+| `aria-invalid` | `UnforwardedAria | undefined` |  |
+| `aria-keyshortcuts` | `UnforwardedAria | undefined` |  |
 | `aria-label` | `string | undefined` |  |
 | `aria-labelledby` | `string | undefined` |  |
+| `aria-level` | `UnforwardedAria | undefined` |  |
+| `aria-live` | `UnforwardedAria | undefined` |  |
+| `aria-modal` | `UnforwardedAria | undefined` |  |
+| `aria-multiline` | `UnforwardedAria | undefined` |  |
+| `aria-multiselectable` | `UnforwardedAria | undefined` |  |
+| `aria-orientation` | `UnforwardedAria | undefined` |  |
+| `aria-owns` | `UnforwardedAria | undefined` |  |
+| `aria-placeholder` | `UnforwardedAria | undefined` |  |
+| `aria-posinset` | `UnforwardedAria | undefined` |  |
+| `aria-pressed` | `UnforwardedAria | undefined` |  |
+| `aria-readonly` | `UnforwardedAria | undefined` |  |
+| `aria-relevant` | `UnforwardedAria | undefined` |  |
+| `aria-required` | `boolean | undefined` | Marks the control required for assistive tech. `FormField required` INJECTS this (via cloneElement, untyped), so a control that neither d… |
+| `aria-roledescription` | `UnforwardedAria | undefined` |  |
+| `aria-rowcount` | `UnforwardedAria | undefined` |  |
+| `aria-rowindex` | `UnforwardedAria | undefined` |  |
+| `aria-rowindextext` | `UnforwardedAria | undefined` |  |
+| `aria-rowspan` | `UnforwardedAria | undefined` |  |
+| `aria-selected` | `UnforwardedAria | undefined` |  |
+| `aria-setsize` | `UnforwardedAria | undefined` |  |
+| `aria-sort` | `UnforwardedAria | undefined` |  |
+| `aria-valuemax` | `UnforwardedAria | undefined` |  |
+| `aria-valuemin` | `UnforwardedAria | undefined` |  |
+| `aria-valuenow` | `UnforwardedAria | undefined` |  |
+| `aria-valuetext` | `UnforwardedAria | undefined` |  |
 | `className` | `string | undefined` |  |
 | `defaultValue` | `string | undefined` |  |
 | `disabled` | `boolean | undefined` |  |
@@ -1017,12 +1262,63 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). |
 | `options` | `SegmentedOption[]` |  |
 
-<details><summary>Optional props (13)</summary>
+<details><summary>Optional props (64)</summary>
 
 | prop | type | notes |
 |---|---|---|
+| `aria-activedescendant` | `UnforwardedAria | undefined` |  |
+| `aria-atomic` | `UnforwardedAria | undefined` |  |
+| `aria-autocomplete` | `UnforwardedAria | undefined` |  |
+| `aria-braillelabel` | `UnforwardedAria | undefined` |  |
+| `aria-brailleroledescription` | `UnforwardedAria | undefined` |  |
+| `aria-busy` | `UnforwardedAria | undefined` |  |
+| `aria-checked` | `UnforwardedAria | undefined` |  |
+| `aria-colcount` | `UnforwardedAria | undefined` |  |
+| `aria-colindex` | `UnforwardedAria | undefined` |  |
+| `aria-colindextext` | `UnforwardedAria | undefined` |  |
+| `aria-colspan` | `UnforwardedAria | undefined` |  |
+| `aria-controls` | `UnforwardedAria | undefined` |  |
+| `aria-current` | `UnforwardedAria | undefined` |  |
 | `aria-describedby` | `string | undefined` |  |
+| `aria-description` | `UnforwardedAria | undefined` |  |
+| `aria-details` | `UnforwardedAria | undefined` |  |
+| `aria-disabled` | `UnforwardedAria | undefined` |  |
+| `aria-dropeffect` | `UnforwardedAria | undefined` |  |
+| `aria-errormessage` | `UnforwardedAria | undefined` |  |
+| `aria-expanded` | `UnforwardedAria | undefined` |  |
+| `aria-flowto` | `UnforwardedAria | undefined` |  |
+| `aria-grabbed` | `UnforwardedAria | undefined` |  |
+| `aria-haspopup` | `UnforwardedAria | undefined` |  |
+| `aria-hidden` | `UnforwardedAria | undefined` |  |
+| `aria-invalid` | `UnforwardedAria | undefined` |  |
+| `aria-keyshortcuts` | `UnforwardedAria | undefined` |  |
 | `aria-label` | `string | undefined` |  |
+| `aria-labelledby` | `UnforwardedAria | undefined` |  |
+| `aria-level` | `UnforwardedAria | undefined` |  |
+| `aria-live` | `UnforwardedAria | undefined` |  |
+| `aria-modal` | `UnforwardedAria | undefined` |  |
+| `aria-multiline` | `UnforwardedAria | undefined` |  |
+| `aria-multiselectable` | `UnforwardedAria | undefined` |  |
+| `aria-orientation` | `UnforwardedAria | undefined` |  |
+| `aria-owns` | `UnforwardedAria | undefined` |  |
+| `aria-placeholder` | `UnforwardedAria | undefined` |  |
+| `aria-posinset` | `UnforwardedAria | undefined` |  |
+| `aria-pressed` | `UnforwardedAria | undefined` |  |
+| `aria-readonly` | `UnforwardedAria | undefined` |  |
+| `aria-relevant` | `UnforwardedAria | undefined` |  |
+| `aria-required` | `UnforwardedAria | undefined` |  |
+| `aria-roledescription` | `UnforwardedAria | undefined` |  |
+| `aria-rowcount` | `UnforwardedAria | undefined` |  |
+| `aria-rowindex` | `UnforwardedAria | undefined` |  |
+| `aria-rowindextext` | `UnforwardedAria | undefined` |  |
+| `aria-rowspan` | `UnforwardedAria | undefined` |  |
+| `aria-selected` | `UnforwardedAria | undefined` |  |
+| `aria-setsize` | `UnforwardedAria | undefined` |  |
+| `aria-sort` | `UnforwardedAria | undefined` |  |
+| `aria-valuemax` | `UnforwardedAria | undefined` |  |
+| `aria-valuemin` | `UnforwardedAria | undefined` |  |
+| `aria-valuenow` | `UnforwardedAria | undefined` |  |
+| `aria-valuetext` | `UnforwardedAria | undefined` |  |
 | `className` | `string | undefined` |  |
 | `defaultValue` | `string | undefined` |  |
 | `disabled` | `boolean | undefined` |  |
@@ -1046,15 +1342,64 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). Options derive `${testid}-opt-${value}`. |
 | `options` | `(SelectOption | SelectOptionGroup)[]` |  |
 
-<details><summary>Optional props (24)</summary>
+<details><summary>Optional props (73)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `allowClear` | `boolean | undefined` |  |
+| `aria-activedescendant` | `UnforwardedAria | undefined` |  |
+| `aria-atomic` | `UnforwardedAria | undefined` |  |
+| `aria-autocomplete` | `UnforwardedAria | undefined` |  |
+| `aria-braillelabel` | `UnforwardedAria | undefined` |  |
+| `aria-brailleroledescription` | `UnforwardedAria | undefined` |  |
+| `aria-busy` | `UnforwardedAria | undefined` |  |
+| `aria-checked` | `UnforwardedAria | undefined` |  |
+| `aria-colcount` | `UnforwardedAria | undefined` |  |
+| `aria-colindex` | `UnforwardedAria | undefined` |  |
+| `aria-colindextext` | `UnforwardedAria | undefined` |  |
+| `aria-colspan` | `UnforwardedAria | undefined` |  |
+| `aria-controls` | `UnforwardedAria | undefined` |  |
+| `aria-current` | `UnforwardedAria | undefined` |  |
 | `aria-describedby` | `string | undefined` |  |
+| `aria-description` | `UnforwardedAria | undefined` |  |
+| `aria-details` | `UnforwardedAria | undefined` |  |
+| `aria-disabled` | `UnforwardedAria | undefined` |  |
+| `aria-dropeffect` | `UnforwardedAria | undefined` |  |
+| `aria-errormessage` | `UnforwardedAria | undefined` |  |
+| `aria-expanded` | `UnforwardedAria | undefined` |  |
+| `aria-flowto` | `UnforwardedAria | undefined` |  |
+| `aria-grabbed` | `UnforwardedAria | undefined` |  |
+| `aria-haspopup` | `UnforwardedAria | undefined` |  |
+| `aria-hidden` | `UnforwardedAria | undefined` |  |
+| `aria-invalid` | `UnforwardedAria | undefined` |  |
+| `aria-keyshortcuts` | `UnforwardedAria | undefined` |  |
 | `aria-label` | `string | undefined` |  |
 | `aria-labelledby` | `string | undefined` |  |
+| `aria-level` | `UnforwardedAria | undefined` |  |
+| `aria-live` | `UnforwardedAria | undefined` |  |
+| `aria-modal` | `UnforwardedAria | undefined` |  |
+| `aria-multiline` | `UnforwardedAria | undefined` |  |
+| `aria-multiselectable` | `UnforwardedAria | undefined` |  |
+| `aria-orientation` | `UnforwardedAria | undefined` |  |
+| `aria-owns` | `UnforwardedAria | undefined` |  |
+| `aria-placeholder` | `UnforwardedAria | undefined` |  |
+| `aria-posinset` | `UnforwardedAria | undefined` |  |
+| `aria-pressed` | `UnforwardedAria | undefined` |  |
+| `aria-readonly` | `UnforwardedAria | undefined` |  |
+| `aria-relevant` | `UnforwardedAria | undefined` |  |
 | `aria-required` | `boolean | undefined` |  |
+| `aria-roledescription` | `UnforwardedAria | undefined` |  |
+| `aria-rowcount` | `UnforwardedAria | undefined` |  |
+| `aria-rowindex` | `UnforwardedAria | undefined` |  |
+| `aria-rowindextext` | `UnforwardedAria | undefined` |  |
+| `aria-rowspan` | `UnforwardedAria | undefined` |  |
+| `aria-selected` | `UnforwardedAria | undefined` |  |
+| `aria-setsize` | `UnforwardedAria | undefined` |  |
+| `aria-sort` | `UnforwardedAria | undefined` |  |
+| `aria-valuemax` | `UnforwardedAria | undefined` |  |
+| `aria-valuemin` | `UnforwardedAria | undefined` |  |
+| `aria-valuenow` | `UnforwardedAria | undefined` |  |
+| `aria-valuetext` | `UnforwardedAria | undefined` |  |
 | `className` | `string | undefined` |  |
 | `clearLabel` | `string | undefined` |  |
 | `defaultValue` | `string | undefined` |  |
@@ -1101,12 +1446,13 @@ _No always-required props._
 | `data-testid` | `string` | Test selector — forwarded onto the sheet content <root> (i18n-safe). |
 | `title` | `ReactNode` | Accessible name — required (the dialog must be labelled). |
 
-<details><summary>Optional props (16)</summary>
+<details><summary>Optional props (17)</summary>
 
 | prop | type | notes |
 |---|---|---|
 | `children` | `ReactNode` |  |
 | `className` | `string | undefined` |  |
+| `closeLabel` | `string | undefined` | Accessible name AND hover text for the corner ×. Defaults to 'Close' — the word this component has always hardcoded — so it is optional; … |
 | `defaultSize` | `number | undefined` | Initial px size of the resizable axis (width for left/right, height for top/bottom). |
 | `description` | `ReactNode` |  |
 | `footer` | `ReactNode` |  |
@@ -1229,13 +1575,63 @@ _No always-required props._
 |---|---|---|
 | `data-testid` | `string` | Test selector — forwarded onto <root> (i18n-safe). |
 
-<details><summary>Optional props (18)</summary>
+<details><summary>Optional props (68)</summary>
 
 | prop | type | notes |
 |---|---|---|
+| `aria-activedescendant` | `UnforwardedAria | undefined` |  |
+| `aria-atomic` | `UnforwardedAria | undefined` |  |
+| `aria-autocomplete` | `UnforwardedAria | undefined` |  |
+| `aria-braillelabel` | `UnforwardedAria | undefined` |  |
+| `aria-brailleroledescription` | `UnforwardedAria | undefined` |  |
+| `aria-busy` | `UnforwardedAria | undefined` |  |
+| `aria-checked` | `UnforwardedAria | undefined` |  |
+| `aria-colcount` | `UnforwardedAria | undefined` |  |
+| `aria-colindex` | `UnforwardedAria | undefined` |  |
+| `aria-colindextext` | `UnforwardedAria | undefined` |  |
+| `aria-colspan` | `UnforwardedAria | undefined` |  |
+| `aria-controls` | `UnforwardedAria | undefined` |  |
+| `aria-current` | `UnforwardedAria | undefined` |  |
 | `aria-describedby` | `string | undefined` |  |
+| `aria-description` | `UnforwardedAria | undefined` |  |
+| `aria-details` | `UnforwardedAria | undefined` |  |
+| `aria-disabled` | `UnforwardedAria | undefined` |  |
+| `aria-dropeffect` | `UnforwardedAria | undefined` |  |
+| `aria-errormessage` | `UnforwardedAria | undefined` |  |
+| `aria-expanded` | `UnforwardedAria | undefined` |  |
+| `aria-flowto` | `UnforwardedAria | undefined` |  |
+| `aria-grabbed` | `UnforwardedAria | undefined` |  |
+| `aria-haspopup` | `UnforwardedAria | undefined` |  |
+| `aria-hidden` | `UnforwardedAria | undefined` |  |
+| `aria-invalid` | `UnforwardedAria | undefined` |  |
+| `aria-keyshortcuts` | `UnforwardedAria | undefined` |  |
 | `aria-label` | `string | undefined` |  |
 | `aria-labelledby` | `string | undefined` |  |
+| `aria-level` | `UnforwardedAria | undefined` |  |
+| `aria-live` | `UnforwardedAria | undefined` |  |
+| `aria-modal` | `UnforwardedAria | undefined` |  |
+| `aria-multiline` | `UnforwardedAria | undefined` |  |
+| `aria-multiselectable` | `UnforwardedAria | undefined` |  |
+| `aria-orientation` | `UnforwardedAria | undefined` |  |
+| `aria-owns` | `UnforwardedAria | undefined` |  |
+| `aria-placeholder` | `UnforwardedAria | undefined` |  |
+| `aria-posinset` | `UnforwardedAria | undefined` |  |
+| `aria-pressed` | `UnforwardedAria | undefined` |  |
+| `aria-readonly` | `UnforwardedAria | undefined` |  |
+| `aria-relevant` | `UnforwardedAria | undefined` |  |
+| `aria-required` | `boolean | undefined` | Marks the control required for assistive tech. `FormField required` INJECTS this (via cloneElement, untyped), so a control that neither d… |
+| `aria-roledescription` | `UnforwardedAria | undefined` |  |
+| `aria-rowcount` | `UnforwardedAria | undefined` |  |
+| `aria-rowindex` | `UnforwardedAria | undefined` |  |
+| `aria-rowindextext` | `UnforwardedAria | undefined` |  |
+| `aria-rowspan` | `UnforwardedAria | undefined` |  |
+| `aria-selected` | `UnforwardedAria | undefined` |  |
+| `aria-setsize` | `UnforwardedAria | undefined` |  |
+| `aria-sort` | `UnforwardedAria | undefined` |  |
+| `aria-valuemax` | `UnforwardedAria | undefined` |  |
+| `aria-valuemin` | `UnforwardedAria | undefined` |  |
+| `aria-valuenow` | `UnforwardedAria | undefined` |  |
+| `aria-valuetext` | `UnforwardedAria | undefined` |  |
 | `checked` | `boolean | undefined` |  |
 | `className` | `string | undefined` |  |
 | `defaultChecked` | `boolean | undefined` |  |
@@ -1315,7 +1711,7 @@ _No always-required props._
 | `defaultValue` | `string | undefined` |  |
 | `disabled` | `boolean | undefined` |  |
 | `editable` | `boolean | undefined` | Editable-card mode (legacy `type="editable-card"`). Requires `onEdit`. |
-| `fill` | `boolean | undefined` | Fill the container: root becomes a flex column, the tab strip stays a fixed row, and the active panel gets the remaining height (so its c… |
+| `fill` | `boolean | undefined` | Fill the container: root becomes a flex column, the tab strip stays a fixed row, and the active panel gets the remaining height AS A FLEX… |
 | `hideAdd` | `boolean | undefined` | Hide the add button while keeping per-tab close affordances. |
 | `onClose` | `((key: string) => void) | undefined` | Also fires with the key of the tab whose close affordance was activated. |
 | `onEdit` | `((action: "remove" | "add", key: string) => void) | undefined` | Unified edit handler (legacy antd `onEdit`): action is 'add' (key='') or 'remove'. |
