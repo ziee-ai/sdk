@@ -107,9 +107,12 @@ interface SelectBase {
    *  would break every existing call site for behaviour it did not opt into. Pass your own
    *  wording (and translate it) wherever the control is user-facing. */
   searchPlaceholder?: string
-  /** What the list reads as when the filter matches nothing. Same defaulting rationale as
-   *  `searchPlaceholder`; an empty popup is indistinguishable from a broken one, so there is
-   *  always SOME sentence here. */
+  /** What the list reads as when there is nothing to show — either the filter matched nothing
+   *  (searchable arm) or the caller passed no options at all (either arm). Same defaulting
+   *  rationale as `searchPlaceholder`; an empty popup is indistinguishable from a broken one,
+   *  so there is always SOME sentence here. The two cases get different defaults, because
+   *  "No match" is a claim about what the user typed and is simply wrong when they typed
+   *  nothing. */
   emptyText?: string
   'aria-describedby'?: string
   'aria-label'?: string
@@ -216,6 +219,11 @@ function filterRuns(runs: SelectOptionGroup[], query: string): SelectOptionGroup
 const DEFAULT_SEARCH_PLACEHOLDER = 'Search…'
 const DEFAULT_SEARCH_LABEL = 'Search options'
 const DEFAULT_EMPTY_TEXT = 'No match'
+// "Nothing to choose from" is a DIFFERENT state from "your filter matched nothing", and the two
+// want different sentences: the first is about the data, the second about what the user typed.
+// The searchable arm has always said the second; the base arm used to say nothing at all and
+// render a blank popup, which is the state this constant exists to stop.
+const DEFAULT_NO_OPTIONS_TEXT = 'No options available'
 
 interface SearchableSelectProps {
   options: (SelectOption | SelectOptionGroup)[]
@@ -427,7 +435,9 @@ const SearchableSelect = React.forwardRef<HTMLButtonElement, SearchableSelectPro
               data-testid={`${testid}-no-match`}
               className="py-6 text-center text-sm text-muted-foreground"
             >
-              {emptyText ?? DEFAULT_EMPTY_TEXT}
+              {/* "No match" is a claim about the user's QUERY, so it is simply false when there
+                  is no query — that is the no-options state wearing the wrong sentence. */}
+              {emptyText ?? (query === '' ? DEFAULT_NO_OPTIONS_TEXT : DEFAULT_EMPTY_TEXT)}
             </div>
           ) : (
             <div role="listbox" id={listboxId} className="max-h-72 overflow-y-auto p-1">
@@ -640,7 +650,25 @@ export const Select = React.forwardRef<HTMLButtonElement, SelectProps>(function 
           on the popup. The WIDTH rule is the popup's own (`optionListPopupWidth`),
           not this call site's. */}
       <SelectContent data-testid={testid ? `${testid}-popup` : undefined} className="p-1">
-        {items}
+        {items.length === 0 ? (
+          // A popup with nothing in it reads as broken: the user cannot tell "this app has no
+          // models configured" from "the list failed to load" from "my click did nothing".
+          // Say which it is. Deliberately not a `SelectItem` — it must not be focusable,
+          // selectable, or typeahead-matchable, because it is prose, not a choice.
+          //
+          // The `-empty` testid names "there was nothing to choose from", which is a different
+          // state from the searchable arm's `-no-match` ("your filter matched nothing"); callers
+          // query them by suffix and must be able to tell the two apart.
+          <div
+            data-testid={testid ? `${testid}-empty` : undefined}
+            role="note"
+            className="py-6 text-center text-sm text-muted-foreground"
+          >
+            {emptyText ?? DEFAULT_NO_OPTIONS_TEXT}
+          </div>
+        ) : (
+          items
+        )}
       </SelectContent>
     </SelectRoot>
   )
