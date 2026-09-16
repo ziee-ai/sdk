@@ -142,7 +142,7 @@ function hasVisibleText(node: React.ReactNode): boolean {
  * A natively `disabled` button can open no React tooltip, so the kit refuses to pretend otherwise.
  *
  * TWO independent reasons, either one sufficient: the kit's own `buttonVariants` sets
- * `disabled:pointer-events-none`, and even without it a disabled control's mouse events do not
+ * `disabled:cursor-not-allowed`, and even without it a disabled control's mouse events do not
  * propagate to the document root — which is where React listens, because it delegates there. A
  * document-level listener records ZERO `mouseover` on a disabled button, capture and bubble alike.
  *
