@@ -25,8 +25,8 @@ import {
   collectTestIds,
   isTestSourceFile,
   renderRegistry,
+  resolveRegistryScope,
 } from './gen-testid-registry.mjs'
-import { resolveGalleryConfig } from './lib/gallery-config.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -289,61 +289,85 @@ test('collectSourceFiles skips CO-LOCATED test suites, wherever they sit', () =>
 })
 
 // ---------------------------------------------------------------------------
-// TEST-21 — GOLDEN set-equality against the REAL configured trees, with every
-// removed and added id asserted BY NAME.
+// TEST-21 — GOLDEN set-equality against the REAL committed registry, driven by
+// the SAME `resolveRegistryScope()` the generator's main() uses, so the golden
+// can never drift from the generator's root logic.
+//
+// The committed registry in the kit's own tree is the SHARED surface (every
+// consumer imports `@ziee/kit/testIds.generated`), so its golden is built here
+// from SDK-INTERNAL paths and ALWAYS RUNS — in the sdk repo no less than inside
+// a consumer. A second block covers a consumer app where one actually exists
+// (dental mounts the sdk as a submodule, so `../../../../src-app/ui` resolves).
+//
+// The golden deliberately names NO consumer-app ids (the old TEST-21 pinning
+// REMOVED_PHANTOMS/ADDED_REAL asserted ZIEE's id set — it could never pass for
+// any other consumer). The mechanics those by-name assertions covered are
+// fixture-covered right here: TEST-5/TEST-5b (comments + interpolations yield
+// nothing), the TEST-22 series (value positions: ternary arms, `??`/`||`, never
+// conditions/args/template spans) and TEST-23c (the three exact phantoms the
+// old scanner harvested — `${testid}-row-${cssEscape(rk)}`, `chat-pane-${idx}`,
+// `kb-hit-source-${n - 1}` — each FAILS `ID_SHAPE`). The golden itself still
+// guards the regressions that matter set-wise: exact equality with the committed
+// file (nothing added, nothing dropped) and the shape guard over the whole set.
 // ---------------------------------------------------------------------------
 
-/** The 3 phantoms the text scan harvested that are NOT real ids. */
-const REMOVED_PHANTOMS = [
-  '${testid}-row-${cssEscape(rk)}', // kit/src/kit/table.tsx — querySelector template
-  'chat-pane-${idx}', // chat/extensions/keyboard/extension.tsx — same shape
-  'kb-hit-source-${n - 1}', // chat/core/utils/CitationChip.tsx — same shape
-]
-/** The 6 REAL ids the text scan silently MISSED (`??` / ternary value positions). */
-const ADDED_REAL = [
-  'chat-single-drop-column',
-  'desktop-bootstrap-failed',
-  'desktop-bootstrap-starting',
-  'memory-core-block-create-dialog',
-  'memory-core-block-edit-dialog',
-  'settings-page-title',
-]
+/** Parse the id list out of a committed registry body (byte-stable format). */
+function parseCommittedRegistry(body) {
+  const ids = [...body.matchAll(/^ {2}"(.+)",$/gm)].map(m => JSON.parse(`"${m[1]}"`))
+  return ids.sort()
+}
 
-test('TEST-21 [golden] the collector reproduces the committed registry exactly', () => {
-  // Resolve the app's config the way the generator's main() does, from the ui
-  // workspace (the committed registry is the sorted UNION, identical from either
-  // workspace cwd — see the generator header).
-  const uiCwd = path.resolve(HERE, '../../../../src-app/ui')
-  if (!fs.existsSync(path.join(uiCwd, 'gallery.config.json'))) {
-    // Package consumed standalone (no app tree) — the fixture tests above still
-    // fully cover the collector; skip only the app-tree golden.
-    return
-  }
-  const CFG = resolveGalleryConfig(uiCwd)
-  const R = p => path.resolve(uiCwd, p)
-  const trees = [CFG.srcDir, ...(CFG.extraTrees ?? []), ...(CFG.kitTestIds ?? [])].map(R)
-  const files = trees.flatMap(r => collectSourceFiles(r))
-  const got = [...collectTestIds(files)].sort()
-
-  const out = R(CFG.testidOut)
-  const committed = fs.readFileSync(out, 'utf-8')
-  const inRegistry = [...committed.matchAll(/^ {2}"(.+)",$/gm)].map(m =>
-    JSON.parse(`"${m[1]}"`),
+test('TEST-21 [golden] sdk-local scope reproduces the committed kit registry exactly (always runs)', () => {
+  // The scope is built from SDK-INTERNAL paths anchored at this test file, so it
+  // needs no consumer app layout and never returns early: the output IS the kit's
+  // own committed shared surface, `resolveRegistryScope` must see it as such, and
+  // the walk must therefore be the kit/shell package trees ONLY.
+  const scope = resolveRegistryScope({
+    __cwd: HERE,
+    srcDir: HERE,
+    kitTestIds: [
+      path.resolve(HERE, '../../kit/src'),
+      path.resolve(HERE, '../../shell/src'),
+    ],
+    testidOut: path.resolve(HERE, '../../kit/src/testIds.generated.ts'),
+  })
+  assert.equal(
+    scope.isKitSurface,
+    true,
+    'an output inside a kitTestIds root is the kit shared surface',
   )
+  const got = [...collectTestIds(scope.files)].sort()
+  const committed = fs.readFileSync(scope.out, 'utf-8')
   assert.deepEqual(
     got,
-    inRegistry.slice().sort(),
-    'collector output must equal the committed registry (run `npm run gen:testid-registry`)',
+    parseCommittedRegistry(committed),
+    'collector output must equal the committed kit registry (run `npm run gen:testid-registry`)',
   )
+  // The whole set satisfies the shape guard (defense-in-depth, unchanged).
+  assert.doesNotThrow(() => assertIdShapes(got))
+})
 
-  // Every removed phantom is GONE, by name.
-  for (const p of REMOVED_PHANTOMS)
-    assert.equal(got.includes(p), false, `phantom must be absent: ${p}`)
-  // Every recovered real id is PRESENT, by name — this half is what fails a
-  // "fix" that removed phantoms by dropping real ids.
-  for (const a of ADDED_REAL)
-    assert.equal(got.includes(a), true, `real id must be present: ${a}`)
-  // And the whole set satisfies the shape guard.
+test('TEST-21b [golden consumer] the consumer app scope reproduces its committed registry exactly', () => {
+  // Runs only where a consumer app layout exists (dental). In the sdk repo this
+  // golden is absent by construction, which is fine: the sdk-local golden above is
+  // the one that always runs, and no app-specific id is hardcoded here either —
+  // the scope comes from the app's OWN gallery.config.json.
+  const uiCwd = path.resolve(HERE, '../../../../src-app/ui')
+  if (!fs.existsSync(path.join(uiCwd, 'gallery.config.json'))) {
+    // No consumer app checked out here (package consumed standalone). The sdk-local
+    // golden above already asserted the shared surface; this block asserts the
+    // per-app union, which has no meaning without the app.
+    return
+  }
+  const scope = resolveRegistryScope(uiCwd)
+  const got = [...collectTestIds(scope.files)].sort()
+  const committed = fs.readFileSync(scope.out, 'utf-8')
+  assert.deepEqual(
+    got,
+    parseCommittedRegistry(committed),
+    "collector output must equal the consumer app's committed registry " +
+      '(run `npm run gen:testid-registry`)',
+  )
   assert.doesNotThrow(() => assertIdShapes(got))
 })
 
