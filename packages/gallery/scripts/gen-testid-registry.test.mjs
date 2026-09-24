@@ -343,11 +343,21 @@ test('TEST-21 [golden] sdk-local scope reproduces the committed kit registry exa
     parseCommittedRegistry(committed),
     'collector output must equal the committed kit registry (run `npm run gen:testid-registry`)',
   )
+  // Two by-name checks against the REAL source, both directions: an id that is a
+  // `??`-arm in shell source must be PRESENT; the exact phantom the old text scan
+  // harvested out of kit's table.tsx template must be ABSENT. (Written as a plain
+  // string — this file lives under scripts/, never walked by the collector.)
+  assert.equal(got.includes('settings-page-title'), true, 'real shell id must be present')
+  assert.equal(
+    got.includes('${testid}-row-${cssEscape(rk)}'),
+    false,
+    'the kit table.tsx phantom must be absent',
+  )
   // The whole set satisfies the shape guard (defense-in-depth, unchanged).
   assert.doesNotThrow(() => assertIdShapes(got))
 })
 
-test('TEST-21b [golden consumer] the consumer app scope reproduces its committed registry exactly', () => {
+test('TEST-21b [golden consumer] the consumer app scope reproduces its committed registry exactly', (t) => {
   // Runs only where a consumer app layout exists (dental). In the sdk repo this
   // golden is absent by construction, which is fine: the sdk-local golden above is
   // the one that always runs, and no app-specific id is hardcoded here either —
@@ -356,7 +366,9 @@ test('TEST-21b [golden consumer] the consumer app scope reproduces its committed
   if (!fs.existsSync(path.join(uiCwd, 'gallery.config.json'))) {
     // No consumer app checked out here (package consumed standalone). The sdk-local
     // golden above already asserted the shared surface; this block asserts the
-    // per-app union, which has no meaning without the app.
+    // per-app union, which has no meaning without the app — report the skip
+    // honestly instead of a vacuous pass.
+    t.skip('no consumer app layout — consumer golden not applicable here')
     return
   }
   const scope = resolveRegistryScope(uiCwd)
@@ -369,6 +381,52 @@ test('TEST-21b [golden consumer] the consumer app scope reproduces its committed
       '(run `npm run gen:testid-registry`)',
   )
   assert.doesNotThrow(() => assertIdShapes(got))
+})
+
+// ---------------------------------------------------------------------------
+// TEST-21c/TEST-21d — isKitSurface CONTAINMENT edges. Contained-ness is decided
+// by `path.relative` after realpath canonicalization: a child NAMED `..weird` is
+// INSIDE (its relative path merely STARTS with two dots), while a real `../sibling`
+// escape is OUTSIDE. Both go through the PUBLIC `resolveRegistryScope` with a
+// config-shaped object, exactly like the sdk-local golden does.
+// ---------------------------------------------------------------------------
+test('TEST-21c [containment] a child dir NAMED `..weird` with the out inside it is the kit surface', () => {
+  const R = fs.mkdtempSync(path.join(os.tmpdir(), 'testid-contain-'))
+  const weird = path.join(R, '..weird')
+  fs.mkdirSync(weird)
+  const out = path.join(weird, 'testIds.generated.ts')
+  const scope = resolveRegistryScope({
+    __cwd: R,
+    srcDir: R,
+    kitTestIds: [R],
+    testidOut: out,
+  })
+  assert.equal(
+    scope.isKitSurface,
+    true,
+    'a child named `..weird` is INSIDE the root — only a real `../`/`..` escape is outside',
+  )
+  fs.rmSync(R, { recursive: true, force: true })
+})
+
+test('TEST-21d [containment] an out at `../sibling` is NOT the kit surface', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'testid-contain-'))
+  const R = path.join(base, 'root')
+  fs.mkdirSync(R)
+  fs.mkdirSync(path.join(base, 'sibling'))
+  const out = path.join(R, '..', 'sibling', 'testIds.generated.ts')
+  const scope = resolveRegistryScope({
+    __cwd: R,
+    srcDir: R,
+    kitTestIds: [R],
+    testidOut: out,
+  })
+  assert.equal(
+    scope.isKitSurface,
+    false,
+    'a real `../sibling` escape is OUTSIDE the root — never the kit surface',
+  )
+  fs.rmSync(base, { recursive: true, force: true })
 })
 
 // ---------------------------------------------------------------------------

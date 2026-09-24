@@ -32,15 +32,19 @@ const DEFAULTS = {
    * Additional PACKAGE src roots (relative to cwd) the testid-registry generator
    * walks for static `data-testid` literals BEYOND the app trees (`srcDir` +
    * `extraTrees`). The kit/shell components moved into packages, so their own
-   * testids are the source of truth for kit-component ids; the app walk adds the
-   * app's ids and the two UNION into `testidOut`. `[]` = a self-contained app
-   * whose kit ids still live under `srcDir` (the pre-package layout). */
+   * testids are the source of truth for kit-component ids. The partition: a
+   * `testidOut` INSIDE a `kitTestIds` root is the kit's own shared surface
+   * (kit/shell ids ONLY); ANY OTHER `testidOut` is the app's own registry
+   * (app ∪ kit/shell). `[]` = a self-contained app whose kit ids still live
+   * under `srcDir` (the pre-package layout). */
   kitTestIds: [],
   /**
-   * Output path (relative to cwd) for the generated testid registry. When the kit
-   * is a package this is its `testIds.generated.ts` (the shared import surface
-   * `@ziee/kit/testIds.generated`); `null` = the historical in-app default
-   * `<srcDir>/components/ui/testIds.generated.ts`. */
+   * Output path (relative to cwd) for the generated testid registry. The
+   * partition decides what it holds: a `testidOut` INSIDE a `kitTestIds` root is
+   * the kit's own shared surface (`@ziee/kit/testIds.generated` — kit/shell ids
+   * ONLY, the import surface every consumer shares); ANY OTHER `testidOut` is
+   * the app's own registry (app ∪ kit/shell). `null` = the historical in-app
+   * default `<srcDir>/components/ui/testIds.generated.ts`. */
   testidOut: null,
   /** Dev-server port for the gate + runtime passes. `null` = derive a
    *  per-worktree, bind-checked port from the unified run key (audit §7 — no

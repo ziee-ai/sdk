@@ -2,10 +2,14 @@
  * i18n-safe semantic/component selectors for Playwright specs.
  *
  * Prefer `data-testid` over `getByText` / `getByRole({ name })`: visible text and
- * accessible names change under translation; a testid does not. The app owns its
- * typed testid UNION (a generated registry, e.g. `@ziee/kit/testIds.generated`);
- * this package supplies the selector HELPERS, generic over any id string, plus a
- * typed factory an app binds to its own union for compile-time typo-checking.
+ * accessible names change under translation; a testid does not. An app binds to
+ * ITS OWN union registry — the generated `testIds.generated.ts` next to its own
+ * source trees (an app-local path like `src/components/ui/testIds.generated.ts`),
+ * which holds the app ∪ kit/shell id union. (The kit's
+ * `@ziee/kit/testIds.generated` is the kit's OWN surface — kit/shell ids only —
+ * and is NOT the app's union.) This package supplies the selector HELPERS,
+ * generic over any id string, plus a typed factory an app binds to its own union
+ * for compile-time typo-checking.
  */
 import type { Page, Locator } from '@playwright/test'
 
@@ -25,8 +29,11 @@ export const byTestId = (scope: Page | Locator, id: TestIdLike): Locator =>
  * Bind a typed `byTestId` to the app's generated testid union so an unknown id is
  * a COMPILE error (derived/template strings still accepted via `TestIdLike`).
  *
- *   import type { KnownTestId } from '@ziee/kit/testIds.generated'
+ *   import type { KnownTestId } from './testIds.generated'
  *   export const byTestId = makeByTestId<KnownTestId>()
+ *
+ * The `KnownTestId` comes from the app's OWN generated registry (app ∪ kit/shell);
+ * `@ziee/kit/testIds.generated` is the kit's own surface, not the app's union.
  */
 export const makeByTestId =
   <Known extends string>() =>

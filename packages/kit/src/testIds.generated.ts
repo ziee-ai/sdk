@@ -17,7 +17,7 @@ export const TEST_IDS = [
   "settings-page-title",
 ] as const
 
-/** Every static data-testid literal in the app. Derived (`${id}-row-${k}`) ids are NOT listed. */
+/** Every static data-testid literal in the configured source trees. Derived (`${id}-row-${k}`) ids are NOT listed. */
 export type KnownTestId = (typeof TEST_IDS)[number]
 
 /** Accepts a known id (autocompleted) OR any string (for derived/template ids). */

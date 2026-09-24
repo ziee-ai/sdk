@@ -33,9 +33,10 @@
  * body is deterministic and `--check`'s trim-compare stays sound in both.
  * Every default reproduces the pre-package in-app behavior (walk `srcDir`, write
  * `<srcDir>/components/ui/testIds.generated.ts`), so a config-less app is
- * unchanged. Run from BOTH the ui and desktop workspace cwds (each supplies the
- * mirrored relative roots) — the sorted UNION is identical, so the single
- * committed registry is byte-stable regardless of which workspace's `--check` ran.
+ * unchanged. Each app owns ONE registry: whether a run yields the kit's SHARED
+ * surface or the app UNION depends on where that app's `testidOut` sits. Run the
+ * generator from the workspace that owns the registry — the consumer app cwd for
+ * an app union; a kit-pointing config only for regenerating the shared surface.
  *
  * Run: node gen-testid-registry.mjs        (write)
  *      node gen-testid-registry.mjs --check (drift guard)
@@ -299,7 +300,7 @@ export const TEST_IDS = [
 ${sorted.map((id) => `  ${JSON.stringify(id)},`).join('\n')}
 ] as const
 
-/** Every static data-testid literal in the app. Derived (\`\${id}-row-\${k}\`) ids are NOT listed. */
+/** Every static data-testid literal in the configured source trees. Derived (\`\${id}-row-\${k}\`) ids are NOT listed. */
 export type KnownTestId = (typeof TEST_IDS)[number]
 
 /** Accepts a known id (autocompleted) OR any string (for derived/template ids). */
@@ -324,11 +325,13 @@ export const isKnownTestId = (id: string): id is KnownTestId => KNOWN.has(id)
  *   - `appTrees`   — `srcDir + extraTrees`, resolved;
  *   - `pkgTrees`   — `kitTestIds`, resolved;
  *   - `out`        — resolved `testidOut ?? <srcDir>/components/ui/testIds.generated.ts`;
- *   - `isKitSurface` — `out` is INSIDE one of the `pkgTrees` roots (containment by
- *                     `path.relative`: equality or a non-`..` relative path counts
- *                     as inside) — i.e. the output is the kit's own committed
- *                     shared surface, so the shared registry must contain ONLY the
- *                     package-tree ids;
+ *   - `isKitSurface` — `out` is INSIDE one of the `pkgTrees` roots (canonicalized
+ *                     containment by `path.relative` over `realpath`-resolved
+ *                     paths: equality or a relative path that neither escapes the
+ *                     root (`..` / `../…`) nor leaves it absolutely counts as
+ *                     inside — so a child NAMED `..weird` is inside) — i.e. the
+ *                     output is the kit's own committed shared surface, so the
+ *                     shared registry must contain ONLY the package-tree ids;
  *   - `files`      — the collected source files: `pkgTrees` only when
  *                     `isKitSurface`, else `[...appTrees, ...pkgTrees]`.
  */
@@ -344,8 +347,24 @@ export function resolveRegistryScope(cwd = process.cwd()) {
   )
 
   const isInsideRoot = (root, target) => {
-    const rel = path.relative(root, target)
-    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+    // Canonicalize through realpath where the path EXISTS (a symlinked view of
+    // the kit root must still count as inside); non-existent targets (e.g. a
+    // consumer's mirrored `../desktop/ui/src`) fall back to the resolved form.
+    const canonical = (p) => {
+      const abs = path.resolve(p)
+      try {
+        return fs.realpathSync(abs)
+      } catch {
+        return abs
+      }
+    }
+    const rel = path.relative(canonical(root), canonical(target))
+    return (
+      rel === '' ||
+      (rel !== '..' &&
+        !rel.startsWith('..' + path.sep) &&
+        !path.isAbsolute(rel))
+    )
   }
   const isKitSurface = pkgTrees.some((root) => isInsideRoot(root, out))
 
@@ -356,7 +375,19 @@ export function resolveRegistryScope(cwd = process.cwd()) {
 
 const isMain = import.meta.url === pathToFileURL(process.argv[1]).href
 if (isMain) {
-  const { files, out } = resolveRegistryScope()
+  const { files, out, isKitSurface } = resolveRegistryScope()
+  if (isKitSurface) {
+    // Loud, NOT an exit-code change: a consumer that still points testidOut into
+    // the kit SEES that its run just wrote the kit's shared surface (11 ids) into
+    // the kit tree instead of discovering it from a silent 1787->11 registry.
+    console.error(
+      '[gen-testid-registry] testidOut points INTO the kit package tree — ' +
+        "this writes the kit's SHARED surface, which holds ONLY kit/shell ids. " +
+        'If you expected app ids here, set testidOut to an app-local path ' +
+        '(e.g. src/components/ui/testIds.generated.ts) and the app union ' +
+        '(app trees + kit/shell ids) will be written there.',
+    )
+  }
   const sites = collectTestIdSites(files)
   const sorted = [...sites.keys()].sort()
   const body = renderRegistry(sorted, sites)
