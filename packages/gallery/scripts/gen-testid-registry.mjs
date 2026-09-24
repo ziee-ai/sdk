@@ -37,6 +37,9 @@
  * surface or the app UNION depends on where that app's `testidOut` sits. Run the
  * generator from the workspace that owns the registry — the consumer app cwd for
  * an app union; a kit-pointing config only for regenerating the shared surface.
+ * A kit-pointing config is a TRANSIENT consumer-side config (not a committed sdk
+ * config) used only to regenerate the shared surface; the sdk repo itself commits
+ * no gallery.config.json.
  *
  * Run: node gen-testid-registry.mjs        (write)
  *      node gen-testid-registry.mjs --check (drift guard)
@@ -348,14 +351,22 @@ export function resolveRegistryScope(cwd = process.cwd()) {
 
   const isInsideRoot = (root, target) => {
     // Canonicalize through realpath where the path EXISTS (a symlinked view of
-    // the kit root must still count as inside); non-existent targets (e.g. a
-    // consumer's mirrored `../desktop/ui/src`) fall back to the resolved form.
+    // the kit root must still count as inside).
     const canonical = (p) => {
-      const abs = path.resolve(p)
-      try {
-        return fs.realpathSync(abs)
-      } catch {
-        return abs
+      let cur = path.resolve(p)
+      const tail = []
+      for (;;) {
+        try {
+          // deepest EXISTING ancestor resolves through symlinks; the tail
+          // (possibly non-existent output) is appended UNRESOLVED, so a first-run
+          // output under a symlinked kit root still counts as inside — and a
+          // never-created path yields the same answer on every run.
+          return path.join(fs.realpathSync(cur), ...tail)
+        } catch { /* not there yet — walk up */ }
+        const parent = path.dirname(cur)
+        if (parent === cur) return path.resolve(p)   // no existing ancestor at all
+        tail.unshift(path.basename(cur))
+        cur = parent
       }
     }
     const rel = path.relative(canonical(root), canonical(target))

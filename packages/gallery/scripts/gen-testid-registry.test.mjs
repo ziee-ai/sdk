@@ -341,7 +341,7 @@ test('TEST-21 [golden] sdk-local scope reproduces the committed kit registry exa
   assert.deepEqual(
     got,
     parseCommittedRegistry(committed),
-    'collector output must equal the committed kit registry (run `npm run gen:testid-registry`)',
+    'collector output must equal the committed kit registry (consumer app: run `npm run gen:testid-registry`; sdk repo: run `node packages/gallery/scripts/gen-testid-registry.mjs` from a dir with a kit-pointing config)',
   )
   // Two by-name checks against the REAL source, both directions: an id that is a
   // `??`-arm in shell source must be PRESENT; the exact phantom the old text scan
@@ -378,7 +378,8 @@ test('TEST-21b [golden consumer] the consumer app scope reproduces its committed
     got,
     parseCommittedRegistry(committed),
     "collector output must equal the consumer app's committed registry " +
-      '(run `npm run gen:testid-registry`)',
+      '(consumer app: run `npm run gen:testid-registry`; sdk repo: run ' +
+      '`node packages/gallery/scripts/gen-testid-registry.mjs` from a dir with a kit-pointing config)',
   )
   assert.doesNotThrow(() => assertIdShapes(got))
 })
@@ -392,41 +393,95 @@ test('TEST-21b [golden consumer] the consumer app scope reproduces its committed
 // ---------------------------------------------------------------------------
 test('TEST-21c [containment] a child dir NAMED `..weird` with the out inside it is the kit surface', () => {
   const R = fs.mkdtempSync(path.join(os.tmpdir(), 'testid-contain-'))
-  const weird = path.join(R, '..weird')
-  fs.mkdirSync(weird)
-  const out = path.join(weird, 'testIds.generated.ts')
-  const scope = resolveRegistryScope({
-    __cwd: R,
-    srcDir: R,
-    kitTestIds: [R],
-    testidOut: out,
-  })
-  assert.equal(
-    scope.isKitSurface,
-    true,
-    'a child named `..weird` is INSIDE the root — only a real `../`/`..` escape is outside',
-  )
-  fs.rmSync(R, { recursive: true, force: true })
+  try {
+    const weird = path.join(R, '..weird')
+    fs.mkdirSync(weird)
+    const out = path.join(weird, 'testIds.generated.ts')
+    const scope = resolveRegistryScope({
+      __cwd: R,
+      srcDir: R,
+      kitTestIds: [R],
+      testidOut: out,
+    })
+    assert.equal(
+      scope.isKitSurface,
+      true,
+      'a child named `..weird` is INSIDE the root — only a real `../`/`..` escape is outside',
+    )
+  } finally {
+    fs.rmSync(R, { recursive: true, force: true })
+  }
 })
 
 test('TEST-21d [containment] an out at `../sibling` is NOT the kit surface', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'testid-contain-'))
-  const R = path.join(base, 'root')
-  fs.mkdirSync(R)
-  fs.mkdirSync(path.join(base, 'sibling'))
-  const out = path.join(R, '..', 'sibling', 'testIds.generated.ts')
-  const scope = resolveRegistryScope({
-    __cwd: R,
-    srcDir: R,
-    kitTestIds: [R],
-    testidOut: out,
-  })
-  assert.equal(
-    scope.isKitSurface,
-    false,
-    'a real `../sibling` escape is OUTSIDE the root — never the kit surface',
-  )
-  fs.rmSync(base, { recursive: true, force: true })
+  try {
+    const R = path.join(base, 'root')
+    fs.mkdirSync(R)
+    fs.mkdirSync(path.join(base, 'sibling'))
+    const out = path.join(R, '..', 'sibling', 'testIds.generated.ts')
+    const scope = resolveRegistryScope({
+      __cwd: R,
+      srcDir: R,
+      kitTestIds: [R],
+      testidOut: out,
+    })
+    assert.equal(
+      scope.isKitSurface,
+      false,
+      'a real `../sibling` escape is OUTSIDE the root — never the kit surface',
+    )
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('TEST-21e [containment] a symlinked kit root with a NOT-YET-CREATED output is the kit surface', (t) => {
+  // The realpath-only canonicalization used to resolve the (always-existing) kit
+  // root through the symlink but left the (not-yet-created, first-run) output on
+  // its UNRESOLVED path — so a first-run write under a symlinked root read
+  // `isKitSurface=false` and silently wrote the app∪kit UNION into the kit tree.
+  // canonical() instead resolves the deepest EXISTING ancestor and appends the
+  // unresolved tail, so root and output always agree.
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'testid-symlink-'))
+  try {
+    const real = path.join(base, 'real')
+    fs.mkdirSync(real)
+    const link = path.join(base, 'link')
+    try {
+      fs.symlinkSync(real, link, 'dir')
+    } catch {
+      t.skip('symlink creation not permitted in this environment')
+      return
+    }
+    const scope = resolveRegistryScope({
+      __cwd: base,
+      srcDir: base,
+      kitTestIds: [path.join(base, 'link')],
+      testidOut: path.join(base, 'link', 'testIds.generated.ts'),
+    })
+    assert.equal(
+      scope.isKitSurface,
+      true,
+      'a symlinked kit root with a NOT-YET-CREATED output is still the kit surface',
+    )
+    // With the SAME symlinked root, an existing sibling through `../` stays
+    // OUTSIDE — the symmetric edge, so the ancestor walk cannot over-correct.
+    fs.mkdirSync(path.join(base, 'sibling'))
+    const sibScope = resolveRegistryScope({
+      __cwd: base,
+      srcDir: base,
+      kitTestIds: [path.join(base, 'link')],
+      testidOut: path.join(base, 'link', '..', 'sibling', 'testIds.generated.ts'),
+    })
+    assert.equal(
+      sibScope.isKitSurface,
+      false,
+      'a real `../sibling` escape out of a symlinked root is OUTSIDE — never the kit surface',
+    )
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true })
+  }
 })
 
 // ---------------------------------------------------------------------------
