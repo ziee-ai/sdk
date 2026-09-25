@@ -111,6 +111,86 @@ export function __resetStaleBuildForTests(target?: ListenerTarget): void {
   if (target) installedTargets.delete(target)
 }
 
+// ============================================================================
+// Offline-aware recovery (issue #161 / FUP-65, ITEM-5b of queue 272's plan).
+//
+// ITEM-5a (queue 272, already landed) gated the app's LINK-based closure
+// prefetch against running while offline — it is prefetch-only, so a failed
+// `<link rel=prefetch>` costs nothing but bandwidth. The two warmers below
+// (`lazy-dispatch.ts`'s on-demand dispatcher, `store-kit.ts`'s
+// `autoWarmLazyActions`, and the shell's `usePrefetchModules`) all call the
+// SAME `import()` an on-demand click/navigation would — and per the HONEST
+// LIMIT documented at the top of `lazy-dispatch.ts`, a failed dynamic
+// `import()` permanently poisons that specifier's module-map entry for the
+// life of the document (the HTML spec caches a fetch failure against the
+// exact URL, forever, per realm). Calling it while offline therefore doesn't
+// just fail once — it BURNS the chunk, so even the user's own retry after
+// reconnecting fails until a full page reload. That is issue #161.
+//
+// The fix is the same shape in both places: never call the underlying
+// `import()` while offline, so the specifier is never poisoned, and the next
+// attempt — a later dispatch, or a warm resumed on `online` — gets a
+// genuinely fresh fetch.
+// ============================================================================
+
+/**
+ * True while the browser reports no network connectivity.
+ *
+ * Off-browser (SSR / a node unit context) `navigator` is absent — that reads
+ * as "online": no connectivity signal exists there to gate on, and nothing
+ * off-browser calls a real `import()` warm loop anyway.
+ */
+export function isOffline(): boolean {
+  return typeof navigator !== 'undefined' && navigator.onLine === false
+}
+
+/**
+ * Injectable environment for `warmUnlessOffline` — a TEST SEAM, the same
+ * pattern as `lazy-dispatch.ts`'s `LazyDispatchOptions.sleep`: the real
+ * browser online/offline lifecycle is slow and process-wide, so specs inject
+ * a fake one instead of flipping `navigator.onLine` for the whole suite.
+ */
+export interface OnlineGateEnv {
+  isOffline: () => boolean
+  /** Register a ONE-SHOT `online` listener; returns an unsubscribe. */
+  onOnline: (cb: () => void) => () => void
+}
+
+const browserOnlineGateEnv: OnlineGateEnv = {
+  isOffline,
+  onOnline: cb => {
+    if (typeof window === 'undefined') return () => {}
+    window.addEventListener('online', cb, { once: true })
+    return () => window.removeEventListener('online', cb)
+  },
+}
+
+/**
+ * Run a WARM-UP unless the browser is offline.
+ *
+ * `store-kit`'s `autoWarmLazyActions` and the shell's `usePrefetchModules`
+ * both wrap their scheduling in this: each warms a chunk with the SAME
+ * `import()` an on-demand dispatch/navigation would use, so warming while
+ * offline would poison the exact specifier a later on-demand click needs (see
+ * the file-level comment above) — worse than simply not warming.
+ *
+ * Online: runs `warm` immediately. Offline: defers it to the next `online`
+ * event (once), so a store/route that happened to init while offline still
+ * gets warmed once connectivity returns, instead of being skipped forever.
+ *
+ * @returns a cleanup that cancels a still-pending deferred run.
+ */
+export function warmUnlessOffline(
+  warm: () => void,
+  env: OnlineGateEnv = browserOnlineGateEnv,
+): () => void {
+  if (!env.isOffline()) {
+    warm()
+    return () => {}
+  }
+  return env.onOnline(warm)
+}
+
 /**
  * Install the `vite:preloadError` listener. Idempotent PER TARGET: calling it
  * twice for the same target (web entry + a re-entrant bootstrap) registers

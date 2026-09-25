@@ -14,7 +14,7 @@ import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
 import { createStoreProxy, type StoreProxy } from './stores'
 import { onNetworkIdle } from './net-idle'
 import { createLazyDispatcher } from './lazy-dispatch'
-import { isStaleBuild } from './chunk-recovery'
+import { isStaleBuild, warmUnlessOffline } from './chunk-recovery'
 
 // ============================================================================
 // store-kit — thin authoring layer over the existing Zustand + Stores.X proxy.
@@ -279,48 +279,57 @@ function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
   if (!STORE_PREFETCH_ENABLED) return
   const keys = Object.keys(lazyDispatchers)
   if (!keys.length) return
-  // Wait for the page's CRITICAL api-client calls to finish (network-idle after
-  // load) BEFORE warming, so the prefetch never competes with them for the
-  // browser's connections — THEN schedule the actual preloads on a main-thread
-  // idle gap. (Fixes: on /login the drawer/onboarding chunks were prefetched
-  // while the auth/providers call was still pending.)
-  onNetworkIdle(() =>
-    warmIdle(() => {
-      for (const k of keys) {
-        // Skip warming once chunk loading is known to be broken.
-        //
-        // HONEST SCOPE, because an earlier comment here overstated it: this loop
-        // body is SYNCHRONOUS (`preload()` is invoked, not awaited) and the mark
-        // can only be set asynchronously, so it cannot flip BETWEEN iterations —
-        // the store whose chunks are failing still fires all of its own keys.
-        // What this does prevent is every store scheduled on a LATER idle tick
-        // (route entry, lazy module registration) from repeating the exercise, so
-        // one deploy-while-a-tab-is-open costs one store's keys rather than every
-        // registered store's. The on-demand dispatch is unaffected: it still
-        // tries, and reports. A successful import clears the mark, so a transient
-        // blip does not disable prefetch for the session.
-        if (isStaleBuild()) return
-        try {
-          // `.catch` is REQUIRED, not belt-and-braces: `preload()` returns a
-          // promise, so the surrounding try/catch only ever caught a synchronous
-          // throw. A chunk that fails to load therefore produced an UNHANDLED
-          // REJECTION — i.e. an uncaught page-level error — for a warm-up nobody
-          // asked for and nothing awaits. (Observed directly: blocking one action
-          // chunk in an e2e produced page errors from this loop alone.)
+  // ITEM-5b (issue #161 / FUP-65): never warm while offline — see
+  // `warmUnlessOffline`'s doc comment in ./chunk-recovery for why (warming
+  // calls the SAME import() an on-demand dispatch uses, and a failed import
+  // permanently poisons that chunk). Deferred to the next `online` event
+  // rather than skipped outright, since this function runs exactly once per
+  // store (at init) and a store that booted offline must still get warmed
+  // once connectivity returns.
+  warmUnlessOffline(() =>
+    // Wait for the page's CRITICAL api-client calls to finish (network-idle after
+    // load) BEFORE warming, so the prefetch never competes with them for the
+    // browser's connections — THEN schedule the actual preloads on a main-thread
+    // idle gap. (Fixes: on /login the drawer/onboarding chunks were prefetched
+    // while the auth/providers call was still pending.)
+    onNetworkIdle(() =>
+      warmIdle(() => {
+        for (const k of keys) {
+          // Skip warming once chunk loading is known to be broken.
           //
-          // A failed warm-up is a genuine no-op: the chunk is simply not warm, and
-          // the on-demand dispatch retries it and surfaces a real error to the
-          // caller if it still fails. So swallow it at debug volume — the
-          // `vite:preloadError` listener has already logged the load failure once
-          // and marked the build stale.
-          lazyDispatchers[k].preload?.().catch((err: unknown) => {
-            console.debug(`[store-kit] prefetch of lazy action "${k}" failed (ignored)`, err)
-          })
-        } catch (err) {
-          console.debug(`[store-kit] prefetch of lazy action "${k}" threw (ignored)`, err)
+          // HONEST SCOPE, because an earlier comment here overstated it: this loop
+          // body is SYNCHRONOUS (`preload()` is invoked, not awaited) and the mark
+          // can only be set asynchronously, so it cannot flip BETWEEN iterations —
+          // the store whose chunks are failing still fires all of its own keys.
+          // What this does prevent is every store scheduled on a LATER idle tick
+          // (route entry, lazy module registration) from repeating the exercise, so
+          // one deploy-while-a-tab-is-open costs one store's keys rather than every
+          // registered store's. The on-demand dispatch is unaffected: it still
+          // tries, and reports. A successful import clears the mark, so a transient
+          // blip does not disable prefetch for the session.
+          if (isStaleBuild()) return
+          try {
+            // `.catch` is REQUIRED, not belt-and-braces: `preload()` returns a
+            // promise, so the surrounding try/catch only ever caught a synchronous
+            // throw. A chunk that fails to load therefore produced an UNHANDLED
+            // REJECTION — i.e. an uncaught page-level error — for a warm-up nobody
+            // asked for and nothing awaits. (Observed directly: blocking one action
+            // chunk in an e2e produced page errors from this loop alone.)
+            //
+            // A failed warm-up is a genuine no-op: the chunk is simply not warm, and
+            // the on-demand dispatch retries it and surfaces a real error to the
+            // caller if it still fails. So swallow it at debug volume — the
+            // `vite:preloadError` listener has already logged the load failure once
+            // and marked the build stale.
+            lazyDispatchers[k].preload?.().catch((err: unknown) => {
+              console.debug(`[store-kit] prefetch of lazy action "${k}" failed (ignored)`, err)
+            })
+          } catch (err) {
+            console.debug(`[store-kit] prefetch of lazy action "${k}" threw (ignored)`, err)
+          }
         }
-      }
-    }),
+      }),
+    ),
   )
 }
 

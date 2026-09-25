@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { routesSeam } from '@ziee/framework'
 import { authStoreProxy, hasPermissionNow } from '@ziee/framework/permissions'
 import type { PermissionExpr } from '@ziee/framework/permissions'
+import { warmUnlessOffline } from '@ziee/framework/chunk-recovery'
 import { selectPrefetchRoutes, type PrefetchRoute } from './prefetch-selection'
 
 /**
@@ -56,13 +57,29 @@ export function usePrefetchModules() {
     }
 
     // Gate 3: true idle, no forced timeout (don't preempt boot fetches).
-    if ('requestIdleCallback' in window) {
-      const handle = requestIdleCallback(prefetch)
-      return () => cancelIdleCallback(handle)
-    } else {
+    const schedule = (): (() => void) => {
+      if ('requestIdleCallback' in window) {
+        const handle = requestIdleCallback(prefetch)
+        return () => cancelIdleCallback(handle)
+      }
       // Fallback for browsers without requestIdleCallback (Safari < 16).
       const timer = setTimeout(prefetch, 1000)
       return () => clearTimeout(timer)
+    }
+
+    // ITEM-5b (issue #161 / FUP-65): each `route.element()` call above is the
+    // SAME dynamic import() an on-demand navigation would make, so prefetching
+    // while offline would permanently poison that route's module-map entry
+    // (see `@ziee/framework`'s lazy-dispatch.ts) instead of merely wasting an
+    // attempt. `warmUnlessOffline` defers scheduling to the next `online`
+    // event instead — the same gate `store-kit`'s `autoWarmLazyActions` uses.
+    let cancelSchedule: () => void = () => {}
+    const cancelOnlineWait = warmUnlessOffline(() => {
+      cancelSchedule = schedule()
+    })
+    return () => {
+      cancelOnlineWait()
+      cancelSchedule()
     }
   }, [routes, isAuthed])
 }

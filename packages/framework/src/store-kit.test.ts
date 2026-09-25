@@ -69,3 +69,15 @@ test('TEST-9: `$.__destroy__` is reachable hook-free and does NOT trigger store 
   // (the `$` branch short-circuits before the trap's init side-effect).
   assert.equal(initRuns, 0)
 })
+
+// NOTE on `autoWarmLazyActions` (issue #161 / FUP-65, ITEM-5b): it now wraps
+// its scheduling in `warmUnlessOffline` (./chunk-recovery.ts), which carries
+// the mutation-tested behavioural coverage — see chunk-recovery.test.ts's
+// GATE-1..3. `autoWarmLazyActions` itself is NOT separately exercised
+// end-to-end here: `STORE_PREFETCH_ENABLED` reads `import.meta.env`, which is
+// `undefined` under plain `node --test` (no bundler), so the function
+// short-circuits to a no-op on the very first line for EVERY test in this
+// process — by design, per its own comment, not something a test seam should
+// override. The wiring at this call site (confirm by reading store-kit.ts) is
+// a one-line change: the existing `onNetworkIdle(...)` call is now the `warm`
+// callback passed to `warmUnlessOffline`.
