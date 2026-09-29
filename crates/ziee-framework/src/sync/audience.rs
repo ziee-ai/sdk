@@ -74,8 +74,9 @@ impl Audience {
 
     /// Deliver to every connection of `account_id` — the tenant-scoped
     /// broadcast (no permission check, origin skipped by `deliver`). No
-    /// current prod caller; retained as intentional API surface.
-    #[allow(dead_code)]
+    /// current prod caller; retained as intentional API surface. (A `pub fn`
+    /// in a lib crate is reachable API — `dead_code` never fires here, so no
+    /// `#[allow]`; INV-11.)
     pub fn tenant(account_id: Uuid) -> Self {
         Audience::Tenant(account_id)
     }

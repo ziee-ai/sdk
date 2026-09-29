@@ -42,6 +42,16 @@ use crate::user::{GroupRepository, UserRepository};
 /// auth-provider fanout). Behaviorally inert pre-tenancy — every connection
 /// principal carries it, so the tenant equality always holds for the one
 /// account — and tenancy/account-provisioning replaces it.
+///
+/// **MIRROR of the app's canonical constant:** the brief-named ONE install
+/// account id is `crate::modules::sync::INSTALL_ACCOUNT_ID` in the consumer
+/// app (`src-app/server/src/modules/sync/mod.rs`); THIS SDK const exists only
+/// for the SDK-internal `AuthContext` constructor fallbacks
+/// ([`crate::auth::module`] / [`crate::auth::turnkey`] — a real production
+/// entry for SDK consumers using the turnkey `module` path to default an
+/// install account). It must stay equal to the app constant — the app-side
+/// test `modules::sync::tests::install_account_id_matches_the_sdk_auth_context`
+/// (queue 417sync) asserts the equality and reddens on drift.
 pub const INSTALL_ACCOUNT_ID: Uuid = Uuid::from_u128(1);
 
 /// The auth-domain sync entities, abstract over the app's concrete

@@ -650,6 +650,51 @@ mod tests {
         );
     }
 
+    /// TEST-28 (queue fr3-417sync) [acceptance] [invariant: INV-4] [covers:
+    /// ITEM-2, ITEM-11, ITEM-3] — the FAIL-CLOSED default half of
+    /// `Principal::account_id()` (DEC-1): a principal that does NOT override
+    /// `account_id()` (default `None` — the honest "unknown") but DOES hold
+    /// the full permission receives ZERO frames on BOTH tenant-scoped arms
+    /// (`Perm` and `Tenant` — `None != Some(account_id)` fails closed), while
+    /// it still receives `Owner` and `Everyone` frames (which match no
+    /// account). This pins the footgun direction: a forgotten override loses
+    /// frames (safe), never leaks them. F-B11: deleting the
+    /// `account_id() != Some(account_id)` guard in the `Perm` arm (or the
+    /// `== Some(account_id)` filter in the `Tenant` arm) makes the
+    /// unknown-account principal receive → RED.
+    #[test]
+    fn unknown_account_principal_receives_zero_tenant_frames_but_owner_and_everyone_still_reach() {
+        let acct = Uuid::from_u128(10_000);
+        let uid = Uuid::new_v4();
+        let reg = empty_registry();
+        // Default `account_id()` (None) via `principal(...)` — full permission:
+        let (c_unknown, mut rx_unknown) =
+            conn(uid, principal(false, vec!["x::read"]));
+        reg.register(Uuid::new_v4(), c_unknown).unwrap();
+
+        // Perm arm: unknown account, permission satisfied → still ZERO.
+        reg.deliver(
+            Audience::Perm { account_id: acct, rule: PermRule::All(vec!["x::read"]) },
+            dummy_event(),
+            None,
+        );
+        assert!(
+            !got(&mut rx_unknown),
+            "a None-account principal must receive ZERO Perm frames (fails closed)"
+        );
+        // Tenant arm: unknown account → ZERO.
+        reg.deliver(Audience::Tenant(acct), dummy_event(), None);
+        assert!(
+            !got(&mut rx_unknown),
+            "a None-account principal must receive ZERO Tenant frames (fails closed)"
+        );
+        // Owner + Everyone still reach it (they match no account).
+        reg.deliver(Audience::Owner(uid), dummy_event(), None);
+        assert!(got(&mut rx_unknown), "Owner must still reach the unknown-account principal");
+        reg.deliver(Audience::Everyone, dummy_event(), None);
+        assert!(got(&mut rx_unknown), "Everyone must still reach the unknown-account principal");
+    }
+
     /// TEST-5 (queue fr3-417sync) [acceptance] [invariant: INV-3] [covers:
     /// ITEM-3, ITEM-11] — a FOREIGN-account ADMIN (empty permission set)
     /// receives ZERO frames: `is_admin()` no longer bypasses the tenant
@@ -780,8 +825,13 @@ mod tests {
     /// `Audience::Owner(uid)` still delivers to exactly `uid`'s connections
     /// (one user, two tabs) and never to another user — user ids are globally
     /// unique in the single credential store, so owner-fanout needs NO account
-    /// comparison (INV-2); an owner arm that started ANDing account could break
-    /// an in-account user whose snapshot is refreshed.
+    /// comparison (INV-2). REGRESSION-ONLY re-scope (fix round 1, F-A11/F-B13):
+    /// the Owner arm carries NO account operand, so the mutation TESTS.md once
+    /// claimed ("add an account comparison to the Owner arm") has nothing to
+    /// compare and cannot redden this test — the mutation row is therefore
+    /// "not applicable", and the test stands as delivery regression coverage:
+    /// it proves cross-user owner isolation is unchanged through the queue's
+    /// shape change.
     #[test]
     fn owner_arm_remains_globally_scoped_by_user_id() {
         let uid = Uuid::new_v4();
