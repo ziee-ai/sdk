@@ -736,12 +736,40 @@ async fn each_mint_site_reports_its_auth_method() {
     let (status, body) = refresh(&app, &jtiless).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
+    // A password login through a configured provider (`login` with a
+    // non-`local` provider name) — a provider row of type `local` linked to
+    // this user, so no directory server is needed.
+    let provider: Uuid = sqlx::query_scalar(
+        "INSERT INTO auth_providers (name, provider_type, enabled, config) \
+         VALUES ('corp-directory', 'local', true, '{}') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO user_auth_links (user_id, provider_id, external_id) VALUES ($1, $2, $3)",
+    )
+    .bind(user)
+    .bind(provider)
+    .bind(user.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, body) = post(
+        &app,
+        "/auth/login",
+        serde_json::json!({"username": "tagger", "password": "Str0ng-pass!word", "provider": "corp-directory"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
     assert_eq!(
         *rec.0.lock().unwrap(),
         vec![
             AuthMethod::NewAccount,
             AuthMethod::Password,
-            AuthMethod::Unspecified
+            AuthMethod::Unspecified,
+            AuthMethod::DirectoryPassword
         ]
     );
 
@@ -801,6 +829,143 @@ async fn legacy_double_refresh_within_grace_converges_on_one_session() {
     .await
     .unwrap();
     assert_eq!(live, 1, "exactly one adopted session is live");
+
+    drop_db(&db).await;
+}
+
+/// TEST-22 (queue fr3-417sess, round-3 finding): the legacy-family session
+/// ADOPTION is ordered with a racing logout by the same `users` row lock the
+/// sign-in takes — a refresh arriving while a logout's epoch bump is in flight
+/// waits (positively observed as a Lock wait) and adopts at the post-bump
+/// epoch, never the stale one.
+#[tokio::test]
+async fn legacy_adoption_racing_an_epoch_bump_adopts_the_post_bump_epoch() {
+    let (pool, db) = fresh_db().await;
+    let jwt = Arc::new(JwtService::try_new(settings()).unwrap());
+    let app = app(&pool, jwt.clone());
+    let user = make_user(&pool, "adopter").await;
+    let before = users_token_version(&pool, user).await;
+    let jti = Uuid::new_v4();
+    let exp = Utc::now() + Duration::days(30);
+    rt::register(&pool, jti, user, exp).await.unwrap();
+    let legacy = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &serde_json::json!({
+            "sub": user.to_string(), "exp": exp.timestamp(), "iat": Utc::now().timestamp(),
+            "iss": "ziee", "aud": "ziee-api-refresh",
+            "username": "", "email": "", "is_admin": false,
+            "jti": jti.to_string(),
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(settings().secret.as_bytes()),
+    )
+    .unwrap();
+
+    let mut bump = pool.begin().await.unwrap();
+    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+        .bind(user)
+        .execute(&mut *bump)
+        .await
+        .unwrap();
+    let (a2, t2) = (app.clone(), legacy.clone());
+    let req = tokio::spawn(async move { refresh(&a2, &t2).await });
+    let mut waited = false;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if n > 0 {
+            waited = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        waited,
+        "the adoption must wait on the in-flight bump's users row lock"
+    );
+    bump.commit().await.unwrap();
+
+    let (status, body) = req.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let c = jwt
+        .validate_access_token(body["access_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(c.ver, Some(before + 1), "adopted at the post-bump epoch");
+    assert_eq!(
+        sessions::get_session_version(&pool, c.sid.unwrap())
+            .await
+            .unwrap(),
+        Some(before + 1)
+    );
+
+    drop_db(&db).await;
+}
+
+/// A claim source that WRITES the user's own row and reads the session it is
+/// told about — what a real claim-record writer does.
+struct WritingSource {
+    pool: PgPool,
+    seen: std::sync::Mutex<Option<(i32, Option<i32>)>>,
+}
+
+#[async_trait::async_trait]
+impl TokenClaimsSource for WritingSource {
+    async fn claims_for(&self, ctx: &MintContext) -> AccessTokenClaimValues {
+        sqlx::query("UPDATE users SET display_name = 'written-by-source' WHERE id = $1")
+            .bind(ctx.user_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        let row_ver: Option<i32> =
+            sqlx::query_scalar("SELECT ver FROM auth_sessions WHERE id = $1")
+                .bind(ctx.session_id)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap();
+        *self.seen.lock().unwrap() = Some((ctx.ver, row_ver));
+        AccessTokenClaimValues::default()
+    }
+}
+
+/// TEST-23 (queue fr3-417sess, round-3 finding): the claim source runs with NO
+/// mint lock held and AFTER its session committed — a source that writes the
+/// user's row completes (no self-deadlock), sees its session row, and is told
+/// that session's `ver` (so a claim record carries the same value).
+#[tokio::test]
+async fn a_database_writing_claim_source_sees_its_committed_session() {
+    let (pool, db) = fresh_db().await;
+    let src = Arc::new(WritingSource {
+        pool: pool.clone(),
+        seen: std::sync::Mutex::new(None),
+    });
+    let jwt = JwtService::try_new(settings())
+        .unwrap()
+        .with_token_claims_source(src.clone());
+    let user = make_user(&pool, "writer").await;
+
+    let minted = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        rt::mint_session_tokens(&pool, &jwt, user, "writer", "w@corp.com", false),
+    )
+    .await
+    .expect("a DB-writing source must not deadlock the mint")
+    .unwrap();
+
+    let ver = users_token_version(&pool, user).await;
+    assert_eq!(
+        *src.seen.lock().unwrap(),
+        Some((ver, Some(ver))),
+        "the source is told the session's ver and can read its committed row"
+    );
+    let c = jwt
+        .validate_access_token(&minted.pair.access_token)
+        .unwrap();
+    assert_eq!(c.ver, Some(ver));
+    assert!(rt::is_active(&pool, minted.refresh_jti).await.unwrap());
 
     drop_db(&db).await;
 }

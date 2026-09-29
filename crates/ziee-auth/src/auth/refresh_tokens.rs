@@ -151,6 +151,16 @@ pub async fn end_session_atomically(pool: &PgPool, user_id: Uuid) -> Result<i32,
 /// refreshes copy them forward. The session row and the first refresh-token
 /// row commit in ONE transaction (neither without the other).
 ///
+/// Order: (1) the transaction takes the `users` lock, reads the epoch, inserts
+/// the session row and the first refresh row (its jti + expiry chosen here),
+/// and COMMITS; (2) only then is the app's claim source consulted — outside
+/// any transaction and lock, with the session already existing and its `ver`
+/// known (so a claim record the source writes can key on the session and carry
+/// the same `ver`, and a source that touches the database cannot wait on its
+/// own mint's lock); (3) the pair is encoded, bound to the committed refresh
+/// jti. Every usable credential is handed out only after its whitelist row is
+/// committed (fail-closed).
+///
 /// The session's initial `ver` is read INSIDE the transaction under a `users`
 /// row share lock, so a logout racing this sign-in is strictly ordered with it:
 /// either the logout committed first (this reads the bumped epoch) or it waits
@@ -192,19 +202,9 @@ pub async fn mint_session_tokens_for(
     method: AuthMethod,
 ) -> Result<TokenPairWithJti, AppError> {
     let (access_hours, refresh_days) = session_expiries(pool, jwt_service).await;
-
-    // The app's claim source runs FIRST, outside the transaction and before
-    // the `users` lock below, so a source that touches the database can never
-    // wait on its own mint's lock. It is told the session id chosen here.
     let session_id = Uuid::new_v4();
-    let values = jwt_service
-        .claims_source()
-        .claims_for(&MintContext {
-            user_id,
-            session_id,
-            method,
-        })
-        .await;
+    let refresh_jti = Uuid::new_v4();
+    let refresh_expires_at = Utc::now() + chrono::Duration::days(refresh_days);
 
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
     let token_version: i32 = sqlx::query_scalar!(
@@ -216,29 +216,45 @@ pub async fn mint_session_tokens_for(
     .map_err(AppError::database_error)?
     .ok_or_else(|| AppError::unauthorized("USER_NOT_FOUND", "User not found"))?;
     sessions::insert_session(&mut tx, session_id, user_id, token_version).await?;
-    let minted = jwt_service.generate_session_tokens(
+    insert_refresh_row(
+        &mut tx,
+        refresh_jti,
+        user_id,
+        Some(session_id),
+        refresh_expires_at,
+    )
+    .await?;
+    tx.commit().await.map_err(AppError::database_error)?;
+
+    let values = jwt_service
+        .claims_source()
+        .claims_for(&MintContext {
+            user_id,
+            session_id,
+            ver: token_version,
+            method,
+        })
+        .await;
+    let pair = jwt_service.reissue_session_tokens_for_jti(
         user_id,
         username,
         email,
         is_admin,
         access_hours,
-        refresh_days,
+        refresh_jti,
+        refresh_expires_at,
         &SessionClaims {
             sid: Some(session_id),
             ver: token_version,
             values,
         },
     )?;
-    insert_refresh_row(
-        &mut tx,
-        minted.refresh_jti,
-        user_id,
-        Some(session_id),
-        minted.refresh_expires_at,
-    )
-    .await?;
-    tx.commit().await.map_err(AppError::database_error)?;
-    Ok(minted)
+    Ok(TokenPairWithJti {
+        pair,
+        refresh_jti,
+        refresh_expires_at,
+        session_id: Some(session_id),
+    })
 }
 
 /// Insert an active row for a freshly-issued refresh token. Call this
@@ -429,7 +445,7 @@ pub async fn claim_rotation_and_register_in_session(
         r#"
         UPDATE refresh_tokens
         SET revoked_at = NOW(), rotated_to = $2
-        WHERE jti = $1 AND revoked_at IS NULL
+        WHERE jti = $1 AND revoked_at IS NULL AND expires_at > NOW()
         "#,
         presented_jti,
         successor_jti,

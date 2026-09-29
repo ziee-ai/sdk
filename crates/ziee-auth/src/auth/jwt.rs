@@ -148,15 +148,15 @@ pub struct AccessTokenClaimValues {
 /// authentication event). Set by the SDK mint site that performed the check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
-    /// The user proved a LOCAL password against an existing credential
-    /// (`login`, or a provider row of type `local`).
+    /// The user proved the account's LOCAL password (`login` without a
+    /// provider).
     Password,
     /// The account was just created and signed in (registration, first-run
     /// setup): the user CHOSE a credential rather than proving one, so this is
     /// a sign-in event without an RFC 8176 authentication method.
     NewAccount,
-    /// The user proved a password against an external directory provider
-    /// (`login` with a non-local `provider`, e.g. LDAP).
+    /// The user proved a password through a configured auth provider
+    /// (`login` with a non-`local` `provider` name, e.g. LDAP).
     DirectoryPassword,
     /// A federated sign-in (OAuth2/OIDC/Apple): the SDK does not learn how the
     /// identity provider authenticated the user.
@@ -175,8 +175,13 @@ pub enum AuthMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MintContext {
     pub user_id: Uuid,
-    /// The session row just created for this sign-in (the token's `sid`).
+    /// The session row created — and COMMITTED — for this sign-in before the
+    /// source is consulted (the token's `sid`).
     pub session_id: Uuid,
+    /// That session's epoch (`auth_sessions.ver`, the token's `ver`), so a
+    /// claim record the app writes for the session carries the same value
+    /// (memo identity-and-access-339 §1 point 2).
+    pub ver: i32,
     /// How the user authenticated (see [`AuthMethod`]).
     pub method: AuthMethod,
 }
@@ -185,9 +190,10 @@ pub struct MintContext {
 /// know (who the client is, how the user authenticated, when, and any PoP key).
 ///
 /// Consulted ONCE per sign-in, by `refresh_tokens::mint_session_tokens_for`,
-/// BEFORE any database lock is taken (so an implementation may read or write
-/// the database, including the user's own row). It is NEVER consulted on
-/// refresh: the refresh token carries the values and the
+/// AFTER the session row and its first refresh row have committed and with no
+/// database lock held (so an implementation may read or write the database,
+/// including the user's own row, and may key a record on the session). It is
+/// NEVER consulted on refresh: the refresh token carries the values and the
 /// refresh handler copies them forward, so they stay fixed for every token
 /// derived from one authorization (RFC 9068 §2.2.1). Install with
 /// [`JwtService::with_token_claims_source`]; the SDK default is
@@ -1136,6 +1142,7 @@ mod tests {
         let ctx = MintContext {
             user_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
+            ver: 0,
             method: AuthMethod::Password,
         };
         let default_svc = JwtService::try_new(test_config(None)).unwrap();

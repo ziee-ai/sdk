@@ -363,6 +363,7 @@ async fn mint_session_tokens_stamps_the_session_dimension() {
         vec![MintContext {
             user_id: user,
             session_id: sid,
+            ver: 3,
             method: ziee_auth::auth::AuthMethod::Password,
         }],
         "the claim source is consulted once, for this session"

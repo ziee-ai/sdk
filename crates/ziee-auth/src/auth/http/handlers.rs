@@ -423,7 +423,7 @@ async fn login_with_provider(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, provider_auth_method(&provider_config.provider_type))
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::DirectoryPassword)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -724,17 +724,6 @@ pub async fn refresh(
         Ok((StatusCode::OK, resp))
     } else {
         Ok((StatusCode::OK, Json(out_pair).into_response()))
-    }
-}
-
-/// The authentication method of a `login_with_provider` sign-in: a provider
-/// row of type `local` checks a LOCAL password; any other password provider
-/// (LDAP) checks it against an external directory.
-fn provider_auth_method(provider_type: &str) -> AuthMethod {
-    if provider_type == "local" {
-        AuthMethod::Password
-    } else {
-        AuthMethod::DirectoryPassword
     }
 }
 
