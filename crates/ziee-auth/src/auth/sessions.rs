@@ -9,8 +9,10 @@
 //! ([`bump_session_version`]) without touching the user's other sessions.
 //!
 //! `users.token_version` stays the write-side master: a session's `ver` is
-//! initialised from it at sign-in ([`create_session`], the one place the user
-//! scalar is read), and the user-level kill (`refresh_tokens::
+//! initialised from it — read under a `users` row share lock — when the
+//! session is created (`refresh_tokens::mint_session_tokens_for` and
+//! [`create_session_at_current_epoch`], the only places the user scalar is
+//! read for a session), and the user-level kill (`refresh_tokens::
 //! end_session_atomically`, i.e. logout) bumps it AND ends every live session
 //! of the user in one transaction. See migration
 //! `202607144650_auth_sessions.sql`.
@@ -32,8 +34,8 @@ pub async fn create_session(
     Ok(id)
 }
 
-/// [`create_session`] with a caller-chosen id (the mint picks the id first so
-/// the app's claim source can be told the session before any lock is taken).
+/// [`create_session`] with a caller-chosen id (the mint picks the session id
+/// and the first refresh jti up front and inserts both in one transaction).
 pub async fn insert_session(
     conn: &mut PgConnection,
     id: Uuid,
@@ -56,8 +58,9 @@ pub async fn insert_session(
 /// `users.token_version` under a `users` row share lock in the same
 /// transaction as the insert — so a racing logout (which updates that row) is
 /// strictly ordered with it and can never leave the session born at the
-/// pre-logout epoch. Returns `(session_id, ver)`, or `None` if the user row is
-/// absent.
+/// pre-logout epoch. Returns `(session_id, ver, values)` — `values` being the
+/// claim values the app's source supplied (and recorded) for the session — or
+/// `None` if the user row is absent.
 ///
 /// The app's `TokenClaimsSource` is consulted in the same transaction
 /// (`record_session` on this connection, method `Unspecified`), so every
@@ -66,7 +69,7 @@ pub async fn create_session_at_current_epoch(
     pool: &PgPool,
     user_id: Uuid,
     source: &dyn crate::auth::jwt::TokenClaimsSource,
-) -> Result<Option<(Uuid, i32)>, AppError> {
+) -> Result<Option<(Uuid, i32, crate::auth::jwt::AccessTokenClaimValues)>, AppError> {
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
     let Some(ver) = sqlx::query_scalar!(
         r#"SELECT token_version AS "adopted_epoch!" FROM users WHERE id = $1 FOR SHARE"#,
@@ -88,9 +91,9 @@ pub async fn create_session_at_current_epoch(
         method: crate::auth::jwt::AuthMethod::Unspecified,
     };
     let values = source.claims_for(&ctx).await;
-    source.record_session(&ctx, &values, &mut tx).await?;
+    let values = source.record_session(&ctx, values, &mut tx).await?;
     tx.commit().await.map_err(AppError::database_error)?;
-    Ok(Some((id, ver)))
+    Ok(Some((id, ver, values)))
 }
 
 /// The session's current epoch, or `None` when the session is absent or has

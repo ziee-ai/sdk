@@ -233,7 +233,7 @@ pub async fn mint_session_tokens_for(
     };
     let source = jwt_service.claims_source();
     let values = source.claims_for(&ctx).await;
-    source.record_session(&ctx, &values, &mut tx).await?;
+    let values = source.record_session(&ctx, values, &mut tx).await?;
 
     // Encode BEFORE committing (pure), so a failure anywhere leaves nothing.
     let pair = jwt_service.reissue_session_tokens_for_jti(

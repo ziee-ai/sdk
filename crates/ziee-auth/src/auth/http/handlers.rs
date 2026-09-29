@@ -19,7 +19,9 @@ use crate::user::{Group, User, UserRepository, UserService};
 use crate::auth::context::{AuthContext, AuthSyncAction, AuthSyncEntity};
 
 use crate::auth::cookie;
-use crate::auth::jwt::{JwtService, SessionClaims, TokenPair, TokenPairWithJti};
+use crate::auth::jwt::{
+    AccessTokenClaimValues, JwtService, SessionClaims, TokenPair, TokenPairWithJti,
+};
 use super::jwt_extractor::JwtAuth;
 use crate::auth::password;
 use crate::auth::permissions::{AuthProvidersManage, AuthProvidersRead};
@@ -568,6 +570,9 @@ pub async fn refresh(
             ),
         )
     };
+    // The claim values an ADOPTED session was created with (the app's source
+    // is consulted once, when the session row is created); `None` otherwise.
+    let mut adopted_values: Option<AccessTokenClaimValues> = None;
     let (own_session, own_ver, adopted) = match claims.sid {
         Some(sid) => {
             let ver = sessions::get_session_version(pool, sid)
@@ -587,14 +592,15 @@ pub async fn refresh(
             if refresh_tokens::is_active(pool, jti).await.map_err(e500)? {
                 // Adopt a session for the legacy family, at the user's current
                 // epoch under the `users` row lock (ordered with logout).
-                let (sid, ver) = sessions::create_session_at_current_epoch(
+                let (sid, ver, values) = sessions::create_session_at_current_epoch(
                     pool,
                     user.id,
                     jwt_service.claims_source().as_ref(),
                 )
-                    .await
-                    .map_err(e500)?
-                    .ok_or_else(user_not_found)?;
+                .await
+                .map_err(e500)?
+                .ok_or_else(user_not_found)?;
+                adopted_values = Some(values);
                 (Some(sid), ver, true)
             } else {
                 // Already rotated (a racing tab) or revoked: adopt NOTHING — a
@@ -617,7 +623,16 @@ pub async fn refresh(
         // `aud`) are COPIED from the presented, signature-verified refresh
         // token — the app's claim source is never re-consulted on refresh, so
         // they stay fixed for every token of this sign-in (RFC 9068 §2.2.1).
-        let carried = SessionClaims::carried_from_refresh(&claims, own_session, own_ver);
+        let carried = match adopted_values.take() {
+            // A freshly adopted session stamps the values it was created (and
+            // recorded) with, so its record and its tokens agree.
+            Some(values) => SessionClaims {
+                sid: own_session,
+                ver: own_ver,
+                values,
+            },
+            None => SessionClaims::carried_from_refresh(&claims, own_session, own_ver),
+        };
         let candidate = match jwt_service.generate_session_tokens(
             user.id,
             &user.username,

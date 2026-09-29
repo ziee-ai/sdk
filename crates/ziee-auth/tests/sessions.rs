@@ -906,12 +906,15 @@ async fn legacy_adoption_racing_an_epoch_bump_adopts_the_post_bump_epoch() {
     drop_db(&db).await;
 }
 
-/// A claim source whose `record_session` WRITES through the mint's own
-/// connection — what a real claim-record writer does: it updates the user's
-/// row (which the mint holds a share lock on) and reads the session it is told
-/// about.
+/// A claim source whose `record_session` writes the app's claim record
+/// through the mint's OWN connection — what a real claim-record writer does —
+/// and derives a value from it (`client_id`), which must reach the token.
+/// It also checks, through a SEPARATE pool connection, that the session row is
+/// NOT yet visible there: proof the record is written inside the mint's
+/// still-open transaction, not after a commit.
 struct WritingSource {
-    seen: std::sync::Mutex<Option<(i32, Option<i32>)>>,
+    pool: PgPool,
+    seen: std::sync::Mutex<Vec<(ziee_auth::auth::AuthMethod, i32, Option<i32>, bool)>>,
 }
 
 #[async_trait::async_trait]
@@ -922,11 +925,12 @@ impl TokenClaimsSource for WritingSource {
     async fn record_session(
         &self,
         ctx: &MintContext,
-        _values: &AccessTokenClaimValues,
+        mut values: AccessTokenClaimValues,
         conn: &mut sqlx::PgConnection,
-    ) -> Result<(), ziee_core::AppError> {
-        sqlx::query("UPDATE users SET display_name = 'written-by-source' WHERE id = $1")
-            .bind(ctx.user_id)
+    ) -> Result<AccessTokenClaimValues, ziee_core::AppError> {
+        sqlx::query("INSERT INTO claim_records (sid, ver) VALUES ($1, $2)")
+            .bind(ctx.session_id)
+            .bind(ctx.ver)
             .execute(&mut *conn)
             .await
             .unwrap();
@@ -936,20 +940,40 @@ impl TokenClaimsSource for WritingSource {
                 .fetch_optional(&mut *conn)
                 .await
                 .unwrap();
-        *self.seen.lock().unwrap() = Some((ctx.ver, row_ver));
-        Ok(())
+        let visible_outside: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM auth_sessions WHERE id = $1)")
+                .bind(ctx.session_id)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+        self.seen
+            .lock()
+            .unwrap()
+            .push((ctx.method, ctx.ver, row_ver, visible_outside));
+        values.client_id = Some(format!("record-{}", ctx.session_id));
+        Ok(values)
     }
 }
 
-/// TEST-23 (queue fr3-417sess, round-3/4 findings): the claim record is
-/// written INSIDE the mint transaction — a `record_session` that writes the
-/// user's row completes (no self-deadlock), sees its session row, and is told
-/// that session's `ver` (a non-zero epoch, so a hard-coded 0 would fail).
+async fn claim_records_table(pool: &PgPool) {
+    sqlx::query("CREATE TABLE claim_records (sid uuid PRIMARY KEY, ver integer NOT NULL)")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// TEST-23 (queue fr3-417sess, round-3/4/5 findings): the claim record is
+/// written INSIDE the mint transaction — `record_session` sees its session
+/// row on the mint connection while it is still invisible to any other
+/// connection, is told the session's `ver` (a non-zero epoch), commits with
+/// the mint, and the values it returns are the ones stamped on the token.
 #[tokio::test]
 async fn a_database_writing_claim_source_sees_its_committed_session() {
     let (pool, db) = fresh_db().await;
+    claim_records_table(&pool).await;
     let src = Arc::new(WritingSource {
-        seen: std::sync::Mutex::new(None),
+        pool: pool.clone(),
+        seen: std::sync::Mutex::new(Vec::new()),
     });
     let jwt = JwtService::try_new(settings())
         .unwrap()
@@ -968,26 +992,28 @@ async fn a_database_writing_claim_source_sees_its_committed_session() {
     .await
     .expect("a DB-writing source must not deadlock the mint")
     .unwrap();
+    let sid = minted.session_id.unwrap();
 
     assert_eq!(
         *src.seen.lock().unwrap(),
-        Some((5, Some(5))),
-        "record_session is told the session's ver and sees its row"
+        vec![(ziee_auth::auth::AuthMethod::Unspecified, 5, Some(5), false)],
+        "record_session runs in the open mint tx (row visible on its conn, not outside)"
     );
-    let name: Option<String> = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
-        .bind(user)
+    let rec_ver: i32 = sqlx::query_scalar("SELECT ver FROM claim_records WHERE sid = $1")
+        .bind(sid)
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        name.as_deref(),
-        Some("written-by-source"),
-        "the record committed with the mint"
-    );
+    assert_eq!(rec_ver, 5, "the record committed with the mint, same ver");
     let c = jwt
         .validate_access_token(&minted.pair.access_token)
         .unwrap();
     assert_eq!(c.ver, Some(5));
+    assert_eq!(
+        c.client_id,
+        Some(format!("record-{sid}")),
+        "record_session's values are stamped"
+    );
     assert!(rt::is_active(&pool, minted.refresh_jti).await.unwrap());
 
     drop_db(&db).await;
@@ -1004,9 +1030,9 @@ impl TokenClaimsSource for FailingRecorder {
     async fn record_session(
         &self,
         _ctx: &MintContext,
-        _values: &AccessTokenClaimValues,
+        _values: AccessTokenClaimValues,
         _conn: &mut sqlx::PgConnection,
-    ) -> Result<(), ziee_core::AppError> {
+    ) -> Result<AccessTokenClaimValues, ziee_core::AppError> {
         Err(ziee_core::AppError::internal_error(
             "claim record write failed",
         ))
@@ -1038,6 +1064,95 @@ async fn a_failed_claim_record_rolls_back_the_whole_mint() {
                 .unwrap();
         assert_eq!(n, 0, "{table} must be empty after a failed mint");
     }
+
+    drop_db(&db).await;
+}
+
+/// TEST-26 (queue fr3-417sess, round-5 findings): the legacy-family ADOPTION
+/// creates its session through the same claim-record hook — `record_session`
+/// runs in the adoption's transaction (method Unspecified) and the adopted
+/// session's tokens carry the values it returned; and a failing record write
+/// aborts the adoption (500) leaving no session row.
+#[tokio::test]
+async fn legacy_adoption_writes_the_claim_record_or_nothing() {
+    let legacy_for = |user: Uuid, jti: Uuid, exp: chrono::DateTime<Utc>| {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::default(),
+            &serde_json::json!({
+                "sub": user.to_string(), "exp": exp.timestamp(), "iat": Utc::now().timestamp(),
+                "iss": "ziee", "aud": "ziee-api-refresh",
+                "username": "", "email": "", "is_admin": false,
+                "jti": jti.to_string(),
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(settings().secret.as_bytes()),
+        )
+        .unwrap()
+    };
+    let (pool, db) = fresh_db().await;
+    claim_records_table(&pool).await;
+    let exp = Utc::now() + Duration::days(30);
+
+    // Success: the record is written and its values are stamped.
+    let src = Arc::new(WritingSource {
+        pool: pool.clone(),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let jwt = Arc::new(
+        JwtService::try_new(settings())
+            .unwrap()
+            .with_token_claims_source(src.clone()),
+    );
+    let app_ok = app(&pool, jwt.clone());
+    let user = make_user(&pool, "adoptrec").await;
+    let jti = Uuid::new_v4();
+    rt::register(&pool, jti, user, exp).await.unwrap();
+    let (status, body) = refresh(&app_ok, &legacy_for(user, jti, exp)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let c = jwt
+        .validate_access_token(body["access_token"].as_str().unwrap())
+        .unwrap();
+    let sid = c.sid.expect("adopted session");
+    let seen = src.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, ziee_auth::auth::AuthMethod::Unspecified);
+    assert!(
+        !seen[0].3,
+        "the adoption's record is written inside its transaction"
+    );
+    let rec: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claim_records WHERE sid = $1")
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rec, 1, "the adopted session has its claim record");
+    assert_eq!(
+        c.client_id,
+        Some(format!("record-{sid}")),
+        "record and token agree"
+    );
+
+    // Failure: the record write fails -> 500, and no session is adopted.
+    let jwt_fail = Arc::new(
+        JwtService::try_new(settings())
+            .unwrap()
+            .with_token_claims_source(Arc::new(FailingRecorder)),
+    );
+    let app_fail = app(&pool, jwt_fail);
+    let user2 = make_user(&pool, "adoptfail").await;
+    let jti2 = Uuid::new_v4();
+    rt::register(&pool, jti2, user2, exp).await.unwrap();
+    let (status, body) = refresh(&app_fail, &legacy_for(user2, jti2, exp)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions WHERE user_id = $1")
+        .bind(user2)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "a failed record write adopts no session");
+    assert!(
+        rt::is_active(&pool, jti2).await.unwrap(),
+        "and the legacy token is untouched"
+    );
 
     drop_db(&db).await;
 }

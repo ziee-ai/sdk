@@ -209,26 +209,38 @@ pub struct MintContext {
 /// [`DefaultTokenClaimsSource`].
 #[async_trait::async_trait]
 pub trait TokenClaimsSource: Send + Sync {
-    /// The claim values for the sign-in described by `ctx`.
+    /// The claim values for the sign-in described by `ctx`. PURE: it runs
+    /// inside the mint's open transaction (a pooled connection held, the
+    /// user's `users` row share-locked), so it must do no I/O of its own —
+    /// database work belongs in [`record_session`](Self::record_session), on
+    /// the connection it is given.
     async fn claims_for(&self, ctx: &MintContext) -> AccessTokenClaimValues;
 
     /// Record the app's side of the new session (its claim record, keyed by
     /// `ctx.session_id` and carrying `ctx.ver`) on `conn` — the mint's own
-    /// transaction, in which the `auth_sessions` row already exists. Default:
-    /// records nothing.
+    /// transaction, in which the `auth_sessions` row already exists — and
+    /// return the FINAL claim values to stamp (default: `values` unchanged;
+    /// an app may derive values here from what it reads on `conn`, e.g. a
+    /// per-session `aud`). An `Err` aborts the whole mint (surfaced as 500).
     ///
-    /// The SDK session row stays the liveness authority: SDK logout
-    /// (`end_session_atomically`) ends `auth_sessions` rows, not the app's
-    /// record, so an app resolver must refuse a session whose `auth_sessions`
-    /// row is ended — e.g. read its record joined to `auth_sessions` by the
-    /// same `sid`, or call `jwt_extractor::assert_session_epoch_current`.
+    /// Constraints: do NOT write the `users` row (the mint holds it `FOR
+    /// SHARE`; two concurrent sign-ins of one user would deadlock upgrading
+    /// it) and keep it short (it delays that user's logout while it runs).
+    ///
+    /// ONE epoch authority: the SDK session row. SDK logout ends
+    /// `auth_sessions` rows and `sessions::bump_session_version` bumps
+    /// `auth_sessions.ver`; neither touches the app's record. So an app
+    /// resolver must refuse a token whose `auth_sessions` row is absent, ended
+    /// OR whose `ver` differs from the token's — e.g. read its record joined
+    /// to `auth_sessions` by the same `sid` and compare `auth_sessions.ver`,
+    /// or call `jwt_extractor::assert_session_epoch_current`.
     async fn record_session(
         &self,
         _ctx: &MintContext,
-        _values: &AccessTokenClaimValues,
+        values: AccessTokenClaimValues,
         _conn: &mut sqlx::PgConnection,
-    ) -> Result<(), AppError> {
-        Ok(())
+    ) -> Result<AccessTokenClaimValues, AppError> {
+        Ok(values)
     }
 
     /// Whether `aud` (a value this source minted, other than the configured
