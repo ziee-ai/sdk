@@ -423,7 +423,7 @@ async fn login_with_provider(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::DirectoryPassword)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, provider_auth_method(&provider_config.provider_type))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -587,7 +587,11 @@ pub async fn refresh(
             if refresh_tokens::is_active(pool, jti).await.map_err(e500)? {
                 // Adopt a session for the legacy family, at the user's current
                 // epoch under the `users` row lock (ordered with logout).
-                let (sid, ver) = sessions::create_session_at_current_epoch(pool, user.id)
+                let (sid, ver) = sessions::create_session_at_current_epoch(
+                    pool,
+                    user.id,
+                    jwt_service.claims_source().as_ref(),
+                )
                     .await
                     .map_err(e500)?
                     .ok_or_else(user_not_found)?;
@@ -724,6 +728,18 @@ pub async fn refresh(
         Ok((StatusCode::OK, resp))
     } else {
         Ok((StatusCode::OK, Json(out_pair).into_response()))
+    }
+}
+
+/// The authentication method of a `login_with_provider` sign-in: a provider
+/// row of type `local` checks the account's LOCAL password (reachable: any
+/// provider NAME other than `local` routes here, whatever its type); any other
+/// type checks the password against an external directory (LDAP).
+pub(crate) fn provider_auth_method(provider_type: &str) -> AuthMethod {
+    if provider_type == "local" {
+        AuthMethod::Password
+    } else {
+        AuthMethod::DirectoryPassword
     }
 }
 
@@ -2456,3 +2472,15 @@ pub fn admin_test_provider_config_docs(op: TransformOperation) -> TransformOpera
 // and the `users.password_changed_at` column added by a desktop
 // migration. Keeping them in this crate would orphan unreachable
 // routes in server-only deployments.
+
+#[cfg(test)]
+mod provider_auth_method_tests {
+    use super::*;
+
+    /// TEST-20 (queue fr3-417sess): the provider-login tag partition.
+    #[test]
+    fn provider_type_decides_the_auth_method() {
+        assert_eq!(provider_auth_method("local"), AuthMethod::Password);
+        assert_eq!(provider_auth_method("ldap"), AuthMethod::DirectoryPassword);
+    }
+}

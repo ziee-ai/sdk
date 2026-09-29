@@ -151,15 +151,13 @@ pub async fn end_session_atomically(pool: &PgPool, user_id: Uuid) -> Result<i32,
 /// refreshes copy them forward. The session row and the first refresh-token
 /// row commit in ONE transaction (neither without the other).
 ///
-/// Order: (1) the transaction takes the `users` lock, reads the epoch, inserts
-/// the session row and the first refresh row (its jti + expiry chosen here),
-/// and COMMITS; (2) only then is the app's claim source consulted — outside
-/// any transaction and lock, with the session already existing and its `ver`
-/// known (so a claim record the source writes can key on the session and carry
-/// the same `ver`, and a source that touches the database cannot wait on its
-/// own mint's lock); (3) the pair is encoded, bound to the committed refresh
-/// jti. Every usable credential is handed out only after its whitelist row is
-/// committed (fail-closed).
+/// Order, all in ONE transaction: take the `users` share lock and read the
+/// epoch; insert the session row and its first refresh row; consult the app's
+/// `TokenClaimsSource` (`claims_for`, then `record_session` on this same
+/// connection — so the app's claim record commits atomically with the session
+/// and carries the same `ver`); encode the pair; COMMIT. Any failure rolls all
+/// of it back, so no session, refresh row or claim record outlives a mint that
+/// handed out no token (fail-closed).
 ///
 /// The session's initial `ver` is read INSIDE the transaction under a `users`
 /// row share lock, so a logout racing this sign-in is strictly ordered with it:
@@ -208,7 +206,7 @@ pub async fn mint_session_tokens_for(
 
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
     let token_version: i32 = sqlx::query_scalar!(
-        r#"SELECT token_version FROM users WHERE id = $1 FOR SHARE"#,
+        r#"SELECT token_version AS "minted_epoch!" FROM users WHERE id = $1 FOR SHARE"#,
         user_id,
     )
     .fetch_optional(&mut *tx)
@@ -224,17 +222,20 @@ pub async fn mint_session_tokens_for(
         refresh_expires_at,
     )
     .await?;
-    tx.commit().await.map_err(AppError::database_error)?;
 
-    let values = jwt_service
-        .claims_source()
-        .claims_for(&MintContext {
-            user_id,
-            session_id,
-            ver: token_version,
-            method,
-        })
-        .await;
+    // The app's hooks run INSIDE this transaction (see `TokenClaimsSource`):
+    // its claim record commits atomically with the session, under the lock.
+    let ctx = MintContext {
+        user_id,
+        session_id,
+        ver: token_version,
+        method,
+    };
+    let source = jwt_service.claims_source();
+    let values = source.claims_for(&ctx).await;
+    source.record_session(&ctx, &values, &mut tx).await?;
+
+    // Encode BEFORE committing (pure), so a failure anywhere leaves nothing.
     let pair = jwt_service.reissue_session_tokens_for_jti(
         user_id,
         username,
@@ -249,6 +250,7 @@ pub async fn mint_session_tokens_for(
             values,
         },
     )?;
+    tx.commit().await.map_err(AppError::database_error)?;
     Ok(TokenPairWithJti {
         pair,
         refresh_jti,

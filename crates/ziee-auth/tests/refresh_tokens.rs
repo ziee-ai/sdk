@@ -385,3 +385,27 @@ async fn mint_session_tokens_stamps_the_session_dimension() {
 
     drop_db(&db).await;
 }
+
+/// TEST-24 (queue fr3-417sess, round-3 fix H1): a whitelist row that has
+/// EXPIRED cannot be claimed for rotation, even though it was never revoked —
+/// so a token presented inside the JWT validation leeway cannot rotate.
+#[tokio::test]
+async fn an_expired_row_cannot_be_claimed_for_rotation() {
+    let (pool, db) = fresh_db().await;
+    let user = make_user(&pool, "stale").await;
+    let presented = Uuid::new_v4();
+    rt::register(&pool, presented, user, Utc::now() - Duration::seconds(2))
+        .await
+        .unwrap();
+    let won = rt::claim_rotation_and_register(
+        &pool,
+        presented,
+        Uuid::new_v4(),
+        user,
+        Utc::now() + Duration::days(30),
+    )
+    .await
+    .unwrap();
+    assert!(!won, "an expired row must not rotate");
+    drop_db(&db).await;
+}

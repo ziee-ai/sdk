@@ -149,14 +149,14 @@ pub struct AccessTokenClaimValues {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
     /// The user proved the account's LOCAL password (`login` without a
-    /// provider).
+    /// provider or with provider `local`, or a provider row of type `local`).
     Password,
     /// The account was just created and signed in (registration, first-run
     /// setup): the user CHOSE a credential rather than proving one, so this is
     /// a sign-in event without an RFC 8176 authentication method.
     NewAccount,
-    /// The user proved a password through a configured auth provider
-    /// (`login` with a non-`local` `provider` name, e.g. LDAP).
+    /// The user proved a password against an external directory provider
+    /// (`login` with a provider row of a non-`local` type, e.g. LDAP).
     DirectoryPassword,
     /// A federated sign-in (OAuth2/OIDC/Apple): the SDK does not learn how the
     /// identity provider authenticated the user.
@@ -175,8 +175,8 @@ pub enum AuthMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MintContext {
     pub user_id: Uuid,
-    /// The session row created — and COMMITTED — for this sign-in before the
-    /// source is consulted (the token's `sid`).
+    /// The session row created for this sign-in (the token's `sid`); it exists
+    /// in the mint's transaction when the source is consulted.
     pub session_id: Uuid,
     /// That session's epoch (`auth_sessions.ver`, the token's `ver`), so a
     /// claim record the app writes for the session carries the same value
@@ -189,11 +189,20 @@ pub struct MintContext {
 /// The app's minting hook: supplies the RFC 9068 claim values the SDK cannot
 /// know (who the client is, how the user authenticated, when, and any PoP key).
 ///
-/// Consulted ONCE per sign-in, by `refresh_tokens::mint_session_tokens_for`,
-/// AFTER the session row and its first refresh row have committed and with no
-/// database lock held (so an implementation may read or write the database,
-/// including the user's own row, and may key a record on the session). It is
-/// NEVER consulted on refresh: the refresh token carries the values and the
+/// Consulted ONCE per session, inside the transaction that creates it
+/// (`refresh_tokens::mint_session_tokens_for`, and the refresh handler's
+/// adoption of a legacy family), AFTER the session row is inserted and while
+/// that transaction holds the user's `users` row share lock — so whatever the
+/// app records for the session is atomic with the session row and strictly
+/// ordered with a logout (which updates that `users` row). Two hooks:
+///   * [`claims_for`](Self::claims_for) returns the values; it must NOT touch the
+///     database through its own connection (it would wait on the very lock the
+///     mint holds);
+///   * [`record_session`](Self::record_session) writes the app's claim record
+///     through the mint's OWN connection; an `Err` aborts the whole mint (no
+///     session, no refresh row, no token).
+///
+/// It is NEVER consulted on refresh: the refresh token carries the values and the
 /// refresh handler copies them forward, so they stay fixed for every token
 /// derived from one authorization (RFC 9068 §2.2.1). Install with
 /// [`JwtService::with_token_claims_source`]; the SDK default is
@@ -202,6 +211,25 @@ pub struct MintContext {
 pub trait TokenClaimsSource: Send + Sync {
     /// The claim values for the sign-in described by `ctx`.
     async fn claims_for(&self, ctx: &MintContext) -> AccessTokenClaimValues;
+
+    /// Record the app's side of the new session (its claim record, keyed by
+    /// `ctx.session_id` and carrying `ctx.ver`) on `conn` — the mint's own
+    /// transaction, in which the `auth_sessions` row already exists. Default:
+    /// records nothing.
+    ///
+    /// The SDK session row stays the liveness authority: SDK logout
+    /// (`end_session_atomically`) ends `auth_sessions` rows, not the app's
+    /// record, so an app resolver must refuse a session whose `auth_sessions`
+    /// row is ended — e.g. read its record joined to `auth_sessions` by the
+    /// same `sid`, or call `jwt_extractor::assert_session_epoch_current`.
+    async fn record_session(
+        &self,
+        _ctx: &MintContext,
+        _values: &AccessTokenClaimValues,
+        _conn: &mut sqlx::PgConnection,
+    ) -> Result<(), AppError> {
+        Ok(())
+    }
 
     /// Whether `aud` (a value this source minted, other than the configured
     /// audience) names this resource server. Default: accept nothing beyond

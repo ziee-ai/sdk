@@ -569,7 +569,7 @@ async fn sign_in_racing_logout_starts_at_the_post_logout_epoch() {
     for _ in 0..100 {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+             WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%minted_epoch%'",
         )
         .fetch_one(&pool)
         .await
@@ -736,9 +736,9 @@ async fn each_mint_site_reports_its_auth_method() {
     let (status, body) = refresh(&app, &jtiless).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    // A password login through a configured provider (`login` with a
-    // non-`local` provider name) — a provider row of type `local` linked to
-    // this user, so no directory server is needed.
+    // A login through a provider NAMED other than `local` whose row is of
+    // TYPE `local` (reachable) — it checks the account's local password, so it
+    // must be tagged Password, not DirectoryPassword.
     let provider: Uuid = sqlx::query_scalar(
         "INSERT INTO auth_providers (name, provider_type, enabled, config) \
          VALUES ('corp-directory', 'local', true, '{}') RETURNING id",
@@ -769,7 +769,8 @@ async fn each_mint_site_reports_its_auth_method() {
             AuthMethod::NewAccount,
             AuthMethod::Password,
             AuthMethod::Unspecified,
-            AuthMethod::DirectoryPassword
+            // A provider row of TYPE `local` proves the account's local password.
+            AuthMethod::Password
         ]
     );
 
@@ -872,7 +873,7 @@ async fn legacy_adoption_racing_an_epoch_bump_adopts_the_post_bump_epoch() {
     for _ in 0..100 {
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+             WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%adopted_epoch%'",
         )
         .fetch_one(&pool)
         .await
@@ -905,47 +906,60 @@ async fn legacy_adoption_racing_an_epoch_bump_adopts_the_post_bump_epoch() {
     drop_db(&db).await;
 }
 
-/// A claim source that WRITES the user's own row and reads the session it is
-/// told about — what a real claim-record writer does.
+/// A claim source whose `record_session` WRITES through the mint's own
+/// connection — what a real claim-record writer does: it updates the user's
+/// row (which the mint holds a share lock on) and reads the session it is told
+/// about.
 struct WritingSource {
-    pool: PgPool,
     seen: std::sync::Mutex<Option<(i32, Option<i32>)>>,
 }
 
 #[async_trait::async_trait]
 impl TokenClaimsSource for WritingSource {
-    async fn claims_for(&self, ctx: &MintContext) -> AccessTokenClaimValues {
+    async fn claims_for(&self, _ctx: &MintContext) -> AccessTokenClaimValues {
+        AccessTokenClaimValues::default()
+    }
+    async fn record_session(
+        &self,
+        ctx: &MintContext,
+        _values: &AccessTokenClaimValues,
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<(), ziee_core::AppError> {
         sqlx::query("UPDATE users SET display_name = 'written-by-source' WHERE id = $1")
             .bind(ctx.user_id)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await
             .unwrap();
         let row_ver: Option<i32> =
             sqlx::query_scalar("SELECT ver FROM auth_sessions WHERE id = $1")
                 .bind(ctx.session_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *conn)
                 .await
                 .unwrap();
         *self.seen.lock().unwrap() = Some((ctx.ver, row_ver));
-        AccessTokenClaimValues::default()
+        Ok(())
     }
 }
 
-/// TEST-23 (queue fr3-417sess, round-3 finding): the claim source runs with NO
-/// mint lock held and AFTER its session committed — a source that writes the
+/// TEST-23 (queue fr3-417sess, round-3/4 findings): the claim record is
+/// written INSIDE the mint transaction — a `record_session` that writes the
 /// user's row completes (no self-deadlock), sees its session row, and is told
-/// that session's `ver` (so a claim record carries the same value).
+/// that session's `ver` (a non-zero epoch, so a hard-coded 0 would fail).
 #[tokio::test]
 async fn a_database_writing_claim_source_sees_its_committed_session() {
     let (pool, db) = fresh_db().await;
     let src = Arc::new(WritingSource {
-        pool: pool.clone(),
         seen: std::sync::Mutex::new(None),
     });
     let jwt = JwtService::try_new(settings())
         .unwrap()
         .with_token_claims_source(src.clone());
     let user = make_user(&pool, "writer").await;
+    sqlx::query("UPDATE users SET token_version = 5 WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let minted = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -955,17 +969,75 @@ async fn a_database_writing_claim_source_sees_its_committed_session() {
     .expect("a DB-writing source must not deadlock the mint")
     .unwrap();
 
-    let ver = users_token_version(&pool, user).await;
     assert_eq!(
         *src.seen.lock().unwrap(),
-        Some((ver, Some(ver))),
-        "the source is told the session's ver and can read its committed row"
+        Some((5, Some(5))),
+        "record_session is told the session's ver and sees its row"
+    );
+    let name: Option<String> = sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        name.as_deref(),
+        Some("written-by-source"),
+        "the record committed with the mint"
     );
     let c = jwt
         .validate_access_token(&minted.pair.access_token)
         .unwrap();
-    assert_eq!(c.ver, Some(ver));
+    assert_eq!(c.ver, Some(5));
     assert!(rt::is_active(&pool, minted.refresh_jti).await.unwrap());
+
+    drop_db(&db).await;
+}
+
+/// A source whose record write fails.
+struct FailingRecorder;
+
+#[async_trait::async_trait]
+impl TokenClaimsSource for FailingRecorder {
+    async fn claims_for(&self, _ctx: &MintContext) -> AccessTokenClaimValues {
+        AccessTokenClaimValues::default()
+    }
+    async fn record_session(
+        &self,
+        _ctx: &MintContext,
+        _values: &AccessTokenClaimValues,
+        _conn: &mut sqlx::PgConnection,
+    ) -> Result<(), ziee_core::AppError> {
+        Err(ziee_core::AppError::internal_error(
+            "claim record write failed",
+        ))
+    }
+}
+
+/// TEST-25 (queue fr3-417sess, round-4 finding: orphans): a mint whose claim
+/// record cannot be written fails and leaves NOTHING — no session row, no
+/// refresh row.
+#[tokio::test]
+async fn a_failed_claim_record_rolls_back_the_whole_mint() {
+    let (pool, db) = fresh_db().await;
+    let jwt = JwtService::try_new(settings())
+        .unwrap()
+        .with_token_claims_source(Arc::new(FailingRecorder));
+    let user = make_user(&pool, "rollback").await;
+
+    assert!(
+        rt::mint_session_tokens(&pool, &jwt, user, "rollback", "r@corp.com", false)
+            .await
+            .is_err()
+    );
+    for table in ["auth_sessions", "refresh_tokens"] {
+        let n: i64 =
+            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = $1"))
+                .bind(user)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "{table} must be empty after a failed mint");
+    }
 
     drop_db(&db).await;
 }

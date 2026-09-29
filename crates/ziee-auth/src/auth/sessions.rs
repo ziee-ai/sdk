@@ -58,13 +58,18 @@ pub async fn insert_session(
 /// strictly ordered with it and can never leave the session born at the
 /// pre-logout epoch. Returns `(session_id, ver)`, or `None` if the user row is
 /// absent.
+///
+/// The app's `TokenClaimsSource` is consulted in the same transaction
+/// (`record_session` on this connection, method `Unspecified`), so every
+/// session the SDK creates has had the app's claim record written with it.
 pub async fn create_session_at_current_epoch(
     pool: &PgPool,
     user_id: Uuid,
+    source: &dyn crate::auth::jwt::TokenClaimsSource,
 ) -> Result<Option<(Uuid, i32)>, AppError> {
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
     let Some(ver) = sqlx::query_scalar!(
-        r#"SELECT token_version FROM users WHERE id = $1 FOR SHARE"#,
+        r#"SELECT token_version AS "adopted_epoch!" FROM users WHERE id = $1 FOR SHARE"#,
         user_id,
     )
     .fetch_optional(&mut *tx)
@@ -76,6 +81,14 @@ pub async fn create_session_at_current_epoch(
     };
     let id = Uuid::new_v4();
     insert_session(&mut tx, id, user_id, ver).await?;
+    let ctx = crate::auth::jwt::MintContext {
+        user_id,
+        session_id: id,
+        ver,
+        method: crate::auth::jwt::AuthMethod::Unspecified,
+    };
+    let values = source.claims_for(&ctx).await;
+    source.record_session(&ctx, &values, &mut tx).await?;
     tx.commit().await.map_err(AppError::database_error)?;
     Ok(Some((id, ver)))
 }
