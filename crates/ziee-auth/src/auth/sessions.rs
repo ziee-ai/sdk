@@ -28,6 +28,18 @@ pub async fn create_session(
     ver: i32,
 ) -> Result<Uuid, AppError> {
     let id = Uuid::new_v4();
+    insert_session(conn, id, user_id, ver).await?;
+    Ok(id)
+}
+
+/// [`create_session`] with a caller-chosen id (the mint picks the id first so
+/// the app's claim source can be told the session before any lock is taken).
+pub async fn insert_session(
+    conn: &mut PgConnection,
+    id: Uuid,
+    user_id: Uuid,
+    ver: i32,
+) -> Result<(), AppError> {
     sqlx::query!(
         r#"INSERT INTO auth_sessions (id, user_id, ver) VALUES ($1, $2, $3)"#,
         id,
@@ -37,7 +49,35 @@ pub async fn create_session(
     .execute(conn)
     .await
     .map_err(AppError::database_error)?;
-    Ok(id)
+    Ok(())
+}
+
+/// Create a live session at the user's CURRENT master epoch, reading
+/// `users.token_version` under a `users` row share lock in the same
+/// transaction as the insert — so a racing logout (which updates that row) is
+/// strictly ordered with it and can never leave the session born at the
+/// pre-logout epoch. Returns `(session_id, ver)`, or `None` if the user row is
+/// absent.
+pub async fn create_session_at_current_epoch(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<(Uuid, i32)>, AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::database_error)?;
+    let Some(ver) = sqlx::query_scalar!(
+        r#"SELECT token_version FROM users WHERE id = $1 FOR SHARE"#,
+        user_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?
+    else {
+        tx.rollback().await.map_err(AppError::database_error)?;
+        return Ok(None);
+    };
+    let id = Uuid::new_v4();
+    insert_session(&mut tx, id, user_id, ver).await?;
+    tx.commit().await.map_err(AppError::database_error)?;
+    Ok(Some((id, ver)))
 }
 
 /// The session's current epoch, or `None` when the session is absent or has

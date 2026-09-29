@@ -563,11 +563,28 @@ async fn sign_in_racing_logout_starts_at_the_post_logout_epoch() {
             .await
             .unwrap()
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Positive proof the sign-in is BLOCKED ON A ROW LOCK (not merely slow):
+    // some backend other than the logout's is waiting on a `Lock`.
+    let mut waited = false;
+    for _ in 0..100 {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if n > 0 {
+            waited = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(
-        !mint.is_finished(),
-        "the sign-in must wait for the in-flight logout"
+        waited,
+        "the sign-in must wait on the in-flight logout's users row lock"
     );
+    assert!(!mint.is_finished());
     sqlx::query(
         "UPDATE auth_sessions SET ended_at = now() WHERE user_id = $1 AND ended_at IS NULL",
     )
@@ -632,6 +649,158 @@ async fn revoked_legacy_refresh_token_adopts_no_session() {
         rows, 0,
         "a replayed revoked legacy token must not create sessions"
     );
+
+    drop_db(&db).await;
+}
+
+/// Records the AuthMethod of every mint the SDK asks it about.
+struct MethodRecorder(std::sync::Mutex<Vec<ziee_auth::auth::AuthMethod>>);
+
+#[async_trait::async_trait]
+impl TokenClaimsSource for MethodRecorder {
+    async fn claims_for(&self, ctx: &MintContext) -> AccessTokenClaimValues {
+        self.0.lock().unwrap().push(ctx.method);
+        AccessTokenClaimValues::default()
+    }
+}
+
+async fn post(
+    app: &axum::Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// TEST-20 (queue fr3-417sess, round-2 finding: the per-flow tag is what makes
+/// the app's `amr` honest): each SDK mint site reports HOW the user
+/// authenticated — registration is a NewAccount (a chosen, not proven,
+/// credential), local login a Password, and the legacy jti-less refresh
+/// upgrade is Unspecified (not an authentication event).
+#[tokio::test]
+async fn each_mint_site_reports_its_auth_method() {
+    use ziee_auth::auth::AuthMethod;
+    let (pool, db) = fresh_db().await;
+    let rec = Arc::new(MethodRecorder(std::sync::Mutex::new(Vec::new())));
+    let jwt = Arc::new(
+        JwtService::try_new(settings())
+            .unwrap()
+            .with_token_claims_source(rec.clone()),
+    );
+    let app = app(&pool, jwt.clone());
+
+    let (status, body) = post(
+        &app,
+        "/auth/register",
+        serde_json::json!({"username": "tagger", "email": "t@corp.com", "password": "Str0ng-pass!word"}),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {body}");
+    let (status, body) = post(
+        &app,
+        "/auth/login",
+        serde_json::json!({"username": "tagger", "password": "Str0ng-pass!word"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let user = Uuid::parse_str(body["user"]["id"].as_str().unwrap()).unwrap();
+    let exp = Utc::now() + Duration::days(30);
+    let jtiless = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &serde_json::json!({
+            "sub": user.to_string(), "exp": exp.timestamp(), "iat": Utc::now().timestamp(),
+            "iss": "ziee", "aud": "ziee-api-refresh",
+            "username": "", "email": "", "is_admin": false,
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(settings().secret.as_bytes()),
+    )
+    .unwrap();
+    let (status, body) = refresh(&app, &jtiless).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        *rec.0.lock().unwrap(),
+        vec![
+            AuthMethod::NewAccount,
+            AuthMethod::Password,
+            AuthMethod::Unspecified
+        ]
+    );
+
+    drop_db(&db).await;
+}
+
+/// TEST-21 (queue fr3-417sess, round-2 finding): two tabs refreshing the SAME
+/// legacy (sid-less, jti-bearing) refresh token — the second, arriving after
+/// the first rotated it, is served the first's successor family inside the
+/// grace window (never a terminal 401), and only ONE session is adopted.
+#[tokio::test]
+async fn legacy_double_refresh_within_grace_converges_on_one_session() {
+    let (pool, db) = fresh_db().await;
+    let jwt = Arc::new(JwtService::try_new(settings()).unwrap());
+    let app = app(&pool, jwt.clone());
+    let user = make_user(&pool, "twotabs").await;
+    let jti = Uuid::new_v4();
+    let exp = Utc::now() + Duration::days(30);
+    rt::register(&pool, jti, user, exp).await.unwrap();
+    let legacy = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &serde_json::json!({
+            "sub": user.to_string(), "exp": exp.timestamp(), "iat": Utc::now().timestamp(),
+            "iss": "ziee", "aud": "ziee-api-refresh",
+            "username": "", "email": "", "is_admin": false,
+            "jti": jti.to_string(),
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(settings().secret.as_bytes()),
+    )
+    .unwrap();
+
+    let (s1, first) = refresh(&app, &legacy).await;
+    assert_eq!(s1, StatusCode::OK, "{first}");
+    let (s2, second) = refresh(&app, &legacy).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "the late tab is served within grace: {second}"
+    );
+
+    let sid_of = |b: &serde_json::Value| {
+        jwt.validate_access_token(b["access_token"].as_str().unwrap())
+            .unwrap()
+            .sid
+    };
+    assert!(sid_of(&first).is_some());
+    assert_eq!(
+        sid_of(&first),
+        sid_of(&second),
+        "both tabs land in one session"
+    );
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM auth_sessions WHERE user_id = $1 AND ended_at IS NULL",
+    )
+    .bind(user)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1, "exactly one adopted session is live");
 
     drop_db(&db).await;
 }

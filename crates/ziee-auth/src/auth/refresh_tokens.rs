@@ -77,11 +77,12 @@ pub async fn current_token_version(pool: &PgPool, user_id: Uuid) -> Result<Optio
 /// COMMITTED this revoke never even scans a successor row that a concurrent
 /// claim has INSERTed but not yet COMMITTed.
 ///
-/// Scope of that guarantee: it covers ROTATION (`/auth/refresh`). It does not
-/// cover `mint_session_tokens`/`register`, which take no `users` lock — so a
-/// LOGIN racing this logout may leave its fresh refresh token active. That is
-/// deliberate and benign: a login is a fresh authentication, not a session this
-/// logout was ever meant to end.
+/// Scope of that guarantee: it covers ROTATION (`/auth/refresh`) and SIGN-IN
+/// (`mint_session_tokens_for` takes `users FOR SHARE` before creating its
+/// session + refresh row, so a login racing this logout either commits first —
+/// and this logout then ends that session and revokes its refresh token — or
+/// waits and starts at the post-logout epoch). The bare `register` helper takes
+/// no lock; it is not a sign-in path.
 ///
 /// Mirrors `claim_rotation_and_register` below (same file, same shape).
 /// NOTE: this is intentionally NOT a refactor of `revoke_all_for_user` — that
@@ -192,6 +193,19 @@ pub async fn mint_session_tokens_for(
 ) -> Result<TokenPairWithJti, AppError> {
     let (access_hours, refresh_days) = session_expiries(pool, jwt_service).await;
 
+    // The app's claim source runs FIRST, outside the transaction and before
+    // the `users` lock below, so a source that touches the database can never
+    // wait on its own mint's lock. It is told the session id chosen here.
+    let session_id = Uuid::new_v4();
+    let values = jwt_service
+        .claims_source()
+        .claims_for(&MintContext {
+            user_id,
+            session_id,
+            method,
+        })
+        .await;
+
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
     let token_version: i32 = sqlx::query_scalar!(
         r#"SELECT token_version FROM users WHERE id = $1 FOR SHARE"#,
@@ -201,16 +215,7 @@ pub async fn mint_session_tokens_for(
     .await
     .map_err(AppError::database_error)?
     .ok_or_else(|| AppError::unauthorized("USER_NOT_FOUND", "User not found"))?;
-    let session_id = sessions::create_session(&mut tx, user_id, token_version).await?;
-
-    let values = jwt_service
-        .claims_source()
-        .claims_for(&MintContext {
-            user_id,
-            session_id,
-            method,
-        })
-        .await;
+    sessions::insert_session(&mut tx, session_id, user_id, token_version).await?;
     let minted = jwt_service.generate_session_tokens(
         user_id,
         username,

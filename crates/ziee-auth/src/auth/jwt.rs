@@ -148,9 +148,13 @@ pub struct AccessTokenClaimValues {
 /// authentication event). Set by the SDK mint site that performed the check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {
-    /// The user proved a LOCAL password (login, registration's chosen
-    /// password, first-run setup).
+    /// The user proved a LOCAL password against an existing credential
+    /// (`login`, or a provider row of type `local`).
     Password,
+    /// The account was just created and signed in (registration, first-run
+    /// setup): the user CHOSE a credential rather than proving one, so this is
+    /// a sign-in event without an RFC 8176 authentication method.
+    NewAccount,
     /// The user proved a password against an external directory provider
     /// (`login` with a non-local `provider`, e.g. LDAP).
     DirectoryPassword,
@@ -180,8 +184,10 @@ pub struct MintContext {
 /// The app's minting hook: supplies the RFC 9068 claim values the SDK cannot
 /// know (who the client is, how the user authenticated, when, and any PoP key).
 ///
-/// Consulted ONCE per sign-in, by `refresh_tokens::mint_session_tokens`. It is
-/// NEVER consulted on refresh: the refresh token carries the values and the
+/// Consulted ONCE per sign-in, by `refresh_tokens::mint_session_tokens_for`,
+/// BEFORE any database lock is taken (so an implementation may read or write
+/// the database, including the user's own row). It is NEVER consulted on
+/// refresh: the refresh token carries the values and the
 /// refresh handler copies them forward, so they stay fixed for every token
 /// derived from one authorization (RFC 9068 §2.2.1). Install with
 /// [`JwtService::with_token_claims_source`]; the SDK default is
