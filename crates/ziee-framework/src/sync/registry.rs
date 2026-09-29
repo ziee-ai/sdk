@@ -661,15 +661,36 @@ mod tests {
     /// frames (safe), never leaks them. F-B11: deleting the
     /// `account_id() != Some(account_id)` guard in the `Perm` arm (or the
     /// `== Some(account_id)` filter in the `Tenant` arm) makes the
-    /// unknown-account principal receive → RED.
+    /// unknown-account principal receive → RED. (F-R7: the principal here is
+    /// `DefaultAccountPrincipal`, whose `impl Principal` genuinely omits
+    /// `account_id()` — the TRAIT DEFAULT is what is exercised, not a
+    /// `TestPrincipal` override that happens to return `None`.)
     #[test]
     fn unknown_account_principal_receives_zero_tenant_frames_but_owner_and_everyone_still_reach() {
+        /// A principal that does NOT override `account_id()` — the trait
+        /// default (`None`) is the value under test.
+        struct DefaultAccountPrincipal {
+            direct: Vec<String>,
+        }
+        impl Principal for DefaultAccountPrincipal {
+            fn is_admin(&self) -> bool {
+                false
+            }
+            fn direct_permissions(&self) -> &[String] {
+                &self.direct
+            }
+        }
+
         let acct = Uuid::from_u128(10_000);
         let uid = Uuid::new_v4();
-        let reg = empty_registry();
-        // Default `account_id()` (None) via `principal(...)` — full permission:
-        let (c_unknown, mut rx_unknown) =
-            conn(uid, principal(false, vec!["x::read"]));
+        let reg: SyncRegistry<DefaultAccountPrincipal> = SyncRegistry::new();
+        // Trait-default `account_id()` (None) — full permission:
+        let (tx, mut rx_unknown) = tokio::sync::mpsc::channel(SYNC_CHANNEL_CAPACITY);
+        let c_unknown = ClientConn {
+            user_id: uid,
+            principal: DefaultAccountPrincipal { direct: vec!["x::read".to_string()] },
+            sender: tx,
+        };
         reg.register(Uuid::new_v4(), c_unknown).unwrap();
 
         // Perm arm: unknown account, permission satisfied → still ZERO.

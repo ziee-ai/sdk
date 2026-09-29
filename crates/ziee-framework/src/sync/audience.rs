@@ -53,7 +53,6 @@ pub enum Audience {
     /// `Everyone` for any entity declared tenant-scoped. No current prod caller
     /// (owner/perm scoping covers today's entities); retained as intentional
     /// API surface.
-    #[allow(dead_code)]
     Everyone,
 }
 
@@ -86,7 +85,6 @@ impl Audience {
     /// — the sync entity registry refuses it for any entity declared
     /// tenant-scoped. No current caller (owner/perm scoping covers today's
     /// entities), so retained as intentional API surface.
-    #[allow(dead_code)]
     pub fn everyone() -> Self {
         Audience::Everyone
     }
@@ -107,7 +105,6 @@ impl Audience {
     /// e.g. `Audience::all_of::<(LlmProvidersRead, LlmModelsRead)>(account_id)`.
     /// Reuses the same `PermissionList` tuple machinery as
     /// `RequirePermissions<(A, B)>`.
-    #[allow(dead_code)]
     pub fn all_of<L: PermissionList>(account_id: Uuid) -> Self {
         Audience::Perm {
             account_id,
@@ -117,7 +114,6 @@ impl Audience {
 
     /// Deliver to holders of ANY permission in the tuple, within one account,
     /// e.g. `Audience::any_of::<(McpServersRead, McpServersAdminRead)>(account_id)`.
-    #[allow(dead_code)]
     pub fn any_of<L: PermissionList>(account_id: Uuid) -> Self {
         Audience::Perm {
             account_id,
