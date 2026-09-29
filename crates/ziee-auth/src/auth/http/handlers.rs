@@ -19,7 +19,9 @@ use crate::user::{Group, User, UserRepository, UserService};
 use crate::auth::context::{AuthContext, AuthSyncAction, AuthSyncEntity};
 
 use crate::auth::cookie;
-use crate::auth::jwt::{JwtService, TokenPair, TokenPairWithJti};
+use crate::auth::jwt::{
+    AccessTokenClaimValues, JwtService, SessionClaims, TokenPair, TokenPairWithJti, TokenSubject,
+};
 use super::jwt_extractor::JwtAuth;
 use crate::auth::password;
 use crate::auth::permissions::{AuthProvidersManage, AuthProvidersRead};
@@ -28,7 +30,9 @@ use crate::auth::providers::{
     AuthResult, create_provider, health as provider_health, repository as provider_repo,
 };
 use crate::auth::refresh_tokens;
-use crate::auth::refresh_tokens::mint_session_tokens;
+use crate::auth::jwt::AuthMethod;
+use crate::auth::refresh_tokens::mint_session_tokens_for;
+use crate::auth::sessions;
 use crate::auth::types::{
     AppleCallbackForm, AuthProviderResponse, AuthResponse, ChangePasswordRequest,
     CreateAuthProviderRequest, CreateAuthProviderResponse, DeleteProviderResponse,
@@ -177,7 +181,7 @@ pub async fn register(
     ctx.events.emit_user(UserEvent::Created { user: user.clone() });
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::NewAccount)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -295,7 +299,7 @@ pub async fn login(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::Password)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -421,7 +425,7 @@ async fn login_with_provider(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, provider_auth_method(&provider_config.provider_type))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -542,86 +546,175 @@ pub async fn refresh(
     // never after. A logout racing this request must not be able to hand back a
     // live session: if it commits first, the claim below finds the token
     // revoked → 401; if it commits after, this read (READ COMMITTED) has
-    // already returned the PRE-bump value, so the token we mint carries the old
-    // `ver` and is dead on arrival. Reading after the claim would instead
-    // observe the NEW epoch and mint a token that survives the logout.
+    // already returned the PRE-logout value, so the token we mint carries the
+    // old epoch — and logout ENDS the session row, so it is dead on arrival.
     // A DB failure here is 500, NOT 401: the client treats a 401 from
     // /auth/refresh as terminal (wipe + reload), so mapping a transient pool
-    // blip to 401 would log active users out mid-work. Only an absent user row
-    // is an auth failure. Mirrors the `get_by_id` mapping above.
-    let token_version = refresh_tokens::current_token_version(ctx.pool(), user.id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                AppError::unauthorized("USER_NOT_FOUND", "User not found"),
-            )
-        })?;
+    // blip to 401 would log active users out mid-work.
+    //
+    // The epoch is the SESSION ROW's `ver` (memo identity-and-access-339 §1),
+    // never `users.token_version` — except for a legacy refresh token that
+    // names no session (`sid`), which ADOPTS a fresh session here (its `ver`
+    // initialised from `users.token_version`, the one place the user scalar is
+    // read), so the family moves onto the session record from this refresh on.
+    // An ended/absent session refuses the refresh (its refresh tokens were
+    // revoked with it; this is the belt to that brace).
+    let pool = ctx.pool();
+    let e500 = |e: AppError| (StatusCode::INTERNAL_SERVER_ERROR, e);
+    let revoked = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            AppError::unauthorized(
+                "REFRESH_TOKEN_REVOKED",
+                "Refresh token has been revoked or already used",
+            ),
+        )
+    };
+    // The claim values an ADOPTED session was created with (the app's source
+    // is consulted once, when the session row is created); `None` otherwise.
+    let mut adopted_values: Option<AccessTokenClaimValues> = None;
+    let (own_session, own_ver, adopted) = match claims.sid {
+        Some(sid) => {
+            let ver = sessions::get_session_version(pool, sid)
+                .await
+                .map_err(e500)?
+                .ok_or_else(revoked)?;
+            (Some(sid), ver, false)
+        }
+        None if presented_jti.is_some() => {
+            let user_not_found = || {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    AppError::unauthorized("USER_NOT_FOUND", "User not found"),
+                )
+            };
+            let jti = presented_jti.expect("guarded by the match arm");
+            if refresh_tokens::is_active(pool, jti).await.map_err(e500)? {
+                // Adopt a session for the legacy family, at the user's current
+                // epoch under the `users` row lock (ordered with logout).
+                let (sid, ver, values) = sessions::create_session_at_current_epoch(
+                    pool,
+                    user.id,
+                    jwt_service.claims_source().as_ref(),
+                )
+                .await
+                .map_err(e500)?
+                .ok_or_else(user_not_found)?;
+                adopted_values = Some(values);
+                (Some(sid), ver, true)
+            } else {
+                // Already rotated (a racing tab) or revoked: adopt NOTHING — a
+                // replay must not mint session rows — and let the claim below
+                // lose, so a rotation within grace is still served the
+                // winner's successor family (no spurious terminal 401).
+                let ver = refresh_tokens::current_token_version(pool, user.id)
+                    .await
+                    .map_err(e500)?
+                    .ok_or_else(user_not_found)?;
+                (None, ver, false)
+            }
+        }
+        // jti-less legacy token: `mint_session_tokens` below creates its session.
+        None => (None, 0, false),
+    };
 
     let (out_pair, out_refresh_expires_at) = if let Some(jti) = presented_jti {
-        let candidate = jwt_service
-            .generate_tokens_with_jti_expiry(
-                user.id,
-                &user.username,
-                &user.email,
-                user.is_admin,
-                access_hours,
-                refresh_days,
-                token_version,
-            )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        // The per-sign-in values (`client_id`/`amr`/`auth_time`/`cnf`, access
+        // `aud`) are COPIED from the presented, signature-verified refresh
+        // token — the app's claim source is never re-consulted on refresh, so
+        // they stay fixed for every token of this sign-in (RFC 9068 §2.2.1).
+        let carried = match adopted_values.take() {
+            // A freshly adopted session stamps the values it was created (and
+            // recorded) with, so its record and its tokens agree.
+            Some(values) => SessionClaims {
+                sid: own_session,
+                ver: own_ver,
+                values,
+            },
+            None => SessionClaims::carried_from_refresh(&claims, own_session, own_ver),
+        };
+        let subject = TokenSubject {
+            user_id: user.id,
+            username: &user.username,
+            email: &user.email,
+            is_admin: user.is_admin,
+        };
+        let candidate = match jwt_service.generate_session_tokens(
+            &subject,
+            access_hours,
+            refresh_days,
+            &carried,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                end_adopted(pool, adopted, own_session).await;
+                return Err(e500(e));
+            }
+        };
 
-        let won = refresh_tokens::claim_rotation_and_register(
-            ctx.pool(),
+        let won = match refresh_tokens::claim_rotation_and_register_in_session(
+            pool,
             jti,
             candidate.refresh_jti,
             user.id,
             candidate.refresh_expires_at,
+            own_session,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        {
+            Ok(won) => won,
+            Err(e) => {
+                end_adopted(pool, adopted, own_session).await;
+                return Err(e500(e));
+            }
+        };
 
         if won {
             (candidate.pair, candidate.refresh_expires_at)
         } else {
             // We lost the race / the token was already rotated. `candidate`
-            // is discarded (never registered). Serve the existing
+            // is discarded (never registered), and a session this request
+            // adopted for it is ended (it holds no tokens). Serve the existing
             // successor family if still within grace + active.
-            match refresh_tokens::rotation_grace_successor(ctx.pool(), jti)
+            end_adopted(pool, adopted, own_session).await;
+            match refresh_tokens::rotation_grace_successor(pool, jti)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .map_err(e500)?
             {
                 Some((succ_jti, succ_exp)) => {
+                    // Re-issue against the SUCCESSOR row's session (the family
+                    // the winner registered) and that session's live epoch.
+                    let succ_session = sessions::session_of_refresh_token(pool, succ_jti)
+                        .await
+                        .map_err(e500)?;
+                    let session = match succ_session {
+                        Some(sid) => {
+                            let ver = sessions::get_session_version(pool, sid)
+                                .await
+                                .map_err(e500)?
+                                .ok_or_else(revoked)?;
+                            SessionClaims::carried_from_refresh(&claims, Some(sid), ver)
+                        }
+                        None => SessionClaims::carried_from_refresh(&claims, None, own_ver),
+                    };
                     let pair = jwt_service
-                        .reissue_tokens_for_jti(
-                            user.id,
-                            &user.username,
-                            &user.email,
-                            user.is_admin,
+                        .reissue_session_tokens_for_jti(
+                            &subject,
                             access_hours,
                             succ_jti,
                             succ_exp,
-                            token_version,
+                            &session,
                         )
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                        .map_err(e500)?;
                     (pair, succ_exp)
                 }
-                None => {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        AppError::unauthorized(
-                            "REFRESH_TOKEN_REVOKED",
-                            "Refresh token has been revoked or already used",
-                        ),
-                    ));
-                }
+                None => return Err(revoked()),
             }
         }
     } else {
         // Legacy jti-less token: one-time upgrade allowance.
         let minted = refresh_tokens::mint_session_tokens(
-            ctx.pool(),
+            pool,
             &jwt_service,
             user.id,
             &user.username,
@@ -629,7 +722,7 @@ pub async fn refresh(
             user.is_admin,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(e500)?;
         (minted.pair, minted.refresh_expires_at)
     };
 
@@ -650,6 +743,31 @@ pub async fn refresh(
         Ok((StatusCode::OK, resp))
     } else {
         Ok((StatusCode::OK, Json(out_pair).into_response()))
+    }
+}
+
+/// The authentication method of a `login_with_provider` sign-in: a provider
+/// row of type `local` checks the account's LOCAL password (reachable: any
+/// provider NAME other than `local` routes here, whatever its type); any other
+/// type checks the password against an external directory (LDAP).
+pub(crate) fn provider_auth_method(provider_type: &str) -> AuthMethod {
+    if provider_type == "local" {
+        AuthMethod::Password
+    } else {
+        AuthMethod::DirectoryPassword
+    }
+}
+
+/// End a session the refresh handler adopted for a legacy family when that
+/// refresh did not register a successor into it (lost race / error), so no
+/// token-less session stays live. A failure here is logged, not surfaced: the
+/// row holds no tokens, so leaving it live grants nothing.
+async fn end_adopted(pool: &sqlx::PgPool, adopted: bool, session: Option<uuid::Uuid>) {
+    if adopted
+        && let Some(sid) = session
+        && let Err(e) = sessions::end_session(pool, sid).await
+    {
+        tracing::warn!(error = ?e, "ending an unused adopted session failed");
     }
 }
 
@@ -1417,7 +1535,7 @@ async fn oauth_complete_inner(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         let minted =
-            mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+            mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::Federated)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1542,7 +1660,7 @@ async fn oauth_complete_inner(
         })?;
 
     let minted =
-        mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+        mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::Federated)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1855,7 +1973,7 @@ pub async fn link_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::LinkAccountPassword)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -2369,3 +2487,15 @@ pub fn admin_test_provider_config_docs(op: TransformOperation) -> TransformOpera
 // and the `users.password_changed_at` column added by a desktop
 // migration. Keeping them in this crate would orphan unreachable
 // routes in server-only deployments.
+
+#[cfg(test)]
+mod provider_auth_method_tests {
+    use super::*;
+
+    /// TEST-20 (queue fr3-417sess): the provider-login tag partition.
+    #[test]
+    fn provider_type_decides_the_auth_method() {
+        assert_eq!(provider_auth_method("local"), AuthMethod::Password);
+        assert_eq!(provider_auth_method("ldap"), AuthMethod::DirectoryPassword);
+    }
+}

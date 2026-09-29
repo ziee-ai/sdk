@@ -20,6 +20,7 @@ pub mod providers;
 pub mod refresh_tokens;
 pub mod repository;
 pub mod session_settings;
+pub mod sessions;
 pub mod types;
 pub mod username;
 
@@ -59,7 +60,10 @@ pub use context::{
     AuthSyncWiring, NoopAuthEventSink, NoopAuthSyncSink, declare_auth_sync,
     declare_auth_sync_inert, declared_auth_sync, install_auth_sync_sink, resolve_auth_sync,
 };
-pub use jwt::JwtService;
+pub use jwt::{
+    AccessTokenClaimValues, AuthMethod, Cnf, DefaultTokenClaimsSource, JwtService, MintContext, SessionClaims,
+    TokenClaimsSource, TokenSubject,
+};
 #[allow(unused_imports)]
 pub use password::hash_password;
 pub use repository::AuthRepository;
