@@ -94,6 +94,7 @@ where
 ///      the SDK's `DefaultIdentityResolver`, and an app's own resolver) — via
 ///      [`assert_session_epoch_current`] for a `sid` token, or the
 ///      `get_by_id_with_token_version` folded read for a legacy `sid`-less one.
+///
 /// The only other `validate_access_token` callers read `exp` solely for a
 /// stream deadline and their routes are gated by `RequirePermissions`, i.e. by
 /// (2).

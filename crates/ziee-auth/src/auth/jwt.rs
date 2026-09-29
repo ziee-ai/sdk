@@ -264,6 +264,16 @@ impl TokenClaimsSource for DefaultTokenClaimsSource {
     }
 }
 
+/// Who a token pair is minted for — the user-scoped claims (`sub` and the
+/// display claims).
+#[derive(Debug, Clone, Copy)]
+pub struct TokenSubject<'a> {
+    pub user_id: Uuid,
+    pub username: &'a str,
+    pub email: &'a str,
+    pub is_admin: bool,
+}
+
 /// Everything session-scoped the mint stamps on a pair: the session id, its
 /// epoch, and the fixed per-sign-in values.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -470,10 +480,12 @@ impl JwtService {
         token_version: i32,
     ) -> Result<TokenPairWithJti, AppError> {
         self.generate_session_tokens(
-            user_id,
-            username,
-            email,
-            is_admin,
+            &TokenSubject {
+                user_id,
+                username,
+                email,
+                is_admin,
+            },
             access_hours,
             refresh_days,
             &SessionClaims {
@@ -495,14 +507,17 @@ impl JwtService {
     /// must register `refresh_jti` before handing the pair out.
     pub fn generate_session_tokens(
         &self,
-        user_id: Uuid,
-        username: &str,
-        email: &str,
-        is_admin: bool,
+        subject: &TokenSubject<'_>,
         access_hours: i64,
         refresh_days: i64,
         session: &SessionClaims,
     ) -> Result<TokenPairWithJti, AppError> {
+        let TokenSubject {
+            user_id,
+            username,
+            email,
+            is_admin,
+        } = *subject;
         let (_, expires_in) = self.access_expiry(access_hours);
         let access_token =
             self.generate_access_token(user_id, username, email, is_admin, access_hours, session)?;
@@ -543,10 +558,12 @@ impl JwtService {
         token_version: i32,
     ) -> Result<TokenPair, AppError> {
         self.reissue_session_tokens_for_jti(
-            user_id,
-            username,
-            email,
-            is_admin,
+            &TokenSubject {
+                user_id,
+                username,
+                email,
+                is_admin,
+            },
             access_hours,
             refresh_jti,
             refresh_expires_at,
@@ -562,15 +579,18 @@ impl JwtService {
     /// session and the fixed per-sign-in values) on both tokens.
     pub fn reissue_session_tokens_for_jti(
         &self,
-        user_id: Uuid,
-        username: &str,
-        email: &str,
-        is_admin: bool,
+        subject: &TokenSubject<'_>,
         access_hours: i64,
         refresh_jti: Uuid,
         refresh_expires_at: chrono::DateTime<Utc>,
         session: &SessionClaims,
     ) -> Result<TokenPair, AppError> {
+        let TokenSubject {
+            user_id,
+            username,
+            email,
+            is_admin,
+        } = *subject;
         let (_, expires_in) = self.access_expiry(access_hours);
         let access_token =
             self.generate_access_token(user_id, username, email, is_admin, access_hours, session)?;
@@ -1057,6 +1077,15 @@ mod tests {
         })
     }
 
+    fn subject(user_id: Uuid) -> TokenSubject<'static> {
+        TokenSubject {
+            user_id,
+            username: "u",
+            email: "u@x",
+            is_admin: false,
+        }
+    }
+
     fn raw_payload(token: &str) -> serde_json::Value {
         use base64::Engine;
         let payload = token.split('.').nth(1).expect("jwt has a payload segment");
@@ -1088,7 +1117,7 @@ mod tests {
             },
         };
         let minted = svc
-            .generate_session_tokens(user, "u", "u@x", false, 2, 7, &session)
+            .generate_session_tokens(&subject(user), 2, 7, &session)
             .unwrap();
         assert_eq!(minted.session_id, Some(sid));
 
@@ -1108,7 +1137,7 @@ mod tests {
 
         // RFC 7519 §4.1.7: unique per token.
         let again = svc
-            .generate_session_tokens(user, "u", "u@x", false, 2, 7, &session)
+            .generate_session_tokens(&subject(user), 2, 7, &session)
             .unwrap();
         let b = svc.validate_access_token(&again.pair.access_token).unwrap();
         assert_ne!(b.jti, a.jti, "each access token gets its own jti");

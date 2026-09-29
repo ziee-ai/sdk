@@ -62,7 +62,7 @@ pub use context::{
 };
 pub use jwt::{
     AccessTokenClaimValues, AuthMethod, Cnf, DefaultTokenClaimsSource, JwtService, MintContext, SessionClaims,
-    TokenClaimsSource,
+    TokenClaimsSource, TokenSubject,
 };
 #[allow(unused_imports)]
 pub use password::hash_password;

@@ -20,7 +20,7 @@ use crate::auth::context::{AuthContext, AuthSyncAction, AuthSyncEntity};
 
 use crate::auth::cookie;
 use crate::auth::jwt::{
-    AccessTokenClaimValues, JwtService, SessionClaims, TokenPair, TokenPairWithJti,
+    AccessTokenClaimValues, JwtService, SessionClaims, TokenPair, TokenPairWithJti, TokenSubject,
 };
 use super::jwt_extractor::JwtAuth;
 use crate::auth::password;
@@ -633,11 +633,14 @@ pub async fn refresh(
             },
             None => SessionClaims::carried_from_refresh(&claims, own_session, own_ver),
         };
+        let subject = TokenSubject {
+            user_id: user.id,
+            username: &user.username,
+            email: &user.email,
+            is_admin: user.is_admin,
+        };
         let candidate = match jwt_service.generate_session_tokens(
-            user.id,
-            &user.username,
-            &user.email,
-            user.is_admin,
+            &subject,
             access_hours,
             refresh_days,
             &carried,
@@ -696,10 +699,7 @@ pub async fn refresh(
                     };
                     let pair = jwt_service
                         .reissue_session_tokens_for_jti(
-                            user.id,
-                            &user.username,
-                            &user.email,
-                            user.is_admin,
+                            &subject,
                             access_hours,
                             succ_jti,
                             succ_exp,

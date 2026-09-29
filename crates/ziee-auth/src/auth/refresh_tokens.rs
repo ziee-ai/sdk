@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::jwt::{AuthMethod, JwtService, MintContext, SessionClaims, TokenPairWithJti};
+use super::jwt::{AuthMethod, JwtService, MintContext, SessionClaims, TokenPairWithJti, TokenSubject};
 use super::sessions;
 use super::session_settings::SessionSettingsRepository;
 use crate::user::UserRepository;
@@ -237,10 +237,12 @@ pub async fn mint_session_tokens_for(
 
     // Encode BEFORE committing (pure), so a failure anywhere leaves nothing.
     let pair = jwt_service.reissue_session_tokens_for_jti(
-        user_id,
-        username,
-        email,
-        is_admin,
+        &TokenSubject {
+            user_id,
+            username,
+            email,
+            is_admin,
+        },
         access_hours,
         refresh_jti,
         refresh_expires_at,
