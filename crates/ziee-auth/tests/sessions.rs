@@ -70,6 +70,12 @@ fn app(pool: &PgPool, jwt: Arc<JwtService>) -> axum::Router {
     let ctx = AuthContext::new(
         Arc::new(pool.clone()),
         None,
+        // The install account operand `AuthContext::new` gained with the
+        // account-scoped sync audiences (feat/dental-sync-tenant) — the same
+        // fixed pre-tenancy literal the SDK fallback constructors pass
+        // (`auth::context::INSTALL_ACCOUNT_ID`); these session tests do not
+        // exercise sync delivery.
+        Uuid::from_u128(1),
         Arc::new(NoopAuthEventSink),
         Arc::new(NoopAuthSyncSink),
     );
