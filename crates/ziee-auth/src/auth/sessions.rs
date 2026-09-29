@@ -60,17 +60,31 @@ pub async fn get_session_version(pool: &PgPool, session_id: Uuid) -> Result<Opti
 /// family, in one transaction (so neither its access tokens nor its refresh
 /// tokens outlive it). The user's other sessions are untouched. Returns `true`
 /// iff a live session was ended by this call.
+///
+/// Lock order matches logout (`end_session_atomically`) and rotation
+/// (`claim_rotation_and_register`): the owning `users` row FIRST (`FOR NO KEY
+/// UPDATE`, which conflicts with rotation's `FOR SHARE` — so a racing rotation
+/// either commits its successor before this revoke scans, or finds its
+/// presented token already revoked), then `refresh_tokens`, then
+/// `auth_sessions`. Taking them in another order could deadlock with a logout.
 pub async fn end_session(pool: &PgPool, session_id: Uuid) -> Result<bool, AppError> {
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
-    let ended = sqlx::query!(
-        r#"UPDATE auth_sessions SET ended_at = NOW() WHERE id = $1 AND ended_at IS NULL"#,
+    let owner = sqlx::query_scalar!(
+        r#"
+        SELECT u.id FROM users u
+        JOIN auth_sessions s ON s.user_id = u.id
+        WHERE s.id = $1
+        FOR NO KEY UPDATE OF u
+        "#,
         session_id,
     )
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(AppError::database_error)?
-    .rows_affected()
-        == 1;
+    .map_err(AppError::database_error)?;
+    if owner.is_none() {
+        tx.rollback().await.map_err(AppError::database_error)?;
+        return Ok(false);
+    }
     sqlx::query!(
         r#"
         UPDATE refresh_tokens
@@ -82,6 +96,15 @@ pub async fn end_session(pool: &PgPool, session_id: Uuid) -> Result<bool, AppErr
     .execute(&mut *tx)
     .await
     .map_err(AppError::database_error)?;
+    let ended = sqlx::query!(
+        r#"UPDATE auth_sessions SET ended_at = NOW() WHERE id = $1 AND ended_at IS NULL"#,
+        session_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?
+    .rows_affected()
+        == 1;
     tx.commit().await.map_err(AppError::database_error)?;
     Ok(ended)
 }

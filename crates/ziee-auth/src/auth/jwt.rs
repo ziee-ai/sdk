@@ -143,6 +143,29 @@ pub struct AccessTokenClaimValues {
     pub cnf: Option<Cnf>,
 }
 
+/// How the user authenticated for the sign-in being minted — the fact an app
+/// needs to supply an honest RFC 8176 `amr` (and to know `auth_time` is a real
+/// authentication event). Set by the SDK mint site that performed the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    /// The user proved a LOCAL password (login, registration's chosen
+    /// password, first-run setup).
+    Password,
+    /// The user proved a password against an external directory provider
+    /// (`login` with a non-local `provider`, e.g. LDAP).
+    DirectoryPassword,
+    /// A federated sign-in (OAuth2/OIDC/Apple): the SDK does not learn how the
+    /// identity provider authenticated the user.
+    Federated,
+    /// Linking an external identity to an existing account, proven by the
+    /// account's local password.
+    LinkAccountPassword,
+    /// No authentication event is known to the mint site (e.g. the one-time
+    /// upgrade of a legacy jti-less refresh token). An honest source supplies
+    /// no `amr`/`auth_time` for it.
+    Unspecified,
+}
+
 /// What the SDK tells the app's [`TokenClaimsSource`] about the sign-in it is
 /// minting for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +173,8 @@ pub struct MintContext {
     pub user_id: Uuid,
     /// The session row just created for this sign-in (the token's `sid`).
     pub session_id: Uuid,
+    /// How the user authenticated (see [`AuthMethod`]).
+    pub method: AuthMethod,
 }
 
 /// The app's minting hook: supplies the RFC 9068 claim values the SDK cannot
@@ -200,8 +225,9 @@ impl SessionClaims {
     /// The session claims a presented (already signature-verified) REFRESH
     /// token carries forward to its successor pair — `sid` and the fixed
     /// per-sign-in values — with `ver` supplied by the caller from the
-    /// session row. The access `aud` is not carried on the refresh token (its
-    /// own `aud` is the refresh audience), so it is re-derived as the default.
+    /// session row. The refresh token's own `aud` is the refresh audience, so a
+    /// non-default ACCESS `aud` rides in its `access_aud` claim and is restored
+    /// here (`None` → the configured audience), keeping it fixed as well.
     pub fn carried_from_refresh(refresh: &Claims, sid: Option<Uuid>, ver: i32) -> Self {
         SessionClaims {
             sid,
@@ -1104,6 +1130,7 @@ mod tests {
         let ctx = MintContext {
             user_id: Uuid::new_v4(),
             session_id: Uuid::new_v4(),
+            method: AuthMethod::Password,
         };
         let default_svc = JwtService::try_new(test_config(None)).unwrap();
         assert_eq!(

@@ -337,9 +337,17 @@ async fn mint_session_tokens_stamps_the_session_dimension() {
         .await
         .unwrap();
 
-    let minted = rt::mint_session_tokens(&pool, &svc, user, "mia", "mia@corp.com", false)
-        .await
-        .unwrap();
+    let minted = rt::mint_session_tokens_for(
+        &pool,
+        &svc,
+        user,
+        "mia",
+        "mia@corp.com",
+        false,
+        ziee_auth::auth::AuthMethod::Password,
+    )
+    .await
+    .unwrap();
     let sid = minted.session_id.expect("a session mint returns its session id");
 
     let (row_user, row_ver, ended): (Uuid, i32, Option<chrono::DateTime<Utc>>) =
@@ -354,7 +362,8 @@ async fn mint_session_tokens_stamps_the_session_dimension() {
         *src.0.lock().unwrap(),
         vec![MintContext {
             user_id: user,
-            session_id: sid
+            session_id: sid,
+            method: ziee_auth::auth::AuthMethod::Password,
         }],
         "the claim source is consulted once, for this session"
     );

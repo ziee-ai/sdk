@@ -389,7 +389,26 @@ async fn refresh_uses_the_session_row_and_refuses_an_ended_session() {
 
     // (b) an ended session refuses its (unexpired) refresh token.
     let next_refresh = body["refresh_token"].as_str().unwrap().to_string();
-    assert!(sessions::end_session(&pool, sid).await.unwrap());
+    // End the session ROW ONLY — its refresh token stays whitelisted, so the
+    // refusal below can come only from the handler's session-row check (not
+    // from the whitelist, which `sessions::end_session` would also clear).
+    sqlx::query("UPDATE auth_sessions SET ended_at = now() WHERE id = $1")
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next_jti = Uuid::parse_str(
+        jwt.validate_refresh_token(&next_refresh)
+            .unwrap()
+            .jti
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        rt::is_active(&pool, next_jti).await.unwrap(),
+        "precondition: the refresh token is still whitelisted"
+    );
     let (status, body) = refresh(&app, &next_refresh).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert!(body.to_string().contains("REFRESH_TOKEN_REVOKED"), "{body}");
@@ -514,6 +533,104 @@ async fn rotation_preserves_the_session_id_across_the_family() {
         jti_of(&rotated),
         jti_of(&grace),
         "the grace re-issue converges on the successor family"
+    );
+
+    drop_db(&db).await;
+}
+
+/// TEST-17 (queue fr3-417sess, F1(a)): a sign-in racing a logout is strictly
+/// ordered by the `users` row lock `mint_session_tokens` takes inside its
+/// transaction — it waits for the in-flight logout and starts the session at
+/// the POST-logout epoch, so the session row and the master never diverge.
+#[tokio::test]
+async fn sign_in_racing_logout_starts_at_the_post_logout_epoch() {
+    let (pool, db) = fresh_db().await;
+    let jwt = Arc::new(JwtService::try_new(settings()).unwrap());
+    let user = make_user(&pool, "racer").await;
+    let before = users_token_version(&pool, user).await;
+
+    // A logout, mid-flight: epoch bumped, not yet committed.
+    let mut logout = pool.begin().await.unwrap();
+    sqlx::query("UPDATE users SET token_version = token_version + 1 WHERE id = $1")
+        .bind(user)
+        .execute(&mut *logout)
+        .await
+        .unwrap();
+
+    let (p2, j2) = (pool.clone(), jwt.clone());
+    let mint = tokio::spawn(async move {
+        rt::mint_session_tokens(&p2, &j2, user, "racer", "r@corp.com", false)
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !mint.is_finished(),
+        "the sign-in must wait for the in-flight logout"
+    );
+    sqlx::query(
+        "UPDATE auth_sessions SET ended_at = now() WHERE user_id = $1 AND ended_at IS NULL",
+    )
+    .bind(user)
+    .execute(&mut *logout)
+    .await
+    .unwrap();
+    logout.commit().await.unwrap();
+
+    let minted = mint.await.unwrap();
+    let sid = minted.session_id.unwrap();
+    assert_eq!(
+        sessions::get_session_version(&pool, sid).await.unwrap(),
+        Some(before + 1),
+        "the new session is live at the post-logout epoch"
+    );
+    assert_eq!(users_token_version(&pool, user).await, before + 1);
+
+    drop_db(&db).await;
+}
+
+/// TEST-18 (queue fr3-417sess, F9): a legacy (sid-less) refresh token that is
+/// no longer on the whitelist is refused WITHOUT adopting a session — a replay
+/// cannot mint session rows.
+#[tokio::test]
+async fn revoked_legacy_refresh_token_adopts_no_session() {
+    let (pool, db) = fresh_db().await;
+    let jwt = Arc::new(JwtService::try_new(settings()).unwrap());
+    let app = app(&pool, jwt.clone());
+    let user = make_user(&pool, "replay").await;
+
+    let jti = Uuid::new_v4();
+    let exp = Utc::now() + Duration::days(30);
+    rt::register(&pool, jti, user, exp).await.unwrap();
+    rt::revoke(&pool, jti).await.unwrap();
+    let legacy = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &serde_json::json!({
+            "sub": user.to_string(),
+            "exp": exp.timestamp(),
+            "iat": Utc::now().timestamp(),
+            "iss": "ziee",
+            "aud": "ziee-api-refresh",
+            "username": "", "email": "", "is_admin": false,
+            "jti": jti.to_string(),
+        }),
+        &jsonwebtoken::EncodingKey::from_secret(settings().secret.as_bytes()),
+    )
+    .unwrap();
+
+    for _ in 0..3 {
+        let (status, body) = refresh(&app, &legacy).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(body.to_string().contains("REFRESH_TOKEN_REVOKED"), "{body}");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "a replayed revoked legacy token must not create sessions"
     );
 
     drop_db(&db).await;

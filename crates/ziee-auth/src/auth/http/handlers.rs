@@ -28,7 +28,8 @@ use crate::auth::providers::{
     AuthResult, create_provider, health as provider_health, repository as provider_repo,
 };
 use crate::auth::refresh_tokens;
-use crate::auth::refresh_tokens::mint_session_tokens;
+use crate::auth::jwt::AuthMethod;
+use crate::auth::refresh_tokens::mint_session_tokens_for;
 use crate::auth::sessions;
 use crate::auth::types::{
     AppleCallbackForm, AuthProviderResponse, AuthResponse, ChangePasswordRequest,
@@ -178,7 +179,7 @@ pub async fn register(
     ctx.events.emit_user(UserEvent::Created { user: user.clone() });
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::Password)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -296,7 +297,7 @@ pub async fn login(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::Password)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -422,7 +423,7 @@ async fn login_with_provider(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::DirectoryPassword)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -576,6 +577,14 @@ pub async fn refresh(
             (Some(sid), ver, false)
         }
         None if presented_jti.is_some() => {
+            // Adopt only for a token still on the whitelist: a replayed,
+            // revoked or already-rotated legacy token must not mint session
+            // rows. (A race past this check loses the claim below, and the
+            // adopted session is then ended.)
+            let jti = presented_jti.expect("guarded by the match arm");
+            if !refresh_tokens::is_active(pool, jti).await.map_err(e500)? {
+                return Err(revoked());
+            }
             let ver = refresh_tokens::current_token_version(pool, user.id)
                 .await
                 .map_err(e500)?
@@ -604,19 +613,23 @@ pub async fn refresh(
         // token — the app's claim source is never re-consulted on refresh, so
         // they stay fixed for every token of this sign-in (RFC 9068 §2.2.1).
         let carried = SessionClaims::carried_from_refresh(&claims, own_session, own_ver);
-        let candidate = jwt_service
-            .generate_session_tokens(
-                user.id,
-                &user.username,
-                &user.email,
-                user.is_admin,
-                access_hours,
-                refresh_days,
-                &carried,
-            )
-            .map_err(e500)?;
+        let candidate = match jwt_service.generate_session_tokens(
+            user.id,
+            &user.username,
+            &user.email,
+            user.is_admin,
+            access_hours,
+            refresh_days,
+            &carried,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                end_adopted(pool, adopted, own_session).await;
+                return Err(e500(e));
+            }
+        };
 
-        let won = refresh_tokens::claim_rotation_and_register_in_session(
+        let won = match refresh_tokens::claim_rotation_and_register_in_session(
             pool,
             jti,
             candidate.refresh_jti,
@@ -625,7 +638,13 @@ pub async fn refresh(
             own_session,
         )
         .await
-        .map_err(e500)?;
+        {
+            Ok(won) => won,
+            Err(e) => {
+                end_adopted(pool, adopted, own_session).await;
+                return Err(e500(e));
+            }
+        };
 
         if won {
             (candidate.pair, candidate.refresh_expires_at)
@@ -634,12 +653,7 @@ pub async fn refresh(
             // is discarded (never registered), and a session this request
             // adopted for it is ended (it holds no tokens). Serve the existing
             // successor family if still within grace + active.
-            if adopted
-                && let Some(sid) = own_session
-                && let Err(e) = sessions::end_session(pool, sid).await
-            {
-                tracing::warn!(error = ?e, "ending an unused adopted session failed");
-            }
+            end_adopted(pool, adopted, own_session).await;
             match refresh_tokens::rotation_grace_successor(pool, jti)
                 .await
                 .map_err(e500)?
@@ -709,6 +723,19 @@ pub async fn refresh(
         Ok((StatusCode::OK, resp))
     } else {
         Ok((StatusCode::OK, Json(out_pair).into_response()))
+    }
+}
+
+/// End a session the refresh handler adopted for a legacy family when that
+/// refresh did not register a successor into it (lost race / error), so no
+/// token-less session stays live. A failure here is logged, not surfaced: the
+/// row holds no tokens, so leaving it live grants nothing.
+async fn end_adopted(pool: &sqlx::PgPool, adopted: bool, session: Option<uuid::Uuid>) {
+    if adopted
+        && let Some(sid) = session
+        && let Err(e) = sessions::end_session(pool, sid).await
+    {
+        tracing::warn!(error = ?e, "ending an unused adopted session failed");
     }
 }
 
@@ -1476,7 +1503,7 @@ async fn oauth_complete_inner(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         let minted =
-            mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+            mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::Federated)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1601,7 +1628,7 @@ async fn oauth_complete_inner(
         })?;
 
     let minted =
-        mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+        mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::Federated)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1914,7 +1941,7 @@ pub async fn link_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens_for(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin, AuthMethod::LinkAccountPassword)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 

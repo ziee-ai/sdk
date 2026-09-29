@@ -61,7 +61,7 @@ pub use context::{
     declare_auth_sync_inert, declared_auth_sync, install_auth_sync_sink, resolve_auth_sync,
 };
 pub use jwt::{
-    AccessTokenClaimValues, Cnf, DefaultTokenClaimsSource, JwtService, MintContext, SessionClaims,
+    AccessTokenClaimValues, AuthMethod, Cnf, DefaultTokenClaimsSource, JwtService, MintContext, SessionClaims,
     TokenClaimsSource,
 };
 #[allow(unused_imports)]

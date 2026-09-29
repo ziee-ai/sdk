@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::jwt::{JwtService, MintContext, SessionClaims, TokenPairWithJti};
+use super::jwt::{AuthMethod, JwtService, MintContext, SessionClaims, TokenPairWithJti};
 use super::sessions;
 use super::session_settings::SessionSettingsRepository;
 use crate::user::UserRepository;
@@ -149,6 +149,17 @@ pub async fn end_session_atomically(pool: &PgPool, user_id: Uuid) -> Result<i32,
 /// claim values — the only time the source is consulted for this session;
 /// refreshes copy them forward. The session row and the first refresh-token
 /// row commit in ONE transaction (neither without the other).
+///
+/// The session's initial `ver` is read INSIDE the transaction under a `users`
+/// row share lock, so a logout racing this sign-in is strictly ordered with it:
+/// either the logout committed first (this reads the bumped epoch) or it waits
+/// for this commit and then ends the new session too. Without the lock the
+/// session could commit at the pre-logout epoch while the master moved on.
+///
+/// This entry point records the sign-in's method as [`AuthMethod::Unspecified`];
+/// a mint site that performed an authentication check uses
+/// [`mint_session_tokens_for`] so the app's claim source can supply an honest
+/// `amr`.
 pub async fn mint_session_tokens(
     pool: &PgPool,
     jwt_service: &JwtService,
@@ -157,12 +168,39 @@ pub async fn mint_session_tokens(
     email: &str,
     is_admin: bool,
 ) -> Result<TokenPairWithJti, AppError> {
+    mint_session_tokens_for(
+        pool,
+        jwt_service,
+        user_id,
+        username,
+        email,
+        is_admin,
+        AuthMethod::Unspecified,
+    )
+    .await
+}
+
+/// [`mint_session_tokens`] for a sign-in authenticated by `method`.
+pub async fn mint_session_tokens_for(
+    pool: &PgPool,
+    jwt_service: &JwtService,
+    user_id: Uuid,
+    username: &str,
+    email: &str,
+    is_admin: bool,
+    method: AuthMethod,
+) -> Result<TokenPairWithJti, AppError> {
     let (access_hours, refresh_days) = session_expiries(pool, jwt_service).await;
-    let token_version = current_token_version(pool, user_id)
-        .await?
-        .ok_or_else(|| AppError::unauthorized("USER_NOT_FOUND", "User not found"))?;
 
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
+    let token_version: i32 = sqlx::query_scalar!(
+        r#"SELECT token_version FROM users WHERE id = $1 FOR SHARE"#,
+        user_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?
+    .ok_or_else(|| AppError::unauthorized("USER_NOT_FOUND", "User not found"))?;
     let session_id = sessions::create_session(&mut tx, user_id, token_version).await?;
 
     let values = jwt_service
@@ -170,6 +208,7 @@ pub async fn mint_session_tokens(
         .claims_for(&MintContext {
             user_id,
             session_id,
+            method,
         })
         .await;
     let minted = jwt_service.generate_session_tokens(
