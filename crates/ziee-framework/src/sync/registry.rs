@@ -207,6 +207,15 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
     /// permits, skipping the originating connection (self-echo suppression). A
     /// connection whose bounded queue is full (stalled reader) or closed is
     /// pruned.
+    ///
+    /// **Tenant equality is the FIRST predicate** (memo-335 §1 / sdk#24,
+    /// queue 417sync): the `Perm` arm matches the connection principal's
+    /// [`account_id`](ziee_identity::Principal::account_id) against the
+    /// audience's `account_id` BEFORE the permission check, so `is_admin()`
+    /// never bypasses it — cross-tenant is cross-tenant regardless of admin
+    /// (INV-3). The `Tenant(account_id)` arm is the tenant-scoped broadcast
+    /// (that account's connections, no permission check). A principal that
+    /// reports `None` never matches either tenant-scoped arm (fail-closed).
     pub fn deliver(&self, audience: Audience, event: Event, origin_conn: Option<ConnId>) {
         let sse: Event = event;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -236,12 +245,16 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
                         }
                     }
                 }
-                Audience::Perm { account_id: _, rule } => {
-                    // NOTE (queue 417sync, C1 intermediate): this is the
-                    // sdk#24 leak shape — permission-only routing, no tenant
-                    // equality (cross-account holders/admins receive). The
-                    // tenant-equality-first guard (INV-3) lands in C2.
+                Audience::Perm { account_id, rule } => {
                     for (cid, conn) in clients.iter() {
+                        // TENANT EQUALITY FIRST (INV-3): a principal whose
+                        // account is unknown (None) or a different account never
+                        // matches — and `is_admin()` cannot bypass it, because
+                        // it is gated behind this `if`. The fanout key is
+                        // (tenant, permission), never permission alone (INV-1).
+                        if conn.principal.account_id() != Some(account_id) {
+                            continue;
+                        }
                         let granted = conn.principal.is_admin()
                             || match &rule {
                                 PermRule::All(perms) => {
@@ -256,14 +269,14 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
                         }
                     }
                 }
-                Audience::Tenant(_) => {
-                    // NOTE (queue 417sync, C1 intermediate): placeholder — the
-                    // Tenant arm's real semantics (that account's connections
-                    // only, origin skipped) land in C2; until then the variant
-                    // routes like Everyone so the tree compiles against the new
-                    // enum shape.
+                Audience::Tenant(account_id) => {
+                    // Tenant-scoped broadcast: every connection whose principal
+                    // account equals the tenant — no permission check; origin
+                    // skipped via the shared `try_send` origin check.
                     for (cid, conn) in clients.iter() {
-                        try_send(cid, conn);
+                        if conn.principal.account_id() == Some(account_id) {
+                            try_send(cid, conn);
+                        }
                     }
                 }
                 Audience::Everyone => {
