@@ -34,10 +34,14 @@ pub fn admin_url() -> String {
 pub async fn fresh_db() -> (PgPool, String) {
     let admin = admin_url();
     let base_full = admin.split('?').next().unwrap();
-    let (base, _) = base_full.rsplit_once('/').expect("admin url has a /db suffix");
+    let (base, _) = base_full
+        .rsplit_once('/')
+        .expect("admin url has a /db suffix");
     let dbname = format!("ziee_auth_test_{}", Uuid::new_v4().simple());
 
-    let mut conn = PgConnection::connect(&admin).await.expect("connect admin db");
+    let mut conn = PgConnection::connect(&admin)
+        .await
+        .expect("connect admin db");
     conn.execute(format!("CREATE DATABASE \"{dbname}\"").as_str())
         .await
         .expect("create test db");

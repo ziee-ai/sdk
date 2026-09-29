@@ -66,31 +66,37 @@ where
     }
 }
 
-/// THE access-token revocation rule.
+/// THE access-token revocation rule — the pure comparison every reader shares.
 ///
 /// `validate_access_token` proves a token was signed by us and has not
-/// expired; this proves the SESSION it belongs to has not been torn down.
-/// Logout bumps `users.token_version`, so a token minted before it no longer
-/// matches and is rejected immediately instead of staying valid for the rest
-/// of its (24h-by-default) TTL.
+/// expired; this proves the SESSION it belongs to has not been torn down: the
+/// token's `ver` must EQUAL the epoch the reader looked up.
 ///
-/// A token with NO `ver` claim was minted before this shipped; it maps to `0`
-/// and so matches the column's `DEFAULT 0` — those sessions keep working until
-/// they expire, and the user's first logout kills them. Deploying forces zero
-/// logouts.
+/// Where that epoch lives (memo identity-and-access-339 §1): for a token that
+/// names its session (`sid`), it is the SESSION ROW's `ver`
+/// (`sessions::get_session_version`) — see [`assert_session_epoch_current`];
+/// for a token minted before the session record existed (no `sid`), it is
+/// `users.token_version`, exactly as before. Logout ends the user's session
+/// rows AND bumps `users.token_version` in one transaction, so both kinds die
+/// at once; a single session can also be ended or have its epoch bumped alone.
+///
+/// A token with NO `ver` claim was minted before the epoch shipped; it maps to
+/// `0` and so matches the column's `DEFAULT 0` — those sessions keep working
+/// until they expire, and the user's first logout kills them. Deploying forces
+/// zero logouts.
 ///
 /// INVARIANT — every caller of `JwtService::validate_access_token` that GATES a
-/// route MUST verify the epoch. There are exactly two, and they read it two
-/// different ways:
+/// route MUST verify the epoch. There are exactly two, and both enforce it
+/// against the session row for a `sid` token:
 ///   1. `JwtAuth` / `OptionalJwtAuth` (this file) — via
-///      `assert_token_version_current`, which does its own scalar read because
-///      these extractors never load the user.
-///   2. the framework permission extractor (`ZieeIdentityResolver::authenticate`)
-///      — via `get_by_id_with_token_version`, folding the read into the user
-///      load it already performs, so the hot path pays no extra round-trip.
-/// The only other `validate_access_token` callers (`chat/stream/handler.rs`,
-/// `sync/handlers.rs`) read `exp` solely for a stream deadline and their routes
-/// are gated by `RequirePermissions`, i.e. by (2).
+///      `assert_token_version_current`.
+///   2. the framework permission extractor (`IdentityResolver::authenticate` —
+///      the SDK's `DefaultIdentityResolver`, and an app's own resolver) — via
+///      [`assert_session_epoch_current`] for a `sid` token, or the
+///      `get_by_id_with_token_version` folded read for a legacy `sid`-less one.
+/// The only other `validate_access_token` callers read `exp` solely for a
+/// stream deadline and their routes are gated by `RequirePermissions`, i.e. by
+/// (2).
 pub fn verify_token_version(
     claims_ver: Option<i32>,
     db_version: i32,
@@ -98,23 +104,48 @@ pub fn verify_token_version(
     if claims_ver.unwrap_or(0) == db_version {
         return Ok(());
     }
-    Err((
+    Err(session_revoked())
+}
+
+fn session_revoked() -> (StatusCode, AppError) {
+    (
         StatusCode::UNAUTHORIZED,
         AppError::unauthorized(
             "SESSION_REVOKED",
             "Session has been revoked; please sign in again",
         ),
-    ))
+    )
 }
 
-/// Look up the user's current epoch and apply [`verify_token_version`].
+/// The session-row epoch check for a token that names its session: read the
+/// session's live `ver` and apply [`verify_token_version`]. An absent or ENDED
+/// session is refused exactly like a stale epoch (401 `SESSION_REVOKED` — no
+/// new error value). Fail-CLOSED: a DB error is a 500, never an implicit pass.
+///
+/// This is the one implementation both INVARIANT readers use for `sid` tokens,
+/// so neither reads `users` to gate a request.
+pub async fn assert_session_epoch_current(
+    pool: &sqlx::PgPool,
+    session_id: uuid::Uuid,
+    claims_ver: Option<i32>,
+) -> Result<(), (StatusCode, AppError)> {
+    match crate::auth::sessions::get_session_version(pool, session_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    {
+        Some(session_ver) => verify_token_version(claims_ver, session_ver),
+        None => Err(session_revoked()),
+    }
+}
+
+/// Look up the token's current epoch and apply [`verify_token_version`]: the
+/// session row for a `sid` token ([`assert_session_epoch_current`]), else —
+/// a token minted before the session record — `users.token_version`.
 ///
 /// The `AuthContext` (the per-request pool + repo handle the app layers onto
-/// the router) is the scalar-read source — these extractors never load the
-/// user, so unlike the permission extractor there is nothing to fold the read
-/// into. Fail-CLOSED: an absent context or a DB error is a 500, never an
-/// implicit pass — a revocation check that fails open is not a revocation
-/// check.
+/// the router) is the read source — these extractors never load the user.
+/// Fail-CLOSED: an absent context or a DB error is a 500, never an implicit
+/// pass — a revocation check that fails open is not a revocation check.
 async fn assert_token_version_current(
     parts: &Parts,
     claims: &Claims,
@@ -132,6 +163,10 @@ async fn assert_token_version_current(
             AppError::internal_error("Auth context not configured"),
         )
     })?;
+
+    if let Some(session_id) = claims.sid {
+        return assert_session_epoch_current(ctx.pool(), session_id, claims.ver).await;
+    }
 
     let db_version = ctx
         .user()

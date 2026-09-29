@@ -19,7 +19,7 @@ use crate::user::{Group, User, UserRepository, UserService};
 use crate::auth::context::{AuthContext, AuthSyncAction, AuthSyncEntity};
 
 use crate::auth::cookie;
-use crate::auth::jwt::{JwtService, TokenPair, TokenPairWithJti};
+use crate::auth::jwt::{JwtService, SessionClaims, TokenPair, TokenPairWithJti};
 use super::jwt_extractor::JwtAuth;
 use crate::auth::password;
 use crate::auth::permissions::{AuthProvidersManage, AuthProvidersRead};
@@ -29,6 +29,7 @@ use crate::auth::providers::{
 };
 use crate::auth::refresh_tokens;
 use crate::auth::refresh_tokens::mint_session_tokens;
+use crate::auth::sessions;
 use crate::auth::types::{
     AppleCallbackForm, AuthProviderResponse, AuthResponse, ChangePasswordRequest,
     CreateAuthProviderRequest, CreateAuthProviderResponse, DeleteProviderResponse,
@@ -542,59 +543,125 @@ pub async fn refresh(
     // never after. A logout racing this request must not be able to hand back a
     // live session: if it commits first, the claim below finds the token
     // revoked → 401; if it commits after, this read (READ COMMITTED) has
-    // already returned the PRE-bump value, so the token we mint carries the old
-    // `ver` and is dead on arrival. Reading after the claim would instead
-    // observe the NEW epoch and mint a token that survives the logout.
+    // already returned the PRE-logout value, so the token we mint carries the
+    // old epoch — and logout ENDS the session row, so it is dead on arrival.
     // A DB failure here is 500, NOT 401: the client treats a 401 from
     // /auth/refresh as terminal (wipe + reload), so mapping a transient pool
-    // blip to 401 would log active users out mid-work. Only an absent user row
-    // is an auth failure. Mirrors the `get_by_id` mapping above.
-    let token_version = refresh_tokens::current_token_version(ctx.pool(), user.id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                AppError::unauthorized("USER_NOT_FOUND", "User not found"),
-            )
-        })?;
+    // blip to 401 would log active users out mid-work.
+    //
+    // The epoch is the SESSION ROW's `ver` (memo identity-and-access-339 §1),
+    // never `users.token_version` — except for a legacy refresh token that
+    // names no session (`sid`), which ADOPTS a fresh session here (its `ver`
+    // initialised from `users.token_version`, the one place the user scalar is
+    // read), so the family moves onto the session record from this refresh on.
+    // An ended/absent session refuses the refresh (its refresh tokens were
+    // revoked with it; this is the belt to that brace).
+    let pool = ctx.pool();
+    let e500 = |e: AppError| (StatusCode::INTERNAL_SERVER_ERROR, e);
+    let revoked = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            AppError::unauthorized(
+                "REFRESH_TOKEN_REVOKED",
+                "Refresh token has been revoked or already used",
+            ),
+        )
+    };
+    let (own_session, own_ver, adopted) = match claims.sid {
+        Some(sid) => {
+            let ver = sessions::get_session_version(pool, sid)
+                .await
+                .map_err(e500)?
+                .ok_or_else(revoked)?;
+            (Some(sid), ver, false)
+        }
+        None if presented_jti.is_some() => {
+            let ver = refresh_tokens::current_token_version(pool, user.id)
+                .await
+                .map_err(e500)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        AppError::unauthorized("USER_NOT_FOUND", "User not found"),
+                    )
+                })?;
+            let mut conn = pool
+                .acquire()
+                .await
+                .map_err(|e| e500(AppError::database_error(e)))?;
+            let sid = sessions::create_session(&mut conn, user.id, ver)
+                .await
+                .map_err(e500)?;
+            (Some(sid), ver, true)
+        }
+        // jti-less legacy token: `mint_session_tokens` below creates its session.
+        None => (None, 0, false),
+    };
 
     let (out_pair, out_refresh_expires_at) = if let Some(jti) = presented_jti {
+        // The per-sign-in values (`client_id`/`amr`/`auth_time`/`cnf`, access
+        // `aud`) are COPIED from the presented, signature-verified refresh
+        // token — the app's claim source is never re-consulted on refresh, so
+        // they stay fixed for every token of this sign-in (RFC 9068 §2.2.1).
+        let carried = SessionClaims::carried_from_refresh(&claims, own_session, own_ver);
         let candidate = jwt_service
-            .generate_tokens_with_jti_expiry(
+            .generate_session_tokens(
                 user.id,
                 &user.username,
                 &user.email,
                 user.is_admin,
                 access_hours,
                 refresh_days,
-                token_version,
+                &carried,
             )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(e500)?;
 
-        let won = refresh_tokens::claim_rotation_and_register(
-            ctx.pool(),
+        let won = refresh_tokens::claim_rotation_and_register_in_session(
+            pool,
             jti,
             candidate.refresh_jti,
             user.id,
             candidate.refresh_expires_at,
+            own_session,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(e500)?;
 
         if won {
             (candidate.pair, candidate.refresh_expires_at)
         } else {
             // We lost the race / the token was already rotated. `candidate`
-            // is discarded (never registered). Serve the existing
+            // is discarded (never registered), and a session this request
+            // adopted for it is ended (it holds no tokens). Serve the existing
             // successor family if still within grace + active.
-            match refresh_tokens::rotation_grace_successor(ctx.pool(), jti)
+            if adopted
+                && let Some(sid) = own_session
+                && let Err(e) = sessions::end_session(pool, sid).await
+            {
+                tracing::warn!(error = ?e, "ending an unused adopted session failed");
+            }
+            match refresh_tokens::rotation_grace_successor(pool, jti)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .map_err(e500)?
             {
                 Some((succ_jti, succ_exp)) => {
+                    // Re-issue against the SUCCESSOR row's session (the family
+                    // the winner registered) and that session's live epoch.
+                    let succ_session = sessions::session_of_refresh_token(pool, succ_jti)
+                        .await
+                        .map_err(e500)?;
+                    let session = match succ_session {
+                        Some(sid) => {
+                            let ver = sessions::get_session_version(pool, sid)
+                                .await
+                                .map_err(e500)?
+                                .ok_or_else(revoked)?;
+                            SessionClaims::carried_from_refresh(&claims, Some(sid), ver)
+                        }
+                        None => SessionClaims::carried_from_refresh(&claims, None, own_ver),
+                    };
                     let pair = jwt_service
-                        .reissue_tokens_for_jti(
+                        .reissue_session_tokens_for_jti(
                             user.id,
                             &user.username,
                             &user.email,
@@ -602,26 +669,18 @@ pub async fn refresh(
                             access_hours,
                             succ_jti,
                             succ_exp,
-                            token_version,
+                            &session,
                         )
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+                        .map_err(e500)?;
                     (pair, succ_exp)
                 }
-                None => {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        AppError::unauthorized(
-                            "REFRESH_TOKEN_REVOKED",
-                            "Refresh token has been revoked or already used",
-                        ),
-                    ));
-                }
+                None => return Err(revoked()),
             }
         }
     } else {
         // Legacy jti-less token: one-time upgrade allowance.
         let minted = refresh_tokens::mint_session_tokens(
-            ctx.pool(),
+            pool,
             &jwt_service,
             user.id,
             &user.username,
@@ -629,7 +688,7 @@ pub async fn refresh(
             user.is_admin,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(e500)?;
         (minted.pair, minted.refresh_expires_at)
     };
 

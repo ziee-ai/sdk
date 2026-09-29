@@ -39,6 +39,8 @@ use crate::user::{Group, User, UserRepository};
 #[derive(Clone)]
 pub struct DefaultIdentityResolver {
     users: UserRepository,
+    /// For the session-row epoch read of a `sid` token.
+    pool: sqlx::PgPool,
     jwt: Arc<JwtService>,
 }
 
@@ -47,7 +49,8 @@ impl DefaultIdentityResolver {
     /// cloneable (pool is Arc-backed; the JWT service is shared behind `Arc`).
     pub fn new(pool: sqlx::PgPool, jwt: Arc<JwtService>) -> Self {
         Self {
-            users: UserRepository::new(pool),
+            users: UserRepository::new(pool.clone()),
+            pool,
             jwt,
         }
     }
@@ -114,11 +117,25 @@ impl IdentityResolver for DefaultIdentityResolver {
                 )
             })?;
 
-        // A token minted before the epoch shipped carries `ver: None`, which
-        // `verify_token_version` folds to 0 — matching the column's `DEFAULT 0`,
-        // so existing sessions keep working and the user's first logout ends
-        // them. Deploying this forces zero logouts.
-        crate::auth::http::jwt_extractor::verify_token_version(claims.ver, token_version)?;
+        // The epoch source (memo identity-and-access-339 §1): a token that
+        // names its session (`sid`) is checked against the SESSION ROW's `ver`
+        // — absent/ended/mismatch → 401 SESSION_REVOKED — and the folded
+        // `users.token_version` is used only for a `sid`-less token minted
+        // before the session record existed. A token minted before the epoch
+        // shipped carries `ver: None`, which `verify_token_version` folds to 0
+        // — matching the column's `DEFAULT 0`, so deploying forces zero logouts.
+        match claims.sid {
+            Some(session_id) => {
+                crate::auth::http::jwt_extractor::assert_session_epoch_current(
+                    &self.pool, session_id, claims.ver,
+                )
+                .await?
+            }
+            None => crate::auth::http::jwt_extractor::verify_token_version(
+                claims.ver,
+                token_version,
+            )?,
+        }
 
         // Reject inactive accounts.
         if !user.is_active {

@@ -1,0 +1,123 @@
+//! The session record (`auth_sessions`) — one row per signed-in session, and
+//! the home of that session's access-token revocation epoch.
+//!
+//! An access token names its session in the `sid` claim. Route-gating readers
+//! compare the token's `ver` against [`get_session_version`] — the session
+//! row — rather than against `users.token_version`, so the per-request check
+//! never reads the identity table, and a single session can be killed
+//! ([`end_session`]) or have its tokens rotated out while it survives
+//! ([`bump_session_version`]) without touching the user's other sessions.
+//!
+//! `users.token_version` stays the write-side master: a session's `ver` is
+//! initialised from it at sign-in ([`create_session`], the one place the user
+//! scalar is read), and the user-level kill (`refresh_tokens::
+//! end_session_atomically`, i.e. logout) bumps it AND ends every live session
+//! of the user in one transaction. See migration
+//! `202607144650_auth_sessions.sql`.
+
+use sqlx::{PgConnection, PgPool};
+use uuid::Uuid;
+use ziee_core::AppError;
+
+/// Insert a new live session row for `user_id` with epoch `ver`, on the given
+/// connection (so the caller can put it in the same transaction as the
+/// session's first refresh-token row). Returns the new session id.
+pub async fn create_session(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    ver: i32,
+) -> Result<Uuid, AppError> {
+    let id = Uuid::new_v4();
+    sqlx::query!(
+        r#"INSERT INTO auth_sessions (id, user_id, ver) VALUES ($1, $2, $3)"#,
+        id,
+        user_id,
+        ver,
+    )
+    .execute(conn)
+    .await
+    .map_err(AppError::database_error)?;
+    Ok(id)
+}
+
+/// The session's current epoch, or `None` when the session is absent or has
+/// ended — both of which mean "this session's tokens are dead".
+///
+/// `Err` only for a genuine DB failure, which callers must surface as 500,
+/// never as 401 (a 401 is terminal to the client and would sign the user out
+/// over a pool blip).
+pub async fn get_session_version(pool: &PgPool, session_id: Uuid) -> Result<Option<i32>, AppError> {
+    sqlx::query_scalar!(
+        r#"SELECT ver FROM auth_sessions WHERE id = $1 AND ended_at IS NULL"#,
+        session_id,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::database_error)
+}
+
+/// End ONE session: mark it ended AND revoke every active refresh token of its
+/// family, in one transaction (so neither its access tokens nor its refresh
+/// tokens outlive it). The user's other sessions are untouched. Returns `true`
+/// iff a live session was ended by this call.
+pub async fn end_session(pool: &PgPool, session_id: Uuid) -> Result<bool, AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::database_error)?;
+    let ended = sqlx::query!(
+        r#"UPDATE auth_sessions SET ended_at = NOW() WHERE id = $1 AND ended_at IS NULL"#,
+        session_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?
+    .rows_affected()
+        == 1;
+    sqlx::query!(
+        r#"
+        UPDATE refresh_tokens
+        SET revoked_at = NOW()
+        WHERE session_id = $1 AND revoked_at IS NULL
+        "#,
+        session_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?;
+    tx.commit().await.map_err(AppError::database_error)?;
+    Ok(ended)
+}
+
+/// Bump ONE live session's epoch: every access token minted for it so far
+/// stops validating, while the session (and its refresh family) survives — the
+/// next refresh mints tokens at the new epoch. Returns the new `ver`, or `None`
+/// if the session is absent or ended.
+pub async fn bump_session_version(
+    pool: &PgPool,
+    session_id: Uuid,
+) -> Result<Option<i32>, AppError> {
+    sqlx::query_scalar!(
+        r#"
+        UPDATE auth_sessions
+        SET ver = ver + 1
+        WHERE id = $1 AND ended_at IS NULL
+        RETURNING ver
+        "#,
+        session_id,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::database_error)
+}
+
+/// The session a registered refresh token belongs to (`None` for a legacy row
+/// with no session, or an unknown jti). Used by the refresh handler's grace
+/// path, which re-issues against the SUCCESSOR row's session.
+pub async fn session_of_refresh_token(pool: &PgPool, jti: Uuid) -> Result<Option<Uuid>, AppError> {
+    let row = sqlx::query_scalar!(
+        r#"SELECT session_id FROM refresh_tokens WHERE jti = $1"#,
+        jti,
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::database_error)?;
+    Ok(row.flatten())
+}

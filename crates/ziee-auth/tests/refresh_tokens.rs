@@ -231,3 +231,147 @@ async fn mint_session_tokens_whitelists_and_validates() {
 
     drop_db(&db).await;
 }
+
+// ── queue fr3-417sess: the session dimension ────────────────────────────────
+
+/// A live `auth_sessions` row for `user` (the FK target of
+/// `refresh_tokens.session_id`).
+async fn make_session(pool: &PgPool, user: Uuid, ver: i32) -> Uuid {
+    let mut conn = pool.acquire().await.unwrap();
+    ziee_auth::auth::sessions::create_session(&mut conn, user, ver)
+        .await
+        .unwrap()
+}
+
+async fn session_of(pool: &PgPool, jti: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT session_id FROM refresh_tokens WHERE jti = $1")
+        .bind(jti)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// TEST-7 (queue fr3-417sess): `register_with_session` writes the session id
+/// on the whitelisted row.
+#[tokio::test]
+async fn register_with_session_roundtrips_the_session_id() {
+    let (pool, db) = fresh_db().await;
+    let user = make_user(&pool, "sam").await;
+    let sid = make_session(&pool, user, 0).await;
+    let jti = Uuid::new_v4();
+
+    rt::register_with_session(&pool, jti, user, sid, Utc::now() + Duration::days(30))
+        .await
+        .unwrap();
+    assert_eq!(session_of(&pool, jti).await, Some(sid));
+    assert!(rt::is_active(&pool, jti).await.unwrap());
+
+    drop_db(&db).await;
+}
+
+/// TEST-8 (queue fr3-417sess, INV-4 — additive): a row registered through the
+/// UNCHANGED legacy `register` has no session and stays fully usable — active,
+/// claimable for rotation (its successor inherits the NULL session), and
+/// resolvable through the grace lookup.
+#[tokio::test]
+async fn legacy_register_row_null_session_id_still_usable() {
+    let (pool, db) = fresh_db().await;
+    let user = make_user(&pool, "lee").await;
+    let presented = Uuid::new_v4();
+    let successor = Uuid::new_v4();
+
+    rt::register(&pool, presented, user, Utc::now() + Duration::days(30))
+        .await
+        .unwrap();
+    assert_eq!(session_of(&pool, presented).await, None);
+    assert!(rt::is_active(&pool, presented).await.unwrap());
+
+    let won = rt::claim_rotation_and_register(
+        &pool,
+        presented,
+        successor,
+        user,
+        Utc::now() + Duration::days(30),
+    )
+    .await
+    .unwrap();
+    assert!(won, "a session-less row is claimable");
+    assert_eq!(session_of(&pool, successor).await, None);
+    let grace = rt::rotation_grace_successor(&pool, presented).await.unwrap();
+    assert_eq!(grace.map(|(j, _)| j), Some(successor));
+
+    drop_db(&db).await;
+}
+
+/// TEST-9 (queue fr3-417sess, INV-4 + INV-1 at the session-mint path):
+/// `mint_session_tokens` creates the session row (epoch = the user's master
+/// `token_version`), consults the installed claim source with that session,
+/// stamps `sid` + the RFC 9068 set on the access token, and whitelists the
+/// refresh row under the same session.
+#[tokio::test]
+async fn mint_session_tokens_stamps_the_session_dimension() {
+    use std::sync::{Arc, Mutex};
+    use ziee_auth::auth::{AccessTokenClaimValues, MintContext, TokenClaimsSource};
+
+    struct Recording(Mutex<Vec<MintContext>>);
+    #[async_trait::async_trait]
+    impl TokenClaimsSource for Recording {
+        async fn claims_for(&self, ctx: &MintContext) -> AccessTokenClaimValues {
+            self.0.lock().unwrap().push(*ctx);
+            AccessTokenClaimValues {
+                client_id: Some(ctx.user_id.to_string()),
+                amr: Some(vec!["pwd".into()]),
+                auth_time: Some(1_700_000_000),
+                ..Default::default()
+            }
+        }
+    }
+
+    let (pool, db) = fresh_db().await;
+    let src = Arc::new(Recording(Mutex::new(Vec::new())));
+    let svc = jwt_service().with_token_claims_source(src.clone());
+    let user = make_user(&pool, "mia").await;
+    sqlx::query("UPDATE users SET token_version = 3 WHERE id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let minted = rt::mint_session_tokens(&pool, &svc, user, "mia", "mia@corp.com", false)
+        .await
+        .unwrap();
+    let sid = minted.session_id.expect("a session mint returns its session id");
+
+    let (row_user, row_ver, ended): (Uuid, i32, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as("SELECT user_id, ver, ended_at FROM auth_sessions WHERE id = $1")
+            .bind(sid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((row_user, row_ver, ended), (user, 3, None));
+
+    assert_eq!(
+        *src.0.lock().unwrap(),
+        vec![MintContext {
+            user_id: user,
+            session_id: sid
+        }],
+        "the claim source is consulted once, for this session"
+    );
+
+    let a = svc.validate_access_token(&minted.pair.access_token).unwrap();
+    assert_eq!(a.sid, Some(sid));
+    assert_eq!(a.ver, Some(3));
+    assert_eq!(a.sub, user.to_string());
+    assert_eq!(a.aud, "ziee-api");
+    assert_eq!(a.iss, "ziee");
+    assert!(a.jti.is_some() && a.iat > 0 && a.exp > a.iat);
+    assert_eq!(a.client_id, Some(user.to_string()));
+    assert_eq!(a.amr, Some(vec!["pwd".to_string()]));
+    assert_eq!(a.auth_time, Some(1_700_000_000));
+
+    assert_eq!(session_of(&pool, minted.refresh_jti).await, Some(sid));
+    assert!(rt::is_active(&pool, minted.refresh_jti).await.unwrap());
+
+    drop_db(&db).await;
+}

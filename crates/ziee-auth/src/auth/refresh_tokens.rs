@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::jwt::{JwtService, TokenPairWithJti};
+use super::jwt::{JwtService, MintContext, SessionClaims, TokenPairWithJti};
+use super::sessions;
 use super::session_settings::SessionSettingsRepository;
 use crate::user::UserRepository;
 
@@ -52,8 +53,15 @@ pub async fn current_token_version(pool: &PgPool, user_id: Uuid) -> Result<Optio
 }
 
 /// End every session the user holds, ATOMICALLY: bump the access-token
-/// revocation epoch AND revoke every outstanding refresh token in ONE
-/// transaction. Returns the new `token_version`.
+/// revocation epoch, END every live `auth_sessions` row of the user, AND
+/// revoke every outstanding refresh token in ONE transaction. Returns the new
+/// `token_version`.
+///
+/// Ending the session rows is what kills the user's `sid`-bearing access
+/// tokens (their epoch is read from the session row); the `users.token_version`
+/// bump kills the `sid`-less (pre-session-record) ones and keeps the master
+/// scalar authoritative for every NEW session's initial `ver`. Lock order is
+/// users → refresh_tokens → auth_sessions.
 ///
 /// Both writes must commit together or neither may. If the bump committed
 /// while the revoke failed, the user's still-live refresh token would re-mint
@@ -107,6 +115,18 @@ pub async fn end_session_atomically(pool: &PgPool, user_id: Uuid) -> Result<i32,
     .await
     .map_err(AppError::database_error)?;
 
+    sqlx::query!(
+        r#"
+        UPDATE auth_sessions
+        SET ended_at = NOW()
+        WHERE user_id = $1 AND ended_at IS NULL
+        "#,
+        user_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::database_error)?;
+
     tx.commit().await.map_err(AppError::database_error)?;
     Ok(new_version)
 }
@@ -121,6 +141,14 @@ pub async fn end_session_atomically(pool: &PgPool, user_id: Uuid) -> Result<i32,
 /// fallback). The refresh token is registered in the `refresh_tokens`
 /// whitelist before the pair is returned (fail-closed: a DB write
 /// failure means no usable refresh token was handed out).
+///
+/// Every call is a NEW sign-in, so it creates a new session: an
+/// `auth_sessions` row whose `ver` is the user's current `users.token_version`
+/// (the one place the user scalar is read for the session), then asks the
+/// app's `TokenClaimsSource` (installed on `jwt_service`) for the per-sign-in
+/// claim values — the only time the source is consulted for this session;
+/// refreshes copy them forward. The session row and the first refresh-token
+/// row commit in ONE transaction (neither without the other).
 pub async fn mint_session_tokens(
     pool: &PgPool,
     jwt_service: &JwtService,
@@ -134,26 +162,76 @@ pub async fn mint_session_tokens(
         .await?
         .ok_or_else(|| AppError::unauthorized("USER_NOT_FOUND", "User not found"))?;
 
-    let minted = jwt_service.generate_tokens_with_jti_expiry(
+    let mut tx = pool.begin().await.map_err(AppError::database_error)?;
+    let session_id = sessions::create_session(&mut tx, user_id, token_version).await?;
+
+    let values = jwt_service
+        .claims_source()
+        .claims_for(&MintContext {
+            user_id,
+            session_id,
+        })
+        .await;
+    let minted = jwt_service.generate_session_tokens(
         user_id,
         username,
         email,
         is_admin,
         access_hours,
         refresh_days,
-        token_version,
+        &SessionClaims {
+            sid: Some(session_id),
+            ver: token_version,
+            values,
+        },
     )?;
-    register(pool, minted.refresh_jti, user_id, minted.refresh_expires_at).await?;
+    insert_refresh_row(
+        &mut tx,
+        minted.refresh_jti,
+        user_id,
+        Some(session_id),
+        minted.refresh_expires_at,
+    )
+    .await?;
+    tx.commit().await.map_err(AppError::database_error)?;
     Ok(minted)
 }
 
 /// Insert an active row for a freshly-issued refresh token. Call this
 /// immediately AFTER JwtService::generate_tokens_with_jti so the token
 /// is whitelisted before being returned to the user.
+///
+/// Registers a SESSION-LESS row (`session_id` NULL) — the legacy shape, kept
+/// unchanged for its existing callers. `mint_session_tokens` registers with
+/// its session; see [`register_with_session`].
 pub async fn register(
     pool: &PgPool,
     jti: Uuid,
     user_id: Uuid,
+    expires_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let mut conn = pool.acquire().await.map_err(AppError::database_error)?;
+    insert_refresh_row(&mut conn, jti, user_id, None, expires_at).await
+}
+
+/// [`register`] for a refresh token that belongs to session `session_id`
+/// (an `auth_sessions` row).
+pub async fn register_with_session(
+    pool: &PgPool,
+    jti: Uuid,
+    user_id: Uuid,
+    session_id: Uuid,
+    expires_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    let mut conn = pool.acquire().await.map_err(AppError::database_error)?;
+    insert_refresh_row(&mut conn, jti, user_id, Some(session_id), expires_at).await
+}
+
+async fn insert_refresh_row(
+    conn: &mut sqlx::PgConnection,
+    jti: Uuid,
+    user_id: Uuid,
+    session_id: Option<Uuid>,
     expires_at: DateTime<Utc>,
 ) -> Result<(), AppError> {
     // sqlx uses time::OffsetDateTime for TIMESTAMPTZ; convert via Unix
@@ -162,14 +240,15 @@ pub async fn register(
         .map_err(|e| AppError::internal_error(format!("invalid expires_at: {}", e)))?;
     sqlx::query!(
         r#"
-        INSERT INTO refresh_tokens (jti, user_id, expires_at)
-        VALUES ($1, $2, $3)
+        INSERT INTO refresh_tokens (jti, user_id, expires_at, session_id)
+        VALUES ($1, $2, $3, $4)
         "#,
         jti,
         user_id,
         expires_at_ts,
+        session_id,
     )
-    .execute(pool)
+    .execute(conn)
     .await
     .map_err(AppError::database_error)?;
     Ok(())
@@ -238,12 +317,39 @@ pub async fn revoke(pool: &PgPool, jti: Uuid) -> Result<(), AppError> {
 ///
 /// A token already revoked (rotation OR logout) matches 0 rows → `false`
 /// and no successor is written.
+///
+/// The successor INHERITS the presented row's `session_id` (one session id per
+/// rotation family). [`claim_rotation_and_register_in_session`] is the variant
+/// that sets it explicitly (the refresh handler's adoption of a session for a
+/// legacy session-less family).
 pub async fn claim_rotation_and_register(
     pool: &PgPool,
     presented_jti: Uuid,
     successor_jti: Uuid,
     user_id: Uuid,
     successor_expires_at: DateTime<Utc>,
+) -> Result<bool, AppError> {
+    claim_rotation_and_register_in_session(
+        pool,
+        presented_jti,
+        successor_jti,
+        user_id,
+        successor_expires_at,
+        None,
+    )
+    .await
+}
+
+/// [`claim_rotation_and_register`], with the successor's session set to
+/// `session_id` when `Some` (else inherited from the presented row). Same
+/// single-use / lock-ordering guarantees.
+pub async fn claim_rotation_and_register_in_session(
+    pool: &PgPool,
+    presented_jti: Uuid,
+    successor_jti: Uuid,
+    user_id: Uuid,
+    successor_expires_at: DateTime<Utc>,
+    session_id: Option<Uuid>,
 ) -> Result<bool, AppError> {
     let mut tx = pool.begin().await.map_err(AppError::database_error)?;
 
@@ -298,10 +404,18 @@ pub async fn claim_rotation_and_register(
         time::OffsetDateTime::from_unix_timestamp(successor_expires_at.timestamp())
             .map_err(|e| AppError::internal_error(format!("invalid expires_at: {}", e)))?;
     sqlx::query!(
-        r#"INSERT INTO refresh_tokens (jti, user_id, expires_at) VALUES ($1, $2, $3)"#,
+        r#"
+        INSERT INTO refresh_tokens (jti, user_id, expires_at, session_id)
+        VALUES (
+            $1, $2, $3,
+            COALESCE($4, (SELECT session_id FROM refresh_tokens WHERE jti = $5))
+        )
+        "#,
         successor_jti,
         user_id,
         expires_at_ts,
+        session_id,
+        presented_jti,
     )
     .execute(&mut *tx)
     .await
