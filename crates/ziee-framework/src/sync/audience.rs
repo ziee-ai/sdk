@@ -17,8 +17,8 @@
 //! is cross-tenant regardless of admin; INV-3). `Tenant(account_id)` is the
 //! tenant-scoped broadcast (that account's connections, no permission check).
 //! `Everyone` is retained as the Everyone-EQUIVALENT for **genuinely non-tenant
-//! frames only** (deployment-global, e.g. install-scope singleton config); the
-//! sync entity registry refuses `Everyone` for any entity declared tenant-scoped.
+//! frames only** (deployment-global, e.g. install-scope singleton config). `deliver`
+//! never sees the entity kind: refusing it per entity is the CONSUMER's gate.
 
 use ziee_identity::{PermissionCheck, PermissionList};
 use uuid::Uuid;
@@ -49,8 +49,8 @@ pub enum Audience {
     Tenant(Uuid),
     /// Every authenticated connection — the Everyone-EQUIVALENT, retained only
     /// for GENUINELY NON-TENANT frames (deployment-global signals such as the
-    /// install-scope singleton config kinds). The sync entity registry refuses
-    /// `Everyone` for any entity declared tenant-scoped. No current prod caller
+    /// install-scope singleton config kinds). NOT enforced here — `deliver` sends
+    /// it to every connection; the consumer's build gate refuses it. No prod caller
     /// (owner/perm scoping covers today's entities); retained as intentional
     /// API surface.
     Everyone,
@@ -82,8 +82,8 @@ impl Audience {
 
     /// Deliver to every authenticated connection. The Everyone-EQUIVALENT for
     /// GENUINELY NON-TENANT frames only (e.g. install-scope singleton config)
-    /// — the sync entity registry refuses it for any entity declared
-    /// tenant-scoped. No current caller (owner/perm scoping covers today's
+    /// — not enforced by the SDK (`deliver` never sees the entity kind); the
+    /// consumer's build gate refuses it per entity. No caller (owner/perm covers
     /// entities), so retained as intentional API surface.
     pub fn everyone() -> Self {
         Audience::Everyone
