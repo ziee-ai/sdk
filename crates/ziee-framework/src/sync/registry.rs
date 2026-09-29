@@ -3,17 +3,21 @@
 //!
 //! Unlike the global broadcast pool used by download/hardware SSE (every
 //! connected client receives every event), this registry is **keyed by
-//! user** so a `publish` targets exactly one user's connections, a
-//! permission-holding subset, or everyone — a change to user A's data is
-//! never delivered to user B. Single-process / single-Postgres today; a
+//! user** — but delivery is authorized by the AUDIENCE, not the connection's
+//! existence: a `publish` targets exactly one user's connections, an
+//! account-scoped permission-holding subset, one account's connections
+//! (`Tenant`), or everyone — a change to user A's data is never delivered to
+//! user B, and (sdk#24 / memo-335 §1, queue 417sync) a frame published for
+//! account X is never delivered to a principal of account Y, even an admin of
+//! Y holding the permission. Single-process / single-Postgres today; a
 //! future multi-instance deployment would fan out via LISTEN/NOTIFY.
 //!
 //! The registry is generic over the app's per-connection permission snapshot
-//! `P: `[`Principal`] — ziee installs a `SyncConnPrincipal { user, groups }` —
-//! and the framework never names ziee's concrete `User`/`Group`. It also never
-//! names ziee's wire types: `deliver` takes an already-serialized axum SSE
-//! [`Event`], and the session fan-out obtains each per-user event from an app
-//! [`SyncEntityKind`](super::SyncEntityKind).
+//! `P: `[`Principal`] — ziee installs a `SyncConnPrincipal { user, groups,
+//! account_id }` — and the framework never names ziee's concrete `User`/`Group`.
+//! It also never names ziee's wire types: `deliver` takes an already-serialized
+//! axum SSE [`Event`], and the session fan-out obtains each per-user event from
+//! an app [`SyncEntityKind`](super::SyncEntityKind).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -44,7 +48,10 @@ type ConnId = Uuid;
 
 /// One live SSE connection's server-side state. `principal` is the permission
 /// snapshot captured at connect (refreshed by the handler's periodic re-check)
-/// and consulted when routing `Perm`-audience events.
+/// and consulted when routing `Perm`-audience events — including its
+/// [`account_id`](ziee_identity::Principal::account_id), which the `Perm` and
+/// `Tenant` arms compare against the audience's account (tenant equality
+/// first: `None` never matches, and `is_admin()` never bypasses it).
 pub struct ClientConn<P: Principal> {
     pub user_id: Uuid,
     pub principal: P,
@@ -229,7 +236,11 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
                         }
                     }
                 }
-                Audience::Perm(rule) => {
+                Audience::Perm { account_id: _, rule } => {
+                    // NOTE (queue 417sync, C1 intermediate): this is the
+                    // sdk#24 leak shape — permission-only routing, no tenant
+                    // equality (cross-account holders/admins receive). The
+                    // tenant-equality-first guard (INV-3) lands in C2.
                     for (cid, conn) in clients.iter() {
                         let granted = conn.principal.is_admin()
                             || match &rule {
@@ -243,6 +254,16 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
                         if granted {
                             try_send(cid, conn);
                         }
+                    }
+                }
+                Audience::Tenant(_) => {
+                    // NOTE (queue 417sync, C1 intermediate): placeholder — the
+                    // Tenant arm's real semantics (that account's connections
+                    // only, origin skipped) land in C2; until then the variant
+                    // routes like Everyone so the tree compiles against the new
+                    // enum shape.
+                    for (cid, conn) in clients.iter() {
+                        try_send(cid, conn);
                     }
                 }
                 Audience::Everyone => {
@@ -428,15 +449,18 @@ mod tests {
     use ziee_identity::check_permissions_array;
 
     /// A framework-side stand-in for ziee's `SyncConnPrincipal`: the routing
-    /// logic depends only on `Principal::{is_admin, has_permission}`, so this
-    /// collapses direct + group permissions into a single string set (the union
-    /// semantics themselves are covered by ziee's `check_permission_union`
-    /// tests). Group-derived routing is still exercised via the
-    /// `active_group_permissions` override below.
+    /// logic depends only on `Principal::{is_admin, has_permission,
+    /// account_id}`, so this collapses direct + group permissions into a single
+    /// string set (the union semantics themselves are covered by ziee's
+    /// `check_permission_union` tests). Group-derived routing is still
+    /// exercised via the `active_group_permissions` override below. `account`
+    /// is the tenant/account half (DEC-1: explicit `Some(..)`; `None` = unknown
+    /// → never matches a tenant-scoped audience).
     struct TestPrincipal {
         admin: bool,
         direct: Vec<String>,
         groups: Vec<Vec<String>>,
+        account: Option<Uuid>,
     }
 
     impl Principal for TestPrincipal {
@@ -449,10 +473,21 @@ mod tests {
         fn active_group_permissions(&self) -> Vec<&[String]> {
             self.groups.iter().map(|g| g.as_slice()).collect()
         }
+        fn account_id(&self) -> Option<Uuid> {
+            self.account
+        }
     }
 
+    /// A principal whose account is unknown (`None`): the default half of the
+    /// tenant equality — `None` never matches `Some(account_id)`.
     fn principal(admin: bool, perms: Vec<&str>) -> TestPrincipal {
+        principal_at(None, admin, perms)
+    }
+
+    /// A principal carrying a tenant/account (explicit override, DEC-1).
+    fn principal_at(account: Option<Uuid>, admin: bool, perms: Vec<&str>) -> TestPrincipal {
         TestPrincipal {
+            account,
             admin,
             direct: perms.into_iter().map(String::from).collect(),
             groups: Vec::new(),
@@ -495,6 +530,8 @@ mod tests {
         rx.try_recv().is_ok()
     }
 
+    // TEST-9 (queue fr3-417sync): re-used owner-fanout fn — stays green, the
+    // Owner arm is unchanged (ITEM-1/ITEM-3; INV-2's "Owner(Uuid) stays").
     #[test]
     fn owner_audience_isolates_users() {
         let reg = empty_registry();
@@ -512,6 +549,8 @@ mod tests {
         assert!(!got(&mut rxb), "user B must NOT receive user A's event");
     }
 
+    // TEST-9 (queue fr3-417sync): re-used self-echo fn — stays green, the
+    // origin skip in `try_send` is shared by every arm (ITEM-3).
     #[test]
     fn origin_connection_is_skipped_but_other_tabs_are_not() {
         let reg = empty_registry();
@@ -529,36 +568,137 @@ mod tests {
         assert!(got(&mut rx2), "the user's OTHER tab must still update");
     }
 
+    /// TEST-3 (queue fr3-417sync) [covers: ITEM-3, ITEM-11] — within ONE
+    /// account, the `Perm` arm delivers to permission holders and excludes
+    /// non-holders, for BOTH `PermRule::All` and `PermRule::Any` (the positive
+    /// + negative of the permission half, tenant equal).
     #[test]
-    fn permission_audience_excludes_non_holders_includes_holders_and_admins() {
+    fn perm_arm_delivers_to_same_account_holders_and_excludes_same_account_non_holders() {
+        let acct = Uuid::from_u128(10_000);
         let reg = empty_registry();
-        let (c_admin, mut rx_admin) = conn(Uuid::new_v4(), principal(true, vec![]));
-        let (c_holder, mut rx_holder) = conn(Uuid::new_v4(), principal(false, vec!["x::read"]));
-        let (c_other, mut rx_other) = conn(Uuid::new_v4(), principal(false, vec![]));
-        reg.register(Uuid::new_v4(), c_admin).unwrap();
+        let (c_holder, mut rx_holder) =
+            conn(Uuid::new_v4(), principal_at(Some(acct), false, vec!["x::read"]));
+        let (c_non, mut rx_non) = conn(Uuid::new_v4(), principal_at(Some(acct), false, vec![]));
         reg.register(Uuid::new_v4(), c_holder).unwrap();
-        reg.register(Uuid::new_v4(), c_other).unwrap();
+        reg.register(Uuid::new_v4(), c_non).unwrap();
 
         reg.deliver(
-            Audience::Perm(PermRule::All(vec!["x::read"])),
+            Audience::Perm { account_id: acct, rule: PermRule::All(vec!["x::read"]) },
+            dummy_event(),
+            None,
+        );
+        assert!(got(&mut rx_holder), "same-account holder must receive (All)");
+        assert!(!got(&mut rx_non), "same-account NON-holder must NOT receive (All)");
+
+        reg.deliver(
+            Audience::Perm { account_id: acct, rule: PermRule::Any(vec!["x::read", "y::admin"]) },
+            dummy_event(),
+            None,
+        );
+        assert!(got(&mut rx_holder), "same-account holder must receive (Any)");
+        assert!(!got(&mut rx_non), "same-account NON-holder must NOT receive (Any)");
+    }
+
+    /// TEST-4 (queue fr3-417sync) [acceptance] [invariant: INV-1, INV-3]
+    /// [covers: ITEM-3, ITEM-11] — the exact cross-tenant leak shape: a
+    /// connection of a FOREIGN account that HOLDS `x::read` receives ZERO
+    /// frames (`try_recv` empty — frame count 0, the memo's negative) while a
+    /// same-account holder receives 1. The fanout key is (tenant, permission),
+    /// never permission alone (INV-1), and tenant equality is checked FIRST
+    /// (INV-3 — the foreign holder would receive if the permission check ran
+    /// without the tenant `&&`).
+    #[test]
+    fn other_account_perm_holder_receives_zero_frames() {
+        let (acct_a, acct_b) = (Uuid::from_u128(10_000), Uuid::from_u128(20_000));
+        let reg = empty_registry();
+        // The foreign holder: same permission, OTHER account.
+        let (c_foreign, mut rx_foreign) =
+            conn(Uuid::new_v4(), principal_at(Some(acct_b), false, vec!["x::read"]));
+        let (c_same, mut rx_same) =
+            conn(Uuid::new_v4(), principal_at(Some(acct_a), false, vec!["x::read"]));
+        reg.register(Uuid::new_v4(), c_foreign).unwrap();
+        reg.register(Uuid::new_v4(), c_same).unwrap();
+
+        reg.deliver(
+            Audience::Perm { account_id: acct_a, rule: PermRule::All(vec!["x::read"]) },
             dummy_event(),
             None,
         );
 
-        assert!(got(&mut rx_admin), "admin (wildcard) must receive");
-        assert!(got(&mut rx_holder), "perm holder must receive");
-        assert!(!got(&mut rx_other), "non-holder must NOT receive");
+        assert!(
+            !got(&mut rx_foreign),
+            "a foreign-account perm HOLDER must receive ZERO frames (tenant equality first)"
+        );
+        assert!(got(&mut rx_same), "the same-account holder must receive exactly the frame");
+        // The negative is count-zero: nothing else may be sitting in the queue.
+        assert!(
+            rx_foreign.try_recv().is_err(),
+            "the foreign connection's frame count stays zero"
+        );
+    }
+
+    /// TEST-5 (queue fr3-417sync) [acceptance] [invariant: INV-3] [covers:
+    /// ITEM-3, ITEM-11] — a FOREIGN-account ADMIN (empty permission set)
+    /// receives ZERO frames: `is_admin()` no longer bypasses the tenant
+    /// equality — "cross-tenant is cross-tenant regardless of admin". This is
+    /// the strongest single assertion on the branch: it reddens on ANY
+    /// admin-before-tenant ordering.
+    #[test]
+    fn other_account_admin_receives_zero_frames_admin_never_bypasses_tenant_equality() {
+        let (acct_a, acct_b) = (Uuid::from_u128(10_000), Uuid::from_u128(20_000));
+        let reg = empty_registry();
+        let (c_admin_b, mut rx_admin_b) =
+            conn(Uuid::new_v4(), principal_at(Some(acct_b), true, vec![]));
+        reg.register(Uuid::new_v4(), c_admin_b).unwrap();
+
+        reg.deliver(
+            Audience::Perm { account_id: acct_a, rule: PermRule::All(vec!["x::read"]) },
+            dummy_event(),
+            None,
+        );
+
+        assert!(
+            !got(&mut rx_admin_b),
+            "a cross-tenant ADMIN must receive ZERO frames — is_admin() never bypasses tenant equality"
+        );
+    }
+
+    /// TEST-6 (queue fr3-417sync) [acceptance] [invariant: INV-3] [covers:
+    /// ITEM-3, ITEM-11] — WITHIN the tenant, the admin short-circuit still
+    /// satisfies the permission check: a same-account admin with an empty
+    /// permission set receives. The tenant ∩ permission predicate keeps
+    /// `is_admin()` as its permission half, not a global bypass.
+    #[test]
+    fn same_account_admin_with_no_explicit_permission_still_receives() {
+        let acct = Uuid::from_u128(10_000);
+        let reg = empty_registry();
+        let (c_admin, mut rx_admin) =
+            conn(Uuid::new_v4(), principal_at(Some(acct), true, vec![]));
+        reg.register(Uuid::new_v4(), c_admin).unwrap();
+
+        reg.deliver(
+            Audience::Perm { account_id: acct, rule: PermRule::All(vec!["x::read"]) },
+            dummy_event(),
+            None,
+        );
+
+        assert!(got(&mut rx_admin), "same-account admin must still receive (admin IS part of the predicate)");
     }
 
     /// Build a ClientConn whose permission comes ONLY from group membership
     /// (the connection's direct permissions are empty), exercising the
-    /// `Principal::active_group_permissions` routing path.
-    fn conn_with_group(user_id: Uuid, group_perms: Vec<&str>) -> (ClientConn<TestPrincipal>, Rx) {
+    /// `Principal::active_group_permissions` routing path, carrying `account`.
+    fn conn_with_group(
+        account: Option<Uuid>,
+        user_id: Uuid,
+        group_perms: Vec<&str>,
+    ) -> (ClientConn<TestPrincipal>, Rx) {
         let (tx, rx) = tokio::sync::mpsc::channel(SYNC_CHANNEL_CAPACITY);
         let p = TestPrincipal {
             admin: false,
             direct: Vec::new(),
             groups: vec![group_perms.into_iter().map(String::from).collect()],
+            account,
         };
         let c = ClientConn {
             user_id,
@@ -568,50 +708,121 @@ mod tests {
         (c, rx)
     }
 
+    /// TEST-7 (queue fr3-417sync) [acceptance] [invariant: INV-2] [covers:
+    /// ITEM-3, ITEM-11] — `Audience::Tenant(acct)` delivers to EVERY connection
+    /// whose principal account equals `acct` (both of that account's
+    /// connections, incl. one with no relevant permission — tenant-scoped
+    /// broadcast, origin skipped via the shared `try_send` closure), while a
+    /// connection of a DIFFERENT account (even a perm holder/admin) receives
+    /// ZERO.
     #[test]
-    fn group_scoped_audience_routes_by_group_membership() {
-        // The group-scoped user-view entities (UserMcpServer / UserLlmProvider /
-        // Group) deliver to perm holders — and the perm is typically granted via
-        // GROUP MEMBERSHIP, not the direct permissions. Assert the group-derived
-        // path is honored for BOTH PermRule::All and PermRule::Any, while a
-        // member-less connection is excluded.
+    fn tenant_arm_reaches_exactly_that_account() {
+        let (acct_a, acct_b) = (Uuid::from_u128(10_000), Uuid::from_u128(20_000));
         let reg = empty_registry();
-        let (c_group, mut rx_group) = conn_with_group(Uuid::new_v4(), vec!["users::read"]);
-        let (c_none, mut rx_none) = conn(Uuid::new_v4(), principal(false, vec![]));
-        reg.register(Uuid::new_v4(), c_group).unwrap();
-        reg.register(Uuid::new_v4(), c_none).unwrap();
+        let (c_a1, mut rx_a1) = conn(Uuid::new_v4(), principal_at(Some(acct_a), false, vec![]));
+        let (c_a2, mut rx_a2) =
+            conn(Uuid::new_v4(), principal_at(Some(acct_a), false, vec!["x::read"]));
+        // A perm holder/admin of the OTHER account must not be swept in.
+        let (c_b, mut rx_b) = conn(Uuid::new_v4(), principal_at(Some(acct_b), true, vec!["x::read"]));
+        let id_a1 = Uuid::new_v4();
+        reg.register(id_a1, c_a1).unwrap();
+        let (id_a2, id_b) = (Uuid::new_v4(), Uuid::new_v4());
+        reg.register(id_a2, c_a2).unwrap();
+        reg.register(id_b, c_b).unwrap();
 
-        // All-rule: the group grants the only required perm.
-        reg.deliver(
-            Audience::Perm(PermRule::All(vec!["users::read"])),
-            dummy_event(),
-            None,
-        );
-        assert!(got(&mut rx_group), "group-derived perm must receive (All)");
-        assert!(!got(&mut rx_none), "connection with no group/perm must NOT receive");
+        // Origin skipped even in the broadcast arm.
+        reg.deliver(Audience::Tenant(acct_a), dummy_event(), Some(id_a1));
 
-        // Any-rule: one of the alternatives is granted via the group.
-        reg.deliver(
-            Audience::Perm(PermRule::Any(vec!["users::read", "mcp::admin"])),
-            dummy_event(),
-            None,
+        assert!(!got(&mut rx_a1), "the originating connection is skipped (self-echo)");
+        assert!(
+            got(&mut rx_a2),
+            "A's OTHER connection (no relevant permission) still receives — broadcast, not a perm check"
         );
-        assert!(got(&mut rx_group), "group-derived perm must receive (Any)");
-        assert!(!got(&mut rx_none), "connection with no group/perm must NOT receive (Any)");
+        assert!(
+            !got(&mut rx_b),
+            "a DIFFERENT-account connection receives ZERO, even as an admin/perm holder"
+        );
     }
 
+    /// TEST-8 (queue fr3-417sync) [covers: ITEM-1, ITEM-3, ITEM-11] — the
+    /// Everyone-EQUIVALENT arm is UNCHANGED for genuinely non-tenant frames:
+    /// `Audience::Everyone` reaches every registered connection regardless of
+    /// account/permission (the pre-change broadcast semantics).
     #[test]
-    fn everyone_audience_reaches_all_connections() {
+    fn everyone_arm_still_reaches_all_connections() {
+        let (acct_a, acct_b) = (Uuid::from_u128(10_000), Uuid::from_u128(20_000));
         let reg = empty_registry();
-        let (c1, mut rx1) = conn(Uuid::new_v4(), principal(false, vec![]));
-        let (c2, mut rx2) = conn(Uuid::new_v4(), principal(false, vec![]));
+        let (c1, mut rx1) = conn(Uuid::new_v4(), principal_at(Some(acct_a), false, vec![]));
+        let (c2, mut rx2) = conn(Uuid::new_v4(), principal_at(Some(acct_b), true, vec![]));
         reg.register(Uuid::new_v4(), c1).unwrap();
         reg.register(Uuid::new_v4(), c2).unwrap();
 
         reg.deliver(Audience::Everyone, dummy_event(), None);
 
-        assert!(got(&mut rx1));
-        assert!(got(&mut rx2));
+        assert!(got(&mut rx1), "Everyone still reaches every connection (account A)");
+        assert!(got(&mut rx2), "Everyone still reaches every connection (account B)");
+    }
+
+    /// TEST-9 (queue fr3-417sync) [covers: ITEM-1, ITEM-3, ITEM-11] —
+    /// `Audience::Owner(uid)` still delivers to exactly `uid`'s connections
+    /// (one user, two tabs) and never to another user — user ids are globally
+    /// unique in the single credential store, so owner-fanout needs NO account
+    /// comparison (INV-2); an owner arm that started ANDing account could break
+    /// an in-account user whose snapshot is refreshed.
+    #[test]
+    fn owner_arm_remains_globally_scoped_by_user_id() {
+        let uid = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let reg = empty_registry();
+        // Two tabs of the SAME user; the other user sits under a different account id —
+        // irrelevant either way: Owner fanout is user_id only.
+        let (c1, mut rx1) = conn(uid, principal_at(Some(uid), false, vec![]));
+        let (c2, mut rx2) = conn(uid, principal_at(Some(uid), false, vec![]));
+        let (c_other, mut rx_other) = conn(other, principal_at(Some(other), false, vec![]));
+        reg.register(Uuid::new_v4(), c1).unwrap();
+        reg.register(Uuid::new_v4(), c2).unwrap();
+        reg.register(Uuid::new_v4(), c_other).unwrap();
+
+        reg.deliver(Audience::Owner(uid), dummy_event(), None);
+
+        assert!(got(&mut rx1), "uid's first tab receives");
+        assert!(got(&mut rx2), "uid's second tab receives");
+        assert!(!got(&mut rx_other), "another user receives NOTHING from an Owner(uid) frame");
+    }
+
+    /// TEST-10 (queue fr3-417sync) [covers: ITEM-3, ITEM-11] — a same-account
+    /// connection whose permission comes ONLY from an ACTIVE group membership
+    /// still receives (All and Any), and a member-less same-account connection
+    /// receives nothing: the `active_group_permissions` union path is untouched
+    /// by the tenant predicate (INV-4/ITEM-2 union semantics unchanged).
+    #[test]
+    fn group_derived_permissions_still_route_within_the_tenant() {
+        let acct = Uuid::from_u128(10_000);
+        let reg = empty_registry();
+        let (c_group, mut rx_group) =
+            conn_with_group(Some(acct), Uuid::new_v4(), vec!["users::read"]);
+        let (c_none, mut rx_none) =
+            conn(Uuid::new_v4(), principal_at(Some(acct), false, vec![]));
+        reg.register(Uuid::new_v4(), c_group).unwrap();
+        reg.register(Uuid::new_v4(), c_none).unwrap();
+
+        // All-rule: the group grants the only required perm, within the tenant.
+        reg.deliver(
+            Audience::Perm { account_id: acct, rule: PermRule::All(vec!["users::read"]) },
+            dummy_event(),
+            None,
+        );
+        assert!(got(&mut rx_group), "group-derived perm must receive (All, within tenant)");
+        assert!(!got(&mut rx_none), "member-less connection must NOT receive (All)");
+
+        // Any-rule: one of the alternatives is granted via the group.
+        reg.deliver(
+            Audience::Perm { account_id: acct, rule: PermRule::Any(vec!["users::read", "mcp::admin"]) },
+            dummy_event(),
+            None,
+        );
+        assert!(got(&mut rx_group), "group-derived perm must receive (Any, within tenant)");
+        assert!(!got(&mut rx_none), "member-less connection must NOT receive (Any)");
     }
 
     #[test]
@@ -703,26 +914,31 @@ mod tests {
         reg.deliver(Audience::Owner(uid), dummy_event(), None);
     }
 
+    // TEST-6 (queue fr3-417sync): re-used refresh fn — stays green, the
+    // re-check replaces the whole snapshot (permission AND account) and the
+    // Perm arm consults the live current snapshot (ITEM-3).
     #[test]
     fn refresh_updates_permission_snapshot() {
+        let acct = Uuid::from_u128(10_000);
         let reg = empty_registry();
         let uid = Uuid::new_v4();
-        let (c, mut rx) = conn(uid, principal(false, vec![]));
+        let (c, mut rx) = conn(uid, principal_at(Some(acct), false, vec![]));
         let id = Uuid::new_v4();
         reg.register(id, c).unwrap();
 
-        // Before refresh: no perm → excluded from a Permission audience.
+        // Before refresh: no perm → excluded from the account's Perm audience.
         reg.deliver(
-            Audience::Perm(PermRule::All(vec!["x::read"])),
+            Audience::Perm { account_id: acct, rule: PermRule::All(vec!["x::read"]) },
             dummy_event(),
             None,
         );
         assert!(!got(&mut rx));
 
-        // After a re-check grants the perm, the same connection is included.
-        reg.refresh(id, principal(false, vec!["x::read"]));
+        // After a re-check grants the perm, the same connection is included
+        // (the refreshed snapshot keeps the account).
+        reg.refresh(id, principal_at(Some(acct), false, vec!["x::read"]));
         reg.deliver(
-            Audience::Perm(PermRule::All(vec!["x::read"])),
+            Audience::Perm { account_id: acct, rule: PermRule::All(vec!["x::read"]) },
             dummy_event(),
             None,
         );

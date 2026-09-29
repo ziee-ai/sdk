@@ -74,7 +74,7 @@ pub async fn update_session_settings<R: IdentityResolver<User = User, Group = Gr
         AuthSyncEntity::SessionSettings,
         AuthSyncAction::Update,
         Uuid::nil(),
-        Audience::perm::<SessionSettingsRead>(),
+        Audience::perm::<SessionSettingsRead>(ctx.install_account_id()),
         origin.0,
     );
     Ok((StatusCode::OK, Json(row)))

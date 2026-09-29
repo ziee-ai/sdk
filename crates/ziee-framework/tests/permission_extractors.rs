@@ -182,6 +182,11 @@ async fn get_with(app: Router, path: &str, bearer: Option<&str>) -> (StatusCode,
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
+// TEST-13 (queue fr3-417sync): the extractor battery (admin short-circuit,
+// direct grant, group union, 403/401 shape) — `TestUser`'s `impl Principal for`
+// compiles on the DEFAULT `account_id()` (None; DEC-1, no edit) and the
+// enforcement algorithm is unchanged; the test principal truthfully carries no
+// account data.
 #[tokio::test]
 async fn missing_token_is_401() {
     let (status, _) = get_with(app(), "/one", None).await;

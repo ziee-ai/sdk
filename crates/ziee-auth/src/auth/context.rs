@@ -29,6 +29,21 @@ use crate::auth::{AuthRepository, SessionSettingsRepository};
 use crate::user::events::UserEvent;
 use crate::user::{GroupRepository, UserRepository};
 
+/// The pre-tenancy single-account id this auth surface uses as the account
+/// operand on every perm-scoped sync audience it builds (DEC-12, queue
+/// 417sync): there is no accounts table yet — the app supplies ONE install
+/// account id (`INSTALL_ACCOUNT_ID` in its sync module) — so the SDK-internal
+/// fallback constructors in [`crate::auth::module`] / [`crate::auth::turnkey`]
+/// pass THIS same documented fixed literal (process-consistency is what
+/// matters; the sync registry is in-process). The literal is deliberately the
+/// smallest non-nil Uuid: fixed, deterministic, outside the v4-random space
+/// of provisioned accounts, and never `Uuid::nil()` (would fail-closed against
+/// every `Some(account_id)` principal and silently break session-settings /
+/// auth-provider fanout). Behaviorally inert pre-tenancy — every connection
+/// principal carries it, so the tenant equality always holds for the one
+/// account — and tenancy/account-provisioning replaces it.
+pub const INSTALL_ACCOUNT_ID: Uuid = Uuid::from_u128(1);
+
 /// The auth-domain sync entities, abstract over the app's concrete
 /// `SyncEntity`. The app-side `AuthSyncSink` impl maps each variant to the
 /// real `SyncEntity::{User, Group, Profile, Session, SessionSettings,
@@ -91,6 +106,11 @@ pub struct AuthContext {
     /// The at-rest secret storage key (app copies it from
     /// the app's at-rest secret key at install time).
     secret_key: Option<String>,
+    /// The install-time tenant/account this auth surface belongs to (copied
+    /// from the app at boot, mirroring `secret_key`). Used as the account
+    /// operand on every perm-scoped sync audience this crate builds
+    /// (`session_settings__read` / `auth_providers__read` fanout, DEC-12).
+    install_account_id: Uuid,
     /// Domain-event sink (app installs an event-bus-backed impl).
     pub events: Arc<dyn AuthEventSink>,
     /// Cross-device sync sink (app installs a `sync::publish`-backed impl).
@@ -99,16 +119,22 @@ pub struct AuthContext {
 
 impl AuthContext {
     /// Assemble the handle from a pool + the installed sinks. Called once at
-    /// boot by the app wiring.
+    /// boot by the app wiring (`build_auth_context` passes the app's
+    /// `INSTALL_ACCOUNT_ID`; the SDK-internal fallback constructors in
+    /// [`crate::auth::module`] / [`crate::auth::turnkey`] pass
+    /// [`INSTALL_ACCOUNT_ID`] — the same documented fixed literal, because the
+    /// sync registry is in-process and process-consistency is what matters).
     pub fn new(
         pool: Arc<PgPool>,
         secret_key: Option<String>,
+        install_account_id: Uuid,
         events: Arc<dyn AuthEventSink>,
         sync: Arc<dyn AuthSyncSink>,
     ) -> Self {
         Self {
             pool,
             secret_key,
+            install_account_id,
             events,
             sync,
         }
@@ -122,6 +148,12 @@ impl AuthContext {
     /// The at-rest secret storage key (replaces the global storage-key read).
     pub fn secret_key(&self) -> Option<&str> {
         self.secret_key.as_deref()
+    }
+
+    /// The install-time tenant/account this process belongs to — the account
+    /// operand for the perm-scoped sync audiences built here.
+    pub fn install_account_id(&self) -> Uuid {
+        self.install_account_id
     }
 
     /// A fresh auth repository bound to the pool (replaces `Repos.auth`).

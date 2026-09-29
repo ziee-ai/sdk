@@ -2067,7 +2067,7 @@ pub async fn admin_create_provider<R: IdentityResolver<User = User, Group = Grou
         AuthSyncEntity::AuthProvider,
         AuthSyncAction::Create,
         row_id,
-        Audience::perm::<AuthProvidersRead>(),
+        Audience::perm::<AuthProvidersRead>(ctx.install_account_id()),
         origin.0,
     );
     Ok((
@@ -2152,7 +2152,7 @@ pub async fn admin_update_provider<R: IdentityResolver<User = User, Group = Grou
         AuthSyncEntity::AuthProvider,
         AuthSyncAction::Update,
         id,
-        Audience::perm::<AuthProvidersRead>(),
+        Audience::perm::<AuthProvidersRead>(ctx.install_account_id()),
         origin.0,
     );
     Ok((StatusCode::OK, Json(provider_to_response(enforced))))
@@ -2220,7 +2220,7 @@ pub async fn admin_delete_provider<R: IdentityResolver<User = User, Group = Grou
         AuthSyncEntity::AuthProvider,
         AuthSyncAction::Delete,
         id,
-        Audience::perm::<AuthProvidersRead>(),
+        Audience::perm::<AuthProvidersRead>(ctx.install_account_id()),
         origin.0,
     );
     Ok((
@@ -2278,7 +2278,7 @@ pub async fn admin_test_provider<R: IdentityResolver<User = User, Group = Group>
         AuthSyncEntity::AuthProvider,
         AuthSyncAction::Update,
         id,
-        Audience::perm::<AuthProvidersRead>(),
+        Audience::perm::<AuthProvidersRead>(ctx.install_account_id()),
         origin.0,
     );
     Ok((

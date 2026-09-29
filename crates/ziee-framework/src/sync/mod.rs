@@ -7,7 +7,9 @@
 //! the framework owns the connection lifecycle (caps / pruning / self-echo) and
 //! the delivery routing, generic over
 //! - an app **principal** ([`ziee_identity::Principal`]) — the per-connection
-//!   permission snapshot the `Perm` audience routes against, and
+//!   permission snapshot the `Perm` audience routes against, incl. its
+//!   [`account_id`](ziee_identity::Principal::account_id): the fanout key is
+//!   (tenant, permission), never permission alone (sdk#24 / memo-335 §1), and
 //! - an app **entity kind** ([`SyncEntityKind`]) — the seam replacing ziee's
 //!   closed `SyncEntity` enum. The framework never names ziee's `SyncEntity`,
 //!   `SyncEvent`, or `SyncSseEvent` (all of which derive `JsonSchema` and are in
@@ -19,8 +21,11 @@
 //!   from [`SyncEntityKind::session_signal`].
 //!
 //! ziee keeps the process-wide singleton (`registry()`) + its concrete
-//! `SyncConnPrincipal` and consumes this via equivalence-preserving re-export
-//! shims, so every `publish(...)` emit site + the `SyncEntity` enum are unchanged.
+//! `SyncConnPrincipal` (which now carries the account on its snapshot) and
+//! consumes this via equivalence-preserving re-export shims; only the
+//! audience CONSTRUCTION at the emit sites changed with the account operand
+//! (the `publish` signature, the wire `{entity, action, id}` and the
+//! `SyncEntity` enum are unchanged).
 
 pub mod audience;
 pub mod extractor;

@@ -12,6 +12,10 @@ ziee-core = { path = "../ziee-core" }
 # projection today, so moving it is E8-neutral).
 serde = { version = "1.0.219", features = ["derive"] }
 schemars = { version = "0.9.0", features = ["chrono04", "uuid1"] }
+# queue 417sync / sdk#24: `Principal::account_id() -> Option<Uuid>` needs the
+# type on this crate; same catalog spelling as ziee-framework so the shared
+# Cargo.lock unifies (and a downstream app's broader feature set is additive).
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
 
 [dev-dependencies]
 serde_json = "1.0.141"

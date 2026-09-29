@@ -117,6 +117,11 @@ fn module_context() -> ModuleContext {
     ModuleContext::new(Arc::new(pool), cfg, app_config)
 }
 
+// TEST-14 (queue fr3-417sync): the declared-sync-surface proof + the crate-wide
+// compile/run of `cargo test -p ziee-auth` — the five perm publish sites now
+// construct `Audience::perm::<P>(ctx.install_account_id())` (DEC-12) and
+// `impl Principal for User` stays on the default `account_id()` = None (DEC-1);
+// a missed site fails the whole crate's compile.
 #[tokio::test]
 async fn auth_sync_wiring_must_be_declared_and_the_declared_sink_is_the_one_used() {
     let ctx = module_context();

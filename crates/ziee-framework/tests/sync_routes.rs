@@ -211,6 +211,11 @@ fn request(bearer: Option<&str>, exp: Option<i64>) -> axum::http::Request<Body> 
     req.body(Body::empty()).unwrap()
 }
 
+// TEST-12 (queue fr3-417sync): the mountable `/sync/subscribe` route battery —
+// both `impl Principal for` below compile on the DEFAULT `account_id()` (None,
+// DEC-1; no edit needed) and the handler's auth/teardown wiring is unchanged by
+// the audience shape change; the whole crate test compiling IS the "every
+// implementor updated" proof.
 #[tokio::test]
 async fn no_token_is_401() {
     let res = app().oneshot(request(None, None)).await.unwrap();

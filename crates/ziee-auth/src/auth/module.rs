@@ -45,7 +45,8 @@ use linkme::distributed_slice;
 use ziee_framework::module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
 
 use super::context::{
-    AuthContext, AuthSyncWiring, NoopAuthEventSink, declared_auth_sync, resolve_auth_sync,
+    AuthContext, AuthSyncWiring, INSTALL_ACCOUNT_ID, NoopAuthEventSink, declared_auth_sync,
+    resolve_auth_sync,
 };
 use super::http::{auth_admin_routes, auth_routes};
 use super::jwt::JwtService;
@@ -132,8 +133,13 @@ impl AppModule for AuthModule {
         // lifecycle events and this module's callers have no in-process event
         // bus to route them to. Unlike sync, that is not an invisible drop —
         // `AuthEventSink` has no cross-device half whose absence is silent.
-        let auth_ctx =
-            AuthContext::new(ctx.db_pool.clone(), None, Arc::new(NoopAuthEventSink), sync);
+        let auth_ctx = AuthContext::new(
+            ctx.db_pool.clone(),
+            None,
+            INSTALL_ACCOUNT_ID,
+            Arc::new(NoopAuthEventSink),
+            sync,
+        );
 
         // Reverse-proxy trust flag (idempotent OnceLock set), mirroring ziee.
         super::set_trust_forwarded_headers(ctx.config.server.trust_forwarded_headers);

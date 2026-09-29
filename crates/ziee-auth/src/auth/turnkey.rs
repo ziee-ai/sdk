@@ -216,7 +216,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::context::{NoopAuthEventSink, NoopAuthSyncSink};
+    use crate::auth::context::{INSTALL_ACCOUNT_ID, NoopAuthEventSink, NoopAuthSyncSink};
     use crate::auth::jwt::{JwtService, JwtSettings};
 
     fn strong_jwt() -> Arc<JwtService> {
@@ -256,6 +256,7 @@ mod tests {
         let ctx = AuthContext::new(
             Arc::new(pool),
             None,
+            INSTALL_ACCOUNT_ID,
             Arc::new(NoopAuthEventSink),
             Arc::new(NoopAuthSyncSink),
         );
