@@ -233,12 +233,37 @@ pub fn make_isolated_data_dir(manifest_dir: &Path) -> PerTestDataDir {
 
 // Per-test DBs are cloned from a fully-migrated TEMPLATE via
 // `CREATE DATABASE ... TEMPLATE`, so migrations run exactly ONCE per test
-// process instead of once per test — eliminating the per-test migration races
-// that broke parallel runs (a half-applied schema → "relation does not exist")
-// and making DB setup dramatically faster (a byte-copy vs replaying every
-// migration per test).
+// process PER MIGRATION SET instead of once per test — eliminating the per-test
+// migration races that broke parallel runs (a half-applied schema → "relation
+// does not exist") and making DB setup dramatically faster (a byte-copy vs
+// replaying every migration per test).
+//
+// The template cache is KEYED on the migration set (owner card
+// `tenant-boundary-migration-dirs-pin`, memo integration-contracts-1043 §1). It
+// used to be one process-wide `OnceCell<()>`: the first `HarnessApp` to build a
+// template decided the schema for every later caller in the process, so a test
+// binary that needed two differently-migrated databases (e.g. a tenant-boundary
+// leak check over a fixture set beside the app's own set) could not get the
+// second from the harness at all. Now each distinct ordered set of migration
+// dirs gets its own template DB, built once; the app's own default set keeps
+// its historical template name, so existing callers are unchanged.
 
-static TEST_TEMPLATE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+/// Process-wide cache of built templates: template DB name → (the ordered
+/// migration dirs it was built from, a once-cell that builds it). The name is a
+/// pure function of the app and the migration set ([`template_db_for`]), so this
+/// is keyed on the set; the stored dirs make a name collision a loud panic
+/// rather than a silently wrong schema.
+type TemplateCells =
+    std::collections::HashMap<String, (Vec<PathBuf>, std::sync::Arc<tokio::sync::OnceCell<()>>)>;
+
+fn template_cells() -> &'static std::sync::Mutex<TemplateCells> {
+    static CELLS: std::sync::OnceLock<std::sync::Mutex<TemplateCells>> = std::sync::OnceLock::new();
+    CELLS.get_or_init(Default::default)
+}
+
+/// The once-per-process startup sweeps, run before the FIRST template build of
+/// the process (whichever migration set that is).
+static STARTUP_SWEEPS: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 /// Prefix of every per-test database this engine creates. The ONE literal — the
 /// creator ([`TestHarness::start`]), the reaper ([`SpawnedServer::drop`]) and the
@@ -436,43 +461,80 @@ async fn sweep_stale_test_dbs_once(admin_url: &str) {
     sweep_stale_test_dbs(admin_url, min_age).await;
 }
 
-/// The fully-migrated TEMPLATE database name = the app's per-variant base +
-/// the per-worktree suffix.
-fn test_template_db<A: HarnessApp>(app: &A, variant: Variant, manifest_dir: &Path) -> String {
-    format!(
-        "{}{}",
-        app.template_db_base(variant),
-        worktree_suffix(manifest_dir)
-    )
+/// Stable 32-bit FNV-1a digest of an ordered migration set, as 8 hex chars —
+/// the same fold `worktree_db` uses, so it is identical across processes.
+fn migration_set_digest(migration_dirs: &[PathBuf]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for dir in migration_dirs {
+        for b in dir.to_string_lossy().bytes().chain(std::iter::once(0u8)) {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{:08x}", (hash ^ (hash >> 32)) as u32)
 }
 
-/// Build the migrated template DB exactly once per process (the OnceCell makes
-/// every concurrent test await the single build before any of them clone). The
-/// template must have NO active connections when a clone runs, so we close our
-/// pools and terminate any stragglers before returning.
-async fn ensure_test_template<A: HarnessApp>(
-    admin_url: &str,
+/// The fully-migrated TEMPLATE database name for `migration_dirs`.
+///
+/// For the app's OWN set ([`HarnessApp::migration_dirs`]) it is the historical
+/// name — the app's per-variant base + the per-worktree suffix — so every
+/// existing caller clones exactly the template it always did. Any OTHER set gets
+/// `<base>_m<digest-of-the-set><suffix>`: a distinct template per set, still
+/// per-worktree, and never under the `test_db_` prefix the stale sweep collects.
+fn template_db_for<A: HarnessApp>(
     app: &A,
     variant: Variant,
     manifest_dir: &Path,
-) {
-    TEST_TEMPLATE
-        .get_or_init(|| async {
-            // Reclaim the orphans no `Drop` could have reaped (abort/SIGKILL/OOM/
-            // timeout), BEFORE this process starts cloning its own. Self-healing:
-            // it needs nothing from the run that leaked.
-            sweep_stale_test_dbs_once(admin_url).await;
-            // The same half of the same problem, for the per-test DATA DIR — whose
-            // orphans cost ~300 MB and a `/proc/mounts` entry each, not a catalog
-            // row. Runs here rather than in `start` so it is once per PROCESS.
-            data_dir::sweep_stale_test_data_dirs_once();
+    migration_dirs: &[PathBuf],
+) -> String {
+    let base = app.template_db_base(variant);
+    let suffix = worktree_suffix(manifest_dir);
+    if app.migration_dirs(variant, manifest_dir).as_slice() == migration_dirs {
+        format!("{base}{suffix}")
+    } else {
+        format!("{base}_m{}{suffix}", migration_set_digest(migration_dirs))
+    }
+}
 
+/// Build the template DB `template_db` from `migration_dirs` exactly once per
+/// process (its once-cell makes every concurrent caller of the SAME set await
+/// the single build before any of them clone; a different set has its own
+/// cell). The template must have NO active connections when a clone runs, so we
+/// close our pools and terminate any stragglers before returning.
+async fn ensure_test_template(admin_url: &str, template_db: &str, migration_dirs: &[PathBuf]) {
+    // Reclaim the orphans no `Drop` could have reaped (abort/SIGKILL/OOM/
+    // timeout), BEFORE this process starts cloning its own. Self-healing: it
+    // needs nothing from the run that leaked.
+    STARTUP_SWEEPS
+        .get_or_init(|| async {
+            sweep_stale_test_dbs_once(admin_url).await;
+            // The same half of the same problem, for the per-test DATA DIR —
+            // whose orphans cost ~300 MB and a `/proc/mounts` entry each, not a
+            // catalog row. Once per PROCESS, not per template.
+            data_dir::sweep_stale_test_data_dirs_once();
+        })
+        .await;
+
+    let cell = {
+        let mut cells = template_cells().lock().expect("template cache poisoned");
+        let (dirs, cell) = cells
+            .entry(template_db.to_string())
+            .or_insert_with(|| (migration_dirs.to_vec(), Default::default()));
+        assert_eq!(
+            dirs.as_slice(),
+            migration_dirs,
+            "test harness: template {template_db} was already built from a different migration set"
+        );
+        cell.clone()
+    };
+
+    cell.get_or_init(|| async {
             let admin = PgPoolOptions::new()
                 .max_connections(1)
                 .connect(admin_url)
                 .await
                 .expect("connect postgres to build test template");
-            let template_db = test_template_db(app, variant, manifest_dir);
+            let template_db = template_db.to_string();
             let term = format!(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{template_db}' AND pid <> pg_backend_pid()"
             );
@@ -500,7 +562,7 @@ async fn ensure_test_template<A: HarnessApp>(
                 .connect(tmpl.as_str())
                 .await
                 .expect("connect template database");
-            for dir in app.migration_dirs(variant, manifest_dir) {
+            for dir in migration_dirs {
                 let mut migrator = sqlx::migrate::Migrator::new(dir.clone())
                     .await
                     .unwrap_or_else(|e| panic!("create migrator for {}: {e}", dir.display()));
@@ -749,8 +811,36 @@ impl<A: HarnessApp> TestHarness<A> {
         }
     }
 
-    /// Spawn a fresh test server with the given app options.
+    /// Acquire the fully-migrated template for `migration_dirs` — built once per
+    /// process per distinct ordered set, on first request — and return its
+    /// database name (clone it with `CREATE DATABASE <x> TEMPLATE <name>`).
+    ///
+    /// The app's own set ([`HarnessApp::migration_dirs`]) yields the same
+    /// template [`start`](Self::start) clones; any other set yields a separate
+    /// template, so one test process can hold two differently-migrated
+    /// templates side by side.
+    pub async fn template_for(&self, migration_dirs: &[PathBuf]) -> String {
+        let template_db =
+            template_db_for(&self.app, self.variant, &self.manifest_dir, migration_dirs);
+        ensure_test_template(&admin_database_url(), &template_db, migration_dirs).await;
+        template_db
+    }
+
+    /// Spawn a fresh test server with the given app options, its database
+    /// cloned from the template of the app's own migration set.
     pub async fn start(&self, opts: A::Options) -> SpawnedServer {
+        let migration_dirs = self.app.migration_dirs(self.variant, &self.manifest_dir);
+        self.start_with_migration_dirs(opts, migration_dirs).await
+    }
+
+    /// [`start`](Self::start), but with the per-test database cloned from the
+    /// template of `migration_dirs` instead of the app's own set (see
+    /// [`template_for`](Self::template_for)).
+    pub async fn start_with_migration_dirs(
+        &self,
+        opts: A::Options,
+        migration_dirs: Vec<PathBuf>,
+    ) -> SpawnedServer {
         // Process-global pre-spawn side effects (storage-key init, Windows
         // sandbox-helper install). Idempotent by the app's contract.
         self.app.before_spawn(&opts);
@@ -797,7 +887,9 @@ impl<A: HarnessApp> TestHarness<A> {
 
         // Ensure the fully-migrated template exists (built once per process),
         // then clone the per-test DB from it — no migrations run per test.
-        ensure_test_template(&db_url, &self.app, self.variant, &self.manifest_dir).await;
+        let template_db =
+            template_db_for(&self.app, self.variant, &self.manifest_dir, &migration_dirs);
+        ensure_test_template(&db_url, &template_db, &migration_dirs).await;
 
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -807,8 +899,7 @@ impl<A: HarnessApp> TestHarness<A> {
 
         sqlx::query(&format!(
             "CREATE DATABASE {} TEMPLATE {}",
-            database_name,
-            test_template_db(&self.app, self.variant, &self.manifest_dir)
+            database_name, template_db
         ))
         .execute(&pool)
         .await
@@ -908,6 +999,49 @@ impl<A: HarnessApp> TestHarness<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NamingApp(Vec<PathBuf>);
+    impl HarnessApp for NamingApp {
+        type Options = ();
+        fn template_db_base(&self, _: Variant) -> String {
+            "app_test_template".to_string()
+        }
+        fn migration_dirs(&self, _: Variant, _: &Path) -> Vec<PathBuf> {
+            self.0.clone()
+        }
+        fn plan_spawn(&self, _: &(), _: &SpawnFacts) -> SpawnPlan {
+            unreachable!()
+        }
+    }
+
+    /// The app's own set keeps the historical `<base><suffix>` template name;
+    /// every other ordered set gets a distinct, deterministic name that the
+    /// stale `test_db_` sweep can never collect.
+    #[test]
+    fn template_name_is_keyed_on_the_migration_set() {
+        let manifest = Path::new("/w/src-app/server");
+        let own = vec![PathBuf::from("/w/migrations")];
+        let other = vec![PathBuf::from("/w/migrations"), PathBuf::from("/w/fixture")];
+        let reordered = vec![PathBuf::from("/w/fixture"), PathBuf::from("/w/migrations")];
+        let app = NamingApp(own.clone());
+        let v = Variant::Server;
+
+        assert_eq!(
+            template_db_for(&app, v, manifest, &own),
+            format!("app_test_template{}", worktree_suffix(manifest)),
+            "the app's own set: unchanged historical name"
+        );
+        let a = template_db_for(&app, v, manifest, &other);
+        assert_ne!(a, template_db_for(&app, v, manifest, &own));
+        assert_eq!(a, template_db_for(&app, v, manifest, &other), "deterministic");
+        assert_ne!(
+            a,
+            template_db_for(&app, v, manifest, &reordered),
+            "order is part of the set: migrations apply in order"
+        );
+        assert!(!is_engine_test_db_name(&a), "never under the sweep's prefix: {a}");
+        assert!(a.len() <= 63, "fits a Postgres identifier: {a}");
+    }
 
     /// The sweep interpolates a database name straight into DDL, so the predicate
     /// that admits a name is the only thing standing between a `pg_database` row
