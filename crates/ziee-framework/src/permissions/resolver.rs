@@ -79,4 +79,19 @@ pub trait IdentityResolver: Send + Sync + 'static {
     fn access_token_ver(&self, _parts: &Parts) -> Option<i32> {
         None
     }
+
+    /// The access token's session id (ziee's `sid` claim — the id of the
+    /// session row that is the home of that session's revocation epoch), read
+    /// from the request parts. Used by [`crate::sync::sync_routes`] so the
+    /// periodic re-check of an ALREADY-OPEN SSE stream can compare the token's
+    /// epoch against THAT SESSION's live epoch rather than a per-user scalar:
+    /// a single session ended or re-epoched alone (sign-out on one terminal,
+    /// idle-lock) then closes that session's streams within one re-check tick,
+    /// without touching the user's other sessions. `None` (the default, an app
+    /// that does not implement the seam, or a token minted before the session
+    /// record existed) → the re-check is handed `session_id: None` and applies
+    /// its prior, session-less epoch gate — exactly the prior behavior.
+    fn access_token_session_id(&self, _parts: &Parts) -> Option<uuid::Uuid> {
+        None
+    }
 }

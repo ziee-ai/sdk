@@ -95,9 +95,17 @@ where
 ///      [`assert_session_epoch_current`] for a `sid` token, or the
 ///      `get_by_id_with_token_version` folded read for a legacy `sid`-less one.
 ///
-/// The only other `validate_access_token` callers read `exp` solely for a
-/// stream deadline and their routes are gated by `RequirePermissions`, i.e. by
-/// (2).
+/// A THIRD reader re-checks an ALREADY-OPEN stream: the framework sync
+/// route's periodic `SyncSurface::recheck`, handed the `ver` and `sid` its
+/// token carried at subscribe (`IdentityResolver::access_token_ver` /
+/// `access_token_session_id`). For a `sid` token it must read the session row
+/// like (1) and (2) (absent/ended/mismatch → tear the stream down; a DB error
+/// → keep it and retry), else `verify_token_version` against
+/// `users.token_version`.
+///
+/// Every other `validate_access_token` caller reads `exp`, `ver` or `sid` solely
+/// to bound or re-check a stream whose route is gated by `RequirePermissions`,
+/// i.e. by (2).
 pub fn verify_token_version(
     claims_ver: Option<i32>,
     db_version: i32,

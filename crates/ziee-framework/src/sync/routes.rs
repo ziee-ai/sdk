@@ -120,21 +120,38 @@ pub trait SyncSurface: Send + Sync + 'static {
     ///
     /// `token_ver` is the epoch snapshot the connection's access token carried at
     /// subscribe time ([`IdentityResolver::access_token_ver`]); the impl compares
-    /// it against the live `users.token_version` and tears down on a mismatch, so
-    /// a logout ends an already-open stream instead of letting it live to the
-    /// token's `exp`. `None` → no epoch gate (a pre-epoch token / an app that
-    /// doesn't implement the seam).
-    async fn recheck(user_id: Uuid, token_ver: Option<i32>) -> RecheckOutcome<Self::Principal>;
+    /// it against the live epoch and tears down on a mismatch, so a logout ends
+    /// an already-open stream instead of letting it live to the token's `exp`.
+    /// `None` → no epoch gate (a pre-epoch token / an app that doesn't implement
+    /// the seam).
+    ///
+    /// `session_id` is the session the token names, captured at subscribe time
+    /// ([`IdentityResolver::access_token_session_id`]). This re-check is the
+    /// THIRD epoch reader beside the two request gates, and for a token that
+    /// names its session it must read the epoch where they do — the SESSION
+    /// ROW (absent / ended / epoch mismatch → [`RecheckOutcome::TearDown`]), so
+    /// a session ended or re-epoched alone closes its open streams within one
+    /// tick while the user's other sessions keep theirs. A DB error on that
+    /// read is [`RecheckOutcome::Transient`], never a teardown. `None` (a
+    /// session-less token, or an app that doesn't implement the seam) → the
+    /// impl's prior session-less gate (e.g. the per-user epoch), unchanged.
+    async fn recheck(
+        user_id: Uuid,
+        session_id: Option<Uuid>,
+        token_ver: Option<i32>,
+    ) -> RecheckOutcome<Self::Principal>;
 }
 
 /// Extractor yielding the access token's unix `exp` (bounding the SSE stream
-/// deadline) AND its revocation epoch `ver` (the periodic re-check's logout
-/// gate), or `None` for each absent value. Pulls the app-installed
-/// [`IdentityResolver`] out of the request extensions and delegates to
-/// [`IdentityResolver::access_token_exp`] / [`IdentityResolver::access_token_ver`];
-/// a missing resolver → `(None, None)` (the stream falls back to the far-future
-/// deadline with no epoch gate, never a hard rejection).
-struct AccessTokenBounds<R>(Option<i64>, Option<i32>, PhantomData<R>);
+/// deadline), its revocation epoch `ver` AND its session id `sid` (the periodic
+/// re-check's logout gate), or `None` for each absent value. Pulls the
+/// app-installed [`IdentityResolver`] out of the request extensions and
+/// delegates to [`IdentityResolver::access_token_exp`] /
+/// [`IdentityResolver::access_token_ver`] /
+/// [`IdentityResolver::access_token_session_id`]; a missing resolver →
+/// `(None, None, None)` (the stream falls back to the far-future deadline with
+/// no epoch gate, never a hard rejection).
+struct AccessTokenBounds<R>(Option<i64>, Option<i32>, Option<Uuid>, PhantomData<R>);
 
 /// Contributes nothing to the OpenAPI operation (it reads the `Authorization`
 /// header the auth extractor already documents), so its `OperationInput` is the
@@ -152,7 +169,10 @@ impl<R: IdentityResolver> FromRequestParts<()> for AccessTokenBounds<R> {
             let resolver = parts.extensions.get::<Arc<R>>().cloned();
             let exp = resolver.as_ref().and_then(|r| r.access_token_exp(parts));
             let ver = resolver.as_ref().and_then(|r| r.access_token_ver(parts));
-            Ok(Self(exp, ver, PhantomData))
+            let sid = resolver
+                .as_ref()
+                .and_then(|r| r.access_token_session_id(parts));
+            Ok(Self(exp, ver, sid, PhantomData))
         }
     }
 }
@@ -176,6 +196,10 @@ where
     // logout (which bumps the live epoch) ends this already-open stream instead
     // of letting it live to `exp`.
     let token_ver = bounds.1;
+    // The session the token names: the re-check reads THAT session's epoch, so
+    // ending or re-epoching one session closes its streams without touching
+    // the user's other sessions.
+    let session_id = bounds.2;
 
     let conn_id = Uuid::new_v4();
     let (tx, mut rx) =
@@ -248,7 +272,7 @@ where
                     // otherwise refresh the snapshot used to route
                     // Permission-audience events (so a user who loses an admin
                     // perm stops receiving its events).
-                    match S::recheck(user_id, token_ver).await {
+                    match S::recheck(user_id, session_id, token_ver).await {
                         RecheckOutcome::Refresh(principal) => {
                             S::registry().refresh(conn_id, principal);
                         }

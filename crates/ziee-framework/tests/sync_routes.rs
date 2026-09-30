@@ -186,7 +186,11 @@ impl SyncSurface for TestSurface {
         Event::default().event("connected").data(conn_id.to_string())
     }
 
-    async fn recheck(_user_id: Uuid, _token_ver: Option<i32>) -> RecheckOutcome<TestPrincipal> {
+    async fn recheck(
+        _user_id: Uuid,
+        _session_id: Option<Uuid>,
+        _token_ver: Option<i32>,
+    ) -> RecheckOutcome<TestPrincipal> {
         RecheckOutcome::Transient
     }
 }
@@ -355,7 +359,11 @@ macro_rules! isolated_surface {
             fn connected_signal(conn_id: Uuid) -> Event {
                 Event::default().event("connected").data(conn_id.to_string())
             }
-            async fn recheck(_user_id: Uuid, _tv: Option<i32>) -> RecheckOutcome<TestPrincipal> {
+            async fn recheck(
+                _user_id: Uuid,
+                _sid: Option<Uuid>,
+                _tv: Option<i32>,
+            ) -> RecheckOutcome<TestPrincipal> {
                 RecheckOutcome::Transient
             }
         }
