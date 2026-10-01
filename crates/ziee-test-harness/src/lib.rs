@@ -784,10 +784,29 @@ fn spawn_harness_child(cmd: &mut Command) -> std::io::Result<Child> {
 /// `getppid()` against it before AND after the `prctl` call, and `_exit(1)`s
 /// the child immediately if the parent is already gone.
 #[cfg(target_os = "linux")]
-fn arm_child_pdeathsig(_cmd: &mut Command) {
-    // TEMPORARY RED-PROOF (revert me): the prctl arm is REMOVED to prove the
-    // pdeathsig test fails without it.
-    let _ = _cmd;
+fn arm_child_pdeathsig(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // Captured in THIS process before `fork`: the pid the child's `getppid()`
+    // must equal right after the fork.
+    let parent_pid = unsafe { libc::getpid() };
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
+            }
+            // SAFETY: prctl with a plain signal-number argument (no pointers)
+            // is always safe to call.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                libc::_exit(1);
+            }
+            // Parent could have died between the getppid above and this
+            // prctl; a signal armed for a dead parent never arrives.
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Non-Linux: the guarantee has no portable equivalent, and the harness's own
