@@ -726,6 +726,94 @@ impl Drop for SpawnedServer {
     }
 }
 
+/// The harness's single spawn path for a child process: apply the
+/// death-with-parent guarantee, then spawn. `TestHarness::start` and the
+/// pdeathsig integration test both go through this one function, so the
+/// guarantee can never be present in one and absent from the other.
+fn spawn_harness_child(cmd: &mut Command) -> std::io::Result<Child> {
+    #[cfg(target_os = "linux")]
+    arm_child_pdeathsig(cmd);
+    cmd.spawn()
+}
+
+/// Linux: make the about-to-be-spawned child die with this process.
+///
+/// Arms `prctl(PR_SET_PDEATHSIG, SIGKILL)` inside a [`CommandExt::pre_exec`]
+/// hook, which runs in the child between `fork()` and `exec()` — before any
+/// app code, so no consumer needs an env-var gate or a startup-line call (the
+/// old app-side workaround `arm_die_with_parent_if_requested` / env var can be
+/// deleted).
+///
+/// ## Async-signal-safety caveat
+///
+/// A `pre_exec` hook may only call async-signal-safe functions: between
+/// `fork` and `exec` the child is a bare heap-allocating-free thread with
+/// only this thread alive — no allocation, no locks, no `eprintln`, no
+/// `std::io`. The hook therefore uses exactly `libc::prctl`, `libc::getppid`
+/// and `libc::_exit` and nothing else. (A `CommandExt::try_pre_exec` hook
+/// returning `Err` would make `spawn()` fail in the parent, but building that
+/// error object allocates — so failures here `_exit(1)` the child instead,
+/// and the harness's readiness poll surfaces the dead child as a boot
+/// timeout.)
+///
+/// ## The caveat about THREAD vs process, and why it is acceptable
+///
+/// `PR_SET_PDEATHSIG` fires when the THREAD that created the child exits —
+/// not when the whole PROCESS exits. A process whose spawning thread happens
+/// to exit while the process lives would kill its test server early. For a
+/// test server that is acceptable, and here is why its lifetime is already
+/// bounded by the test: `SpawnedServer::drop` kills and reaps the child when
+/// the test body ends, and the harness process's threads live exactly as long
+/// as the tokio runtime the test runs on (`#[tokio::test]` takes the runtime
+/// down — and its worker threads with it — when the test returns). The one
+/// case this mechanism is for — a SIGKILLed test RUNNER, a killed merge gate,
+/// an OOM kill, a binary timeout: paths where no `Drop` can ever run — is
+/// precisely the case where every thread of the runner exits, so the
+/// thread-death and process-death definitions coincide. When the thread
+/// outlives the test's need for the server, the server is already being
+/// reaped by the same event that killed the thread. The alternative —
+/// relying on `Drop` alone — is exactly the 110-orphans incident this
+/// prevents (orphans reparented to PID 1, holding ports and DB connections
+/// and spinning the box to load 424).
+///
+/// ## The parent-already-dead race
+///
+/// `prctl` arms a signal for a FUTURE parent death only — a parent that died
+/// between this child's `fork` and the `prctl` call would never deliver it.
+/// The hook therefore captures the parent pid BEFORE spawning, compares
+/// `getppid()` against it before AND after the `prctl` call, and `_exit(1)`s
+/// the child immediately if the parent is already gone.
+#[cfg(target_os = "linux")]
+fn arm_child_pdeathsig(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // Captured in THIS process before `fork`: the pid the child's `getppid()`
+    // must equal right after the fork.
+    let parent_pid = unsafe { libc::getpid() };
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
+            }
+            // SAFETY: prctl with a plain signal-number argument (no pointers)
+            // is always safe to call.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                libc::_exit(1);
+            }
+            // Parent could have died between the getppid above and this
+            // prctl; a signal armed for a dead parent never arrives.
+            if libc::getppid() != parent_pid {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Non-Linux: the guarantee has no portable equivalent, and the harness's own
+/// `SpawnedServer::drop` still reaps the child on every clean exit.
+#[cfg(not(target_os = "linux"))]
+fn arm_child_pdeathsig(_cmd: &mut Command) {}
+
 /// The harness: an installed [`HarnessApp`] impl + the consumer's `manifest_dir`
 /// + the compile-context [`Variant`]. Construct once per test binary (a
 /// `OnceLock` in the consumer's shim) and call [`TestHarness::start`] per test.
@@ -862,7 +950,7 @@ impl<A: HarnessApp> TestHarness<A> {
         for (k, v) in &plan.extra_env {
             cmd.env(k, v);
         }
-        let child = cmd.spawn().expect("Failed to start test server");
+        let child = spawn_harness_child(&mut cmd).expect("Failed to start test server");
 
         let base_url = format!("http://127.0.0.1:{}", server_port);
         let test_database_url = format!(
@@ -947,5 +1035,142 @@ mod tests {
         ] {
             assert!(!is_engine_test_db_name(hostile), "admitted {hostile:?}");
         }
+    }
+
+    // ---- death-with-parent (GAP: no PR_SET_PDEATHSIG on spawn) ----
+
+    /// Env gate for the stand-in "test runner" re-invocation (see
+    /// [`pdeathsig_helper_stand_in`]). Set only by
+    /// [`spawned_child_dies_when_parent_is_sigkilled`].
+    const PDEATHSIG_HELPER_ENV: &str = "ZIEE_TEST_PDEATHSIG_HELPER";
+    /// The stand-in writes the spawned child's pid to the file in this env var
+    /// (the outer test polls it — so it never has to parse libtest-captured
+    /// stdout).
+    const PDEATHSIG_PID_FILE_ENV: &str = "ZIEE_TEST_PDEATHSIG_PID_FILE";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pdeathsig_helper_stand_in() {
+        if env::var(PDEATHSIG_HELPER_ENV).as_deref() != Ok("1") {
+            // A plain `cargo test` run MUST see this test do nothing.
+            return;
+        }
+        let pid_file = PathBuf::from(
+            env::var(PDEATHSIG_PID_FILE_ENV).expect("pdeathsig helper: pid file env"),
+        );
+        // `exec` makes the single direct child BE the `sleep` process, so the
+        // pid we record and the process the pdeathsig guarantee kills are the
+        // same thing.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("exec sleep 120");
+        // THE HARNESS SPAWN PATH: this is exactly what `TestHarness::start`
+        // calls for a real test server.
+        let child = spawn_harness_child(&mut cmd).expect("spawn long-sleeping child");
+        fs::write(&pid_file, child.id().to_string()).expect("write child pid");
+        // Park until the outer test SIGKILLs this process. Unreachable by the
+        // outer test except via the kill — deliberately no Drop-guard here:
+        // this process IS the stand-in for the crash path.
+        std::thread::sleep(Duration::from_secs(120));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawned_child_dies_when_parent_is_sigkilled() {
+        use std::process::Stdio;
+
+        /// Kill the stand-in runner AND, if it survived, the orphaned child on
+        /// every exit path (green AND red) so a failing run leaks nothing.
+        struct Cleanup {
+            runner: Option<Child>,
+            child_pid: Option<libc::pid_t>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(child_pid) = self.child_pid {
+                    unsafe { libc::kill(child_pid, libc::SIGKILL) };
+                }
+                if let Some(mut runner) = self.runner.take() {
+                    unsafe { libc::kill(runner.id() as libc::pid_t, libc::SIGKILL) };
+                    let _ = runner.wait();
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir for pid file");
+        let pid_file = dir.path().join("child.pid");
+        let exe = std::env::current_exe().expect("current test exe");
+
+        // The stand-in "test runner": this SAME test binary, filtered down to
+        // the helper test (fresh process, acting as the runner that would
+        // otherwise die without ever running a `Drop`).
+        let runner = Command::new(&exe)
+            .arg("--exact")
+            .arg("tests::pdeathsig_helper_stand_in")
+            .arg("--nocapture")
+            .env(PDEATHSIG_HELPER_ENV, "1")
+            .env(PDEATHSIG_PID_FILE_ENV, &pid_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn stand-in test runner");
+        let mut cleanup = Cleanup {
+            runner: Some(runner),
+            child_pid: None,
+        };
+
+        // Wait for the stand-in to spawn its long-sleeping child and report
+        // the pid. 30s is generous: the alternative to polling is parsing
+        // libtest output, which captures on success.
+        let report_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let child_pid = loop {
+            if let Ok(s) = fs::read_to_string(&pid_file) {
+                if let Ok(pid) = s.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < report_deadline,
+                "stand-in runner never reported a child pid"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        cleanup.child_pid = Some(child_pid);
+        assert!(child_pid > 1, "implausible child pid {child_pid}");
+
+        // SIGKILL the stand-in runner — the exact path a killed merge gate /
+        // OOM kill / operator `kill -9` takes, where Rust destructors never
+        // run. The spawned server must die with it.
+        let runner_pid = cleanup
+            .runner
+            .as_ref()
+            .expect("runner still owned")
+            .id() as libc::pid_t;
+        assert_eq!(
+            unsafe { libc::kill(runner_pid, libc::SIGKILL) },
+            0,
+            "kill stand-in runner"
+        );
+        // Reap our direct child (we own it; without `wait` it would zombie).
+        let mut runner = cleanup.runner.take().expect("runner still owned");
+        let _ = runner.wait();
+
+        // The spawned server must disappear within a few seconds. `kill(pid,0)`
+        // returns ESRCH only once the process is gone (killed AND reaped by its
+        // new parent), so a mere zombie does not count.
+        let gone_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut gone = false;
+        while std::time::Instant::now() < gone_deadline {
+            let r = unsafe { libc::kill(child_pid, 0) };
+            if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(
+            gone,
+            "spawned child {child_pid} still alive 10s after its test-runner \
+             parent was SIGKILLed — PR_SET_PDEATHSIG is not armed on spawn"
+        );
     }
 }
