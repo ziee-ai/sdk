@@ -580,49 +580,6 @@ async fn ensure_test_template<A: HarnessApp>(
                 .await
                 .expect("connect postgres to build test template");
 
-            // TEMPORARY RED-PROOF (revert me): restore the OLD
-            // drop-and-rebuild-in-place behaviour — terminate every backend on
-            // the final template name, DROP it, CREATE it, migrate it — to
-            // prove the concurrency test fails with it.
-            let old_term = format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{template_db}' AND pid <> pg_backend_pid()"
-            );
-            let _ = sqlx::query(&old_term).execute(&admin).await;
-            let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {template_db}"))
-                .execute(&admin)
-                .await;
-            sqlx::query(&format!("CREATE DATABASE {template_db}"))
-                .execute(&admin)
-                .await
-                .expect("create test template database (old behaviour)");
-            admin.close().await;
-            let mut old_tmpl = url::Url::parse(admin_url).expect("admin url");
-            old_tmpl.set_path(&template_db);
-            let old_tmpl_pool = PgPoolOptions::new()
-                .max_connections(1)
-                .connect(old_tmpl.as_str())
-                .await
-                .expect("connect template database (old behaviour)");
-            for dir in app.migration_dirs(variant, manifest_dir) {
-                let mut migrator = sqlx::migrate::Migrator::new(dir.clone())
-                    .await
-                    .unwrap_or_else(|e| panic!("create migrator for {}: {e}", dir.display()));
-                migrator.set_ignore_missing(true);
-                migrator
-                    .run(&old_tmpl_pool)
-                    .await
-                    .unwrap_or_else(|e| panic!("migrate test template from {}: {e}", dir.display()));
-            }
-            old_tmpl_pool.close().await;
-            let old_admin2 = PgPoolOptions::new()
-                .max_connections(1)
-                .connect(admin_url)
-                .await
-                .expect("connect postgres to quiesce template (old behaviour)");
-            let _ = sqlx::query(&old_term).execute(&old_admin2).await;
-            old_admin2.close().await;
-            return template_db;
-
             // Fast path: a sibling process already built this exact template.
             // No lock needed — the name is content-addressed, so this is only
             // ever the complete build of the same migration set.
