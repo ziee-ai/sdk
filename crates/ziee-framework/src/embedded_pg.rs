@@ -22,13 +22,16 @@
 use postgresql_embedded::{PostgreSQL, Settings, VersionReq};
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
+use std::collections::hash_map::RandomState;
 use std::future::Future;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::OnceCell;
 use ziee_core::config::PostgreSqlConfig;
 
@@ -139,6 +142,69 @@ fn stop_existing_postgres_instance(
     Ok(())
 }
 
+/// Full-jitter exponential backoff — the "Full Jitter" algorithm from the AWS
+/// Architecture Blog's "Exponential Backoff And Jitter".
+///
+/// The returned delay is drawn uniformly from `[0, current_cap)` where the
+/// current cap is `min(cap, base * 2^attempt)`: the cap grows exponentially
+/// with the attempt number and stays bounded by `cap`, and the actual sleep is
+/// a RANDOM point in that range rather than the capped value itself. `cap`
+/// unchanged and `base` unchanged ⇒ the maximum total wait of a retry loop is
+/// byte-identical to the old fixed schedule (each fixed sleep is replaced by a
+/// sleep of at most the same length), so callers keep their attempt counts and
+/// their total-time bounds while the delays are no longer identical across
+/// processes.
+///
+/// `unit_rand` is the caller's `[0, 1)` draw, passed in (rather than drawing
+/// inside) so the schedule's SHAPE — the exponential growth + the cap — is
+/// unit-testable without flakiness. The real call sites pass [`unit_random`].
+fn full_jitter_delay(
+    attempt: u32,
+    base: std::time::Duration,
+    cap: std::time::Duration,
+    unit_rand: f64,
+) -> std::time::Duration {
+    // A caller bug (e.g. a draw slightly outside [0,1) from float rounding)
+    // clamps, never panics and never produces a negative/overflowing delay.
+    let unit_rand = unit_rand.clamp(0.0, 1.0);
+    // `.min(60)` guards the shift against overflow: 2^60 * base is already far
+    // past any cap used here, so clamping the exponent this low never changes
+    // the result. saturating_mul against as_millis keeps a huge base/cap pair
+    // from panicking too.
+    let exp_millis = base.as_millis().saturating_mul(1u128 << attempt.min(60));
+    let current_cap_millis = exp_millis.min(cap.as_millis());
+    let jittered_millis = (unit_rand * current_cap_millis as f64) as u64;
+    std::time::Duration::from_millis(jittered_millis)
+}
+
+/// Per-process seed for [`unit_random`]: `RandomState::new` draws its hasher
+/// keys from OS randomness once per process, so two processes booting at the
+/// same instant get DIFFERENT jitter streams — the property that breaks the
+/// lockstep-retry resonance. (`RandomState` is std, so the SDK needs no new
+/// dependency; there is no `rand` in this crate's `Cargo.toml`.)
+static JITTER_STATE: OnceLock<RandomState> = OnceLock::new();
+
+/// Monotonic per-call counter mixed into every draw: without it, two calls in
+/// one process with identical `attempt` values would hash to the same output
+/// and produce the same "random" delay.
+static JITTER_CALL: AtomicU64 = AtomicU64::new(0);
+
+/// Draw a uniformly distributed `f64` in `[0, 1)` with no new dependency.
+///
+/// Hashes the per-call counter under `RandomState`'s per-process keys and
+/// takes the top 53 bits as the significand — the standard trick for a uniform
+/// double (all 2^53 values are exactly representable, so the draw is uniform
+/// to the precision the result is used at). A fast path, not a CSPRNG: jitter
+/// only needs to desynchronize retry waves, not be unpredictable.
+fn unit_random() -> f64 {
+    let state = JITTER_STATE.get_or_init(RandomState::new);
+    let call = JITTER_CALL.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = state.build_hasher();
+    call.hash(&mut hasher);
+    let bits = hasher.finish();
+    (bits >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+}
+
 /// Initialize (once) the process-wide database pool: bring up embedded Postgres
 /// or connect externally, run `migrator`, and cache the pool. `pg` /
 /// `external_url` come from the app's `ServerConfig`; `pg_ctl_version` is the
@@ -154,9 +220,13 @@ pub async fn initialize_database(
 
     let pool = DATABASE_POOL
         .get_or_try_init(|| async move {
-            // Retry logic for database initialization
+            // Retry logic for database initialization.
             let max_retries = 5;
-            let retry_delay = std::time::Duration::from_secs(3);
+            // Base == cap (3s): each delay is a full-jitter draw in [0, 3s) —
+            // the same worst-case 12s of sleep across the 5 attempts as the
+            // old fixed 3s sleeps, but randomized so N processes that boot
+            // together do not retry in lockstep ("thundering herd").
+            let retry_schedule = std::time::Duration::from_secs(3);
 
             for attempt in 1..=max_retries {
                 println!(
@@ -179,8 +249,17 @@ pub async fn initialize_database(
                     Err(e) => {
                         eprintln!("Database initialization attempt {} failed: {}", attempt, e);
                         if attempt < max_retries {
-                            println!("Waiting {} seconds before retry...", retry_delay.as_secs());
-                            tokio::time::sleep(retry_delay).await;
+                            let delay = full_jitter_delay(
+                                attempt - 1,
+                                retry_schedule,
+                                retry_schedule,
+                                unit_random(),
+                            );
+                            println!(
+                                "Waiting {} before retry (full-jitter: uniformly in [0, 3s))...",
+                                delay.as_secs_f64()
+                            );
+                            tokio::time::sleep(delay).await;
                         } else {
                             return Err(format!(
                                 "Failed to initialize database after {} attempts: {}",
@@ -450,8 +529,18 @@ async fn connect_with_retry(
             }
         }
 
-        // Wait before retrying (exponential backoff)
-        let delay = Duration::from_millis(100 * (1 << (retry_count - 1).min(6))); // Cap at ~6.4 seconds
+        // Wait before retrying — full-jitter exponential backoff. The cap
+        // grows exactly like the old deterministic schedule (100, 200, 400, …
+        // up to 6400 ms), so the max total wait across the 10 attempts is
+        // unchanged; the sleep itself is now uniform in [0, cap), so many
+        // processes that hit the same cap at the same time retry at random
+        // offsets instead of in synchronized waves.
+        let delay = full_jitter_delay(
+            retry_count - 1,
+            Duration::from_millis(100),
+            Duration::from_millis(6400),
+            unit_random(),
+        );
         println!("Waiting {:?} before retry...", delay);
         tokio::time::sleep(delay).await;
     }
@@ -559,6 +648,7 @@ static _CLEANUP: std::sync::LazyLock<DatabaseCleanup> =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     /// The Postgres binary version used for the versioned `pg_ctl` path in
     /// tests — mirrors ziee's `ZIEE_POSTGRES_VERSION` build env (the SDK
@@ -649,5 +739,91 @@ mod tests {
             .join("bin")
             .join(pg_ctl_exe);
         assert!(!expected.exists());
+    }
+
+    // ---- full-jitter backoff (GAP: db-init retry had no jitter) ----
+
+    /// The inner connect loop's schedule: base 100 ms, cap ~6.4 s.
+    const INNER_BASE: Duration = Duration::from_millis(100);
+    const INNER_CAP: Duration = Duration::from_millis(6400);
+
+    #[test]
+    fn full_jitter_delay_is_within_zero_and_current_cap() {
+        // At every attempt the delay is uniform in [0, current cap): pinning
+        // the unit draw to 0.0 and 1.0 pins both inclusive bounds, and a
+        // mid-range draw must land inside them (never above the cap).
+        for attempt in 0..64u32 {
+            let max_millis = (100u128 << attempt.min(60)).min(6400);
+            assert_eq!(
+                full_jitter_delay(attempt, INNER_BASE, INNER_CAP, 0.0),
+                Duration::ZERO,
+                "attempt {attempt}"
+            );
+            let mid = full_jitter_delay(attempt, INNER_BASE, INNER_CAP, 0.5);
+            assert!(mid <= Duration::from_millis(max_millis as u64), "attempt {attempt}: {mid:?} > {max_millis}ms");
+            assert_eq!(
+                full_jitter_delay(attempt, INNER_BASE, INNER_CAP, 1.0),
+                Duration::from_millis(max_millis as u64),
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_jitter_cap_grows_exponentially_and_stays_bounded() {
+        // The 10-attempt schedule replaced by this function had caps
+        // 100,200,400,800,1600,3200,6400 ms (then flat). With the draw pinned
+        // at 1.0 the result IS the (uncapped) envelope, so this pins the
+        // growth curve AND the bound.
+        let expected = [100u64, 200, 400, 800, 1600, 3200, 6400, 6400, 6400, 6400];
+        for (attempt, &exp) in expected.iter().enumerate() {
+            assert_eq!(
+                full_jitter_delay(attempt as u32, INNER_BASE, INNER_CAP, 1.0),
+                Duration::from_millis(exp),
+                "attempt {attempt}"
+            );
+        }
+        // Far past the cap (and the shift guard's clamp) it must still be the
+        // cap — never larger, never overflowing.
+        for attempt in [10u32, 32, 60, u32::MAX] {
+            assert_eq!(
+                full_jitter_delay(attempt, INNER_BASE, INNER_CAP, 1.0),
+                INNER_CAP,
+                "attempt {attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_jitter_delay_clamps_out_of_range_draws() {
+        // A caller bug (e.g. float rounding slightly outside [0,1)) must clamp,
+        // not panic or produce a negative/overflowing delay.
+        let d_neg = full_jitter_delay(4, INNER_BASE, INNER_CAP, -0.5);
+        let d_over = full_jitter_delay(4, INNER_BASE, INNER_CAP, 1.5);
+        assert_eq!(d_neg, Duration::ZERO);
+        assert_eq!(d_over, full_jitter_delay(4, INNER_BASE, INNER_CAP, 1.0));
+    }
+
+    #[test]
+    fn unit_random_is_uniform_stride_and_stays_in_unit_interval() {
+        for _ in 0..256 {
+            let d = unit_random();
+            assert!((0.0..1.0).contains(&d), "draw {d} escaped [0,1)");
+        }
+    }
+
+    #[test]
+    fn two_consecutive_draws_do_not_always_return_the_same_value() {
+        // The whole point of jitter: repeated calls must not be a constant.
+        // With the per-call counter feeding RandomState's per-process keys,
+        // all-identical draws over 256 calls has probability ~2^-256·… —
+        // effectively never, so this cannot flake while still killing the
+        // mutation "return a constant 0.0" / "drop the counter".
+        let draws: Vec<f64> = (0..256).map(|_| unit_random()).collect();
+        assert!(
+            draws.iter().any(|&d| d != draws[0]),
+            "all 256 successive draws were identical ({})",
+            draws[0]
+        );
     }
 }
