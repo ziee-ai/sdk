@@ -238,7 +238,7 @@ pub fn make_isolated_data_dir(manifest_dir: &Path) -> PerTestDataDir {
 // and making DB setup dramatically faster (a byte-copy vs replaying every
 // migration per test).
 
-static TEST_TEMPLATE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+static TEST_TEMPLATE: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
 /// Prefix of every per-test database this engine creates. The ONE literal — the
 /// creator ([`TestHarness::start`]), the reaper ([`SpawnedServer::drop`]) and the
@@ -436,26 +436,126 @@ async fn sweep_stale_test_dbs_once(admin_url: &str) {
     sweep_stale_test_dbs(admin_url, min_age).await;
 }
 
+/// FNV-1a over the migration-set CONTENT (stable across processes, platforms
+/// and rebuilds — deliberately not `DefaultHasher`, whose algorithm is allowed
+/// to change between std releases). Hashes, in application order, each
+/// migration FILE's name and contents: a schema change anywhere in the set
+/// yields a different hash, and therefore a different template name.
+fn migration_content_hash<A: HarnessApp>(app: &A, variant: Variant, manifest_dir: &Path) -> String {
+    fn feed(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (dir_idx, dir) in app
+        .migration_dirs(variant, manifest_dir)
+        .iter()
+        .enumerate()
+    {
+        feed(&mut hash, &dir_idx.to_le_bytes());
+        let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read migration dir {}: {e}", dir.display()))
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().is_file()
+                    && e.path().extension().and_then(|x| x.to_str()) == Some("sql")
+            })
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .collect();
+        // sqlx applies migration files in file-name order; hash in that same
+        // order so a rename that changes application order changes the hash.
+        files.sort();
+        for (name, path) in files {
+            feed(&mut hash, name.as_bytes());
+            feed(
+                &mut hash,
+                &std::fs::read(&path)
+                    .unwrap_or_else(|e| panic!("read migration {}: {e}", path.display())),
+            );
+        }
+    }
+    format!("{:012x}", hash)
+}
+
 /// The fully-migrated TEMPLATE database name = the app's per-variant base +
-/// the per-worktree suffix.
-fn test_template_db<A: HarnessApp>(app: &A, variant: Variant, manifest_dir: &Path) -> String {
+/// the per-worktree suffix + a hash of the migration-set CONTENT.
+///
+/// The content hash is load-bearing: a schema change produces a DIFFERENT
+/// name, so a new process builds its fresh template under the new name instead
+/// of terminating/dropping the template an older process's tests are still
+/// cloning from (the old name is simply left in place — it is never reused,
+/// and it is never dropped by a newer build, because it cannot be a template
+/// the newer build's clones use).
+fn test_template_db<A: HarnessApp>(
+    app: &A,
+    variant: Variant,
+    manifest_dir: &Path,
+    content_hash: &str,
+) -> String {
     format!(
-        "{}{}",
+        "{}{}_{}",
         app.template_db_base(variant),
-        worktree_suffix(manifest_dir)
+        worktree_suffix(manifest_dir),
+        content_hash
     )
 }
 
-/// Build the migrated template DB exactly once per process (the OnceCell makes
-/// every concurrent test await the single build before any of them clone). The
-/// template must have NO active connections when a clone runs, so we close our
-/// pools and terminate any stragglers before returning.
+/// Advisory-lock key for one template name: FNV-1a reinterpreted as i64. The
+/// lockspace is keyed on the FULL name (base + worktree suffix + content
+/// hash), so builders of different templates never contend with each other.
+fn template_advisory_key(name: &str) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash as i64
+}
+
+/// True when a database with this exact name exists.
+///
+/// Safe to treat "exists" as "completely built": the name embeds the
+/// migration-content hash, and a build is published under the final name only
+/// by `ALTER DATABASE ... RENAME` AFTER every migration completed (builds
+/// happen under a random temporary name). So an existing final name is always
+/// a complete, quiesced template — never a half-built one.
+async fn template_database_exists(admin: &sqlx::PgPool, name: &str) -> bool {
+    sqlx::query("SELECT 1 FROM pg_database WHERE datname = $1")
+        .bind(name)
+        .fetch_optional(admin)
+        .await
+        .expect("query pg_database for template")
+        .is_some()
+}
+
+/// Ensure a fully-migrated TEMPLATE database for this app/variant/worktree
+/// exists, and return its name.
+///
+/// Within ONE process the [`TEST_TEMPLATE`] OnceCell makes every concurrent
+/// test await the single build before any of them clone. Between PROCESSES the
+/// coordination is a Postgres advisory lock keyed on the template name: the
+/// first process to arrive builds it (under a random temporary name, renamed
+/// into place only after every migration completed and every pool closed), and
+/// every concurrent process blocks on the lock, then re-checks and reuses the
+/// template the winner published. No process ever terminates or drops a
+/// template another process may be cloning — the old
+/// terminate-backends + DROP + CREATE-at-the-final-name rebuild-in-place is
+/// gone, which is what made a second process in a worktree delete the template
+/// out from under the first process's clones (`template database ... does not
+/// exist`).
+///
+/// The template must have NO active connections when a clone runs, so the
+/// builder closes its migration pool and terminates any stragglers on the
+/// temporary name BEFORE it is renamed into place.
 async fn ensure_test_template<A: HarnessApp>(
     admin_url: &str,
     app: &A,
     variant: Variant,
     manifest_dir: &Path,
-) {
+) -> String {
     TEST_TEMPLATE
         .get_or_init(|| async {
             // Reclaim the orphans no `Drop` could have reaped (abort/SIGKILL/OOM/
@@ -467,25 +567,86 @@ async fn ensure_test_template<A: HarnessApp>(
             // row. Runs here rather than in `start` so it is once per PROCESS.
             data_dir::sweep_stale_test_data_dirs_once();
 
+            let template_db = test_template_db(
+                app,
+                variant,
+                manifest_dir,
+                &migration_content_hash(app, variant, manifest_dir),
+            );
+
             let admin = PgPoolOptions::new()
                 .max_connections(1)
                 .connect(admin_url)
                 .await
                 .expect("connect postgres to build test template");
-            let template_db = test_template_db(app, variant, manifest_dir);
-            let term = format!(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{template_db}' AND pid <> pg_backend_pid()"
-            );
-            let _ = sqlx::query(&term).execute(&admin).await;
-            // Rebuild fresh each process so migration changes are picked up.
-            let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {template_db}"))
+
+            // Fast path: a sibling process already built this exact template.
+            // No lock needed — the name is content-addressed, so this is only
+            // ever the complete build of the same migration set.
+            if template_database_exists(&admin, &template_db).await {
+                admin.close().await;
+                return template_db;
+            }
+
+            // Session-scoped advisory lock: serializes the BUILD across
+            // processes (the OnceCell only serializes within one process). The
+            // pool below keeps exactly one connection, so the lock survives
+            // every statement until we explicitly unlock / close the pool.
+            let lock_key = template_advisory_key(&template_db);
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(lock_key)
                 .execute(&admin)
-                .await;
-            sqlx::query(&format!("CREATE DATABASE {template_db}"))
+                .await
+                .expect("acquire template-build advisory lock");
+
+            // Re-check AFTER taking the lock: the process we blocked on may
+            // have published the template while we were waiting.
+            if template_database_exists(&admin, &template_db).await {
+                sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(lock_key)
+                    .execute(&admin)
+                    .await
+                    .expect("release template-build advisory lock");
+                admin.close().await;
+                return template_db;
+            }
+
+            // Build under a random temporary name and rename into place at the
+            // end: a half-built (or mid-migration) template is never visible
+            // under the name clones use, so a clone can never fail with
+            // "template database ... does not exist" because another process
+            // dropped the name out from under it.
+            let build_name = format!(
+                "{template_db}_b{}",
+                &Uuid::new_v4().simple().to_string()[..8]
+            );
+
+            // Clean stale half-built templates from crashed builders. Safe
+            // here: same-template builders are serialized by the lock, so no
+            // `_b*` name can be a LIVE build. The DROP is deliberately plain
+            // (non-FORCE) and allowed to fail — if anything is still attached
+            // (it cannot be, under the lock), Postgres refuses, and refusing
+            // is the correct outcome.
+            let stale: Vec<String> = sqlx::query_scalar(
+                "SELECT datname FROM pg_database WHERE datname LIKE $1",
+            )
+            .bind(format!("{template_db}_b%"))
+            .fetch_all(&admin)
+            .await
+            .expect("enumerate stale half-built templates")
+            .into_iter()
+            .filter(|name: &String| name.starts_with(&format!("{template_db}_b")))
+            .collect();
+            for stale_name in stale {
+                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {stale_name}"))
+                    .execute(&admin)
+                    .await;
+            }
+
+            sqlx::query(&format!("CREATE DATABASE {build_name}"))
                 .execute(&admin)
                 .await
                 .expect("create test template database");
-            admin.close().await;
 
             // Migrate the template at RUNTIME from the on-disk migration dirs.
             // We deliberately do NOT use the compile-time crate-relative
@@ -494,7 +655,7 @@ async fn ensure_test_template<A: HarnessApp>(
             // miss the server's migrations. The runtime Migrator lets a desktop
             // build apply server-then-desktop from the dirs the app supplies.
             let mut tmpl = url::Url::parse(admin_url).expect("admin url");
-            tmpl.set_path(&template_db);
+            tmpl.set_path(&build_name);
             let tmpl_pool = PgPoolOptions::new()
                 .max_connections(1)
                 .connect(tmpl.as_str())
@@ -515,16 +676,37 @@ async fn ensure_test_template<A: HarnessApp>(
             }
             tmpl_pool.close().await;
 
-            // Drop any lingering backend on the template so clones can copy it.
-            let admin2 = PgPoolOptions::new()
-                .max_connections(1)
-                .connect(admin_url)
+            // Quiesce BEFORE the rename: `CREATE DATABASE ... TEMPLATE x`
+            // requires zero live sessions on x, and a session connected to the
+            // temporary name stays connected to the same database after the
+            // rename — so any stragglers must be terminated now, before the
+            // final name exists.
+            let _ = sqlx::query(&format!(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                  WHERE datname = '{build_name}' AND pid <> pg_backend_pid()"
+            ))
+            .execute(&admin)
+            .await;
+
+            // Publish — atomic rename: from this instant the final name names a
+            // COMPLETE, quiesced template. No clone can observe a half-built
+            // one, and no later process can validly see the name missing.
+            sqlx::query(&format!("ALTER DATABASE {build_name} RENAME TO {template_db}"))
+                .execute(&admin)
                 .await
-                .expect("connect postgres to quiesce template");
-            let _ = sqlx::query(&term).execute(&admin2).await;
-            admin2.close().await;
+                .expect("rename built test template into place");
+
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(lock_key)
+                .execute(&admin)
+                .await
+                .expect("release template-build advisory lock");
+            admin.close().await;
+
+            template_db
         })
-        .await;
+        .await
+        .clone()
 }
 
 /// A running test server: a spawned app process bound to a fresh per-test DB.
@@ -883,9 +1065,12 @@ impl<A: HarnessApp> TestHarness<A> {
         let temp_config_path = std::env::temp_dir().join(format!("testharness-{test_id}.yaml"));
         fs::write(&temp_config_path, &plan.config_yaml).expect("Failed to write temporary config");
 
-        // Ensure the fully-migrated template exists (built once per process),
-        // then clone the per-test DB from it — no migrations run per test.
-        ensure_test_template(&db_url, &self.app, self.variant, &self.manifest_dir).await;
+        // Ensure the fully-migrated template exists (built once per process,
+        // cross-process-coordinated), then clone the per-test DB from it — no
+        // migrations run per test. The name embeds the migration-content hash,
+        // so this is the name the template was actually published under.
+        let template_db =
+            ensure_test_template(&db_url, &self.app, self.variant, &self.manifest_dir).await;
 
         let pool = PgPoolOptions::new()
             .max_connections(1)
@@ -895,8 +1080,7 @@ impl<A: HarnessApp> TestHarness<A> {
 
         sqlx::query(&format!(
             "CREATE DATABASE {} TEMPLATE {}",
-            database_name,
-            test_template_db(&self.app, self.variant, &self.manifest_dir)
+            database_name, template_db
         ))
         .execute(&pool)
         .await
@@ -1172,5 +1356,263 @@ mod tests {
             "spawned child {child_pid} still alive 10s after its test-runner \
              parent was SIGKILLed — PR_SET_PDEATHSIG is not armed on spawn"
         );
+    }
+
+    // ---- shared template across concurrent processes (GAP: rebuild-per-process) ----
+
+    /// Env gate for the two stand-in helper processes of
+    /// [`concurrent_processes_reuse_one_shared_template`] — a re-invocation of
+    /// THIS test binary, filtered via `--exact` (see that test).
+    const TEMPLATE_HELPER_ENV: &str = "ZIEE_TEST_TEMPLATE_HELPER";
+    /// "first" builds + marks; "second" starts only after first's marker.
+    const TEMPLATE_ROLE_ENV: &str = "ZIEE_TEST_TEMPLATE_ROLE";
+    /// The real migration dir both helpers must build from (same content ⇒ same
+    /// content-hash ⇒ the template name the OLD code would also have raced on).
+    const TEMPLATE_MIG_DIR_ENV: &str = "ZIEE_TEST_TEMPLATE_MIG_DIR";
+    /// "first" writes this marker file once its template build finished.
+    const TEMPLATE_MARKER_ENV: &str = "ZIEE_TEST_TEMPLATE_MARKER_FILE";
+    /// Each helper writes its clone-failure count here for the outer test.
+    const TEMPLATE_RESULT_ENV: &str = "ZIEE_TEST_TEMPLATE_RESULT_FILE";
+
+    const TEMPLATE_CLONES_PER_PROCESS: usize = 30;
+    const TEMPLATE_CLONE_GAP_MS: u64 = 100;
+
+    /// Minimal harness app for the template-concurrency test: a REAL migration
+    /// dir (path passed via env so helper processes share the outer test's
+    /// tree), and a `plan_spawn` that must never be reached (this test drives
+    /// `ensure_test_template` directly, never `TestHarness::start`).
+    struct SdkTestApp {
+        mig_dir: PathBuf,
+    }
+
+    impl HarnessApp for SdkTestApp {
+        type Options = ();
+        fn template_db_base(&self, _variant: Variant) -> String {
+            "sdk_test_template".to_string()
+        }
+        fn migration_dirs(&self, _variant: Variant, _manifest_dir: &Path) -> Vec<PathBuf> {
+            vec![self.mig_dir.clone()]
+        }
+        fn plan_spawn(&self, _opts: &Self::Options, _facts: &SpawnFacts) -> SpawnPlan {
+            panic!("template-concurrency test never spawns a server")
+        }
+    }
+
+    fn run_on_current_thread<F: std::future::Future<Output = R>, R>(fut: F) -> R {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime")
+            .block_on(fut)
+    }
+
+    /// The stand-in process for [`concurrent_processes_reuse_one_shared_template`]:
+    /// (re)check + (if needed) build the shared template through the REAL
+    /// `ensure_test_template`, then clone databases from it in a tight loop,
+    /// reporting the number of clones that failed. A no-op unless
+    /// [`TEMPLATE_HELPER_ENV`] is set.
+    #[test]
+    fn template_concurrency_helper() {
+        if env::var(TEMPLATE_HELPER_ENV).as_deref() != Ok("1") {
+            return;
+        }
+        let role = env::var(TEMPLATE_ROLE_ENV).expect("template helper: role env");
+        let mig_dir =
+            PathBuf::from(env::var(TEMPLATE_MIG_DIR_ENV).expect("template helper: mig dir env"));
+        let marker =
+            PathBuf::from(env::var(TEMPLATE_MARKER_ENV).expect("template helper: marker env"));
+        let result =
+            PathBuf::from(env::var(TEMPLATE_RESULT_ENV).expect("template helper: result env"));
+
+        let admin_url = admin_database_url();
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let app = SdkTestApp { mig_dir };
+
+        let (template, errors, last_error) = run_on_current_thread(async move {
+            // "second" starts ONLY after "first" reports its template build
+            // finished. That makes the OLD behaviour deterministically reproduce
+            // the race (second terminates + drops + recreates the exact template
+            // first's concurrent clones are copying from) instead of merely
+            // sometimes hitting it, and the NEW behaviour deterministically
+            // exercises the reuse path (second finds it built and clones from it).
+            if role == "second" {
+                let deadline = std::time::Instant::now() + Duration::from_secs(180);
+                while !marker.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for the first process to (re)build the template"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+
+            // The per-process template build. In the FIXED harness this BLOCKS
+            // on the advisory lock while the first process builds, then
+            // re-checks and reuses; in the OLD harness this terminates + drops
+            // + recreates the template the first process's tests are cloning
+            // FROM.
+            let template = ensure_test_template(&admin_url, &app, Variant::Server, &manifest_dir).await;
+
+            if role == "first" {
+                fs::write(&marker, "1").expect("write first-ensured marker");
+            }
+
+            // Clone from the template repeatedly (creating + dropping the
+            // per-test DB each time) — the same shape `TestHarness::start`
+            // uses. Many iterations across the other process's startup window,
+            // so the old drop-and-rebuild race must fire at least once.
+            let mut errors: u32 = 0;
+            let mut last_error = String::new();
+            for i in 0..TEMPLATE_CLONES_PER_PROCESS {
+                let pool = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&admin_url)
+                    .await
+                    .expect("connect to postgres to clone from template");
+                let name = format!("test_db_{}_{i}", Uuid::new_v4().simple());
+                let created = sqlx::query(&format!("CREATE DATABASE {name} TEMPLATE {template}"))
+                    .execute(&pool)
+                    .await;
+                if let Err(e) = created {
+                    errors += 1;
+                    last_error = format!("{e}");
+                }
+                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {name}"))
+                    .execute(&pool)
+                    .await;
+                pool.close().await;
+                std::thread::sleep(Duration::from_millis(TEMPLATE_CLONE_GAP_MS));
+            }
+
+            (template, errors, last_error)
+        });
+
+        fs::write(
+            &result,
+            format!("errors={errors}\nlast_error={last_error}\ntemplate={template}\n"),
+        )
+        .expect("write helper result");
+    }
+    /// Two concurrent harness PROCESSES in the same worktree must be able to
+    /// share one migrated template: each builds (or reuses), then clones from
+    /// it — and no clone may ever fail with `template database ... does not
+    /// exist` (or any other error). The old drop-and-rebuild-per-process
+    /// behaviour fails this test: the second process's startup terminated /
+    /// dropped / recreated the exact template the first process was cloning
+    /// from, and the first's clones raced the DROP.
+    #[test]
+    fn concurrent_processes_reuse_one_shared_template() {
+        use std::process::Stdio;
+
+        /// Kill + reap both helpers on every exit path (green AND red) so a
+        /// failing run never leaves two test processes behind.
+        struct Cleanup(Vec<Child>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        // A REAL migration set in a temp tree both helper processes read via
+        // env — same content ⇒ same content hash ⇒ same template name.
+        let dir = tempfile::tempdir().expect("tempdir for template test");
+        let mig_dir = dir.path().join("migrations");
+        fs::create_dir_all(&mig_dir).expect("create migrations dir");
+        fs::write(
+            mig_dir.join("0001_init.sql"),
+            "CREATE TABLE sdk_concurrency_probe (id int PRIMARY KEY);\n",
+        )
+        .expect("write migration");
+        let marker = dir.path().join("first-ensured");
+        let result_first = dir.path().join("first.result");
+        let result_second = dir.path().join("second.result");
+
+        let exe = std::env::current_exe().expect("current test exe");
+        let spawn_helper = |role: &str, result_file: &Path| -> Child {
+            Command::new(&exe)
+                .arg("--exact")
+                .arg("tests::template_concurrency_helper")
+                .arg("--nocapture")
+                .env(TEMPLATE_HELPER_ENV, "1")
+                .env(TEMPLATE_ROLE_ENV, role)
+                .env(TEMPLATE_MIG_DIR_ENV, &mig_dir)
+                .env(TEMPLATE_MARKER_ENV, &marker)
+                .env(TEMPLATE_RESULT_ENV, result_file)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn template helper")
+        };
+
+        let mut cleanup = Cleanup(vec![
+            spawn_helper("first", &result_first),
+            spawn_helper("second", &result_second),
+        ]);
+        let mut reports: Vec<String> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        for path in [&result_first, &result_second] {
+            loop {
+                if let Ok(s) = fs::read_to_string(path) {
+                    reports.push(s);
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "helper did not write {} in time",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        // Both helpers must have exited cleanly (a helper that panicked left
+        // no result file and made the wait above fail instead).
+        for child in &mut cleanup.0 {
+            let status = child.wait().expect("wait for helper");
+            assert!(status.success(), "helper exited with {status}");
+        }
+
+        // Zero "does not exist" (or any other) clone failures across both
+        // processes' many iterations.
+        for report in &reports {
+            let errors: u32 = report
+                .lines()
+                .find_map(|l| l.strip_prefix("errors="))
+                .expect("errors= line")
+                .parse()
+                .expect("parse clone-failure count");
+            assert_eq!(
+                errors, 0,
+                "concurrent helper reported {errors} clone failures:\n{report}"
+            );
+        }
+
+        // Both processes must have settled on THE SAME template name (same
+        // base + worktree key + migration-content hash) — otherwise they
+        // would not be sharing a template at all.
+        let templates: Vec<&str> = reports
+            .iter()
+            .map(|r| r.lines().find_map(|l| l.strip_prefix("template=")).expect("template= line"))
+            .collect();
+        assert_eq!(
+            templates[0], templates[1],
+            "the two concurrent processes used different template names"
+        );
+
+        // The template must actually exist (the name is no fantasy). The pool
+        // is created and used inside ONE runtime (a sqlx pool must not be
+        // created on a runtime that is dropped before the pool is used).
+        let exists = run_on_current_thread(async {
+            let verify = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&admin_database_url())
+                .await
+                .expect("connect to postgres to verify template");
+            template_database_exists(&verify, templates[0]).await
+        });
+        assert!(exists, "template {} does not exist", templates[0]);
     }
 }
