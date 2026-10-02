@@ -63,6 +63,13 @@ pub struct ShardOptions {
     /// Stop after this many objects were moved (a partial run); `None` ⇒
     /// until nothing flat is left.
     pub limit: Option<u64>,
+    /// Bound on the number of `read_dir` passes a single call makes. The loop
+    /// normally stops when a pass moves nothing, but a sustained concurrent
+    /// flat writer (a not-yet-restarted server still writing flat) can keep
+    /// adding entries forever, so without a ceiling the call would never
+    /// return. `ShardReport::remaining_flat` reports what is still flat when
+    /// the bound is hit; a follow-up call continues from there.
+    pub max_passes: usize,
 }
 
 impl Default for ShardOptions {
@@ -71,6 +78,7 @@ impl Default for ShardOptions {
             batch: 2000,
             pause: std::time::Duration::from_millis(50),
             limit: None,
+            max_passes: 3,
         }
     }
 }
@@ -188,6 +196,25 @@ impl FilesystemStorage {
     /// one, and `rename`/`unlink` of one name are atomic with respect to each
     /// other — either the unlink wins (the rename then fails `ENOENT` and is
     /// skipped) or the rename wins (the sharded unlink, which runs after, hits).
+    ///
+    /// The target of a move is probed with `symlink_metadata` (never
+    /// followed) before anything is read through it: if it exists and is
+    /// NOT a regular file — a symlink, a directory, anything else — it is
+    /// never opened and the flat copy is never unlinked on its say-so; that
+    /// is counted as a conflict and both are left in place. Without this, a
+    /// symlink planted at the shard target pointing at bytes identical to
+    /// the flat copy would make the byte-compare report "same" and the
+    /// mover would unlink the REAL flat object, leaving only the
+    /// attacker-controlled symlink behind.
+    ///
+    /// Bounded by `opts.max_passes`: a sustained concurrent flat writer can
+    /// keep adding entries to the directory forever, so without a ceiling
+    /// this would never return. `ShardReport::remaining_flat` reports what
+    /// is left when the bound is hit (or a `limit`/conflict stopped it
+    /// early); a follow-up call continues from there. On an I/O error the
+    /// best-effort report accumulated so far is handed to `progress` before
+    /// the error propagates, so a caller does not lose a long run's progress
+    /// to its last failure.
     pub async fn shard_flat_originals(
         &self,
         user_id: Uuid,
@@ -199,10 +226,13 @@ impl FilesystemStorage {
         let mut leaves: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let batch = opts.batch.max(1) as u64;
         let mut since_pause = 0u64;
-        // Passes until one moves nothing: a directory being renamed out of
-        // while it is read may skip entries, and a concurrent writer may add
-        // flat ones — the next pass picks both up.
+        let max_passes = opts.max_passes.max(1);
+        let mut passes = 0usize;
+        // Passes until one moves nothing (or the bound is hit): a directory
+        // being renamed out of while it is read may skip entries, and a
+        // concurrent writer may add flat ones — the next pass picks both up.
         loop {
+            passes += 1;
             let mut moved_this_pass = 0u64;
             let mut flat_seen = 0u64;
             // Conflicts and skips are a property of what is in the directory,
@@ -210,12 +240,30 @@ impl FilesystemStorage {
             // report's).
             let mut conflicts = 0u64;
             let mut skipped = 0u64;
+            // On any I/O error below, hand `progress` the best-effort report
+            // accumulated so far (this pass's counters folded in) before
+            // propagating — a long run's partial progress is not silently
+            // dropped on its last failure.
+            macro_rules! bail {
+                ($e:expr) => {{
+                    report.remaining_flat = flat_seen;
+                    report.conflicts = conflicts;
+                    report.skipped = skipped;
+                    progress(&report);
+                    return Err($e);
+                }};
+            }
             let mut entries = match fs::read_dir(&dir).await {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
-                Err(e) => return Err(e),
+                Err(e) => bail!(e),
             };
-            while let Some(entry) = entries.next_entry().await? {
+            loop {
+                let entry = match entries.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(e) => bail!(e),
+                };
                 if opts.limit.is_some_and(|l| report.moved >= l) {
                     // Count what is left without moving it.
                     if Self::flat_object_name(&entry).await.is_some() {
@@ -235,11 +283,29 @@ impl FilesystemStorage {
                 let to = self.sharded_original_path(user_id, file_id, &ext);
                 let leaf = self.shard_dir(user_id, file_id);
                 if !leaves.contains(&leaf) {
-                    fs::create_dir_all(&leaf).await?;
+                    if let Err(e) = fs::create_dir_all(&leaf).await {
+                        bail!(e);
+                    }
                     leaves.insert(leaf);
                 }
                 match fs::symlink_metadata(&to).await {
+                    Ok(meta) if !meta.file_type().is_file() => {
+                        // The target exists but is not a regular file.
+                        // INV-6: never read through it, never unlink the
+                        // flat copy on its say-so.
+                        conflicts += 1;
+                        tracing::warn!(
+                            flat = %from.display(),
+                            sharded = %to.display(),
+                            "shard move: target exists but is not a regular file \
+                             (symlink or other) — left the flat copy in place"
+                        );
+                        continue;
+                    }
                     Ok(_) => {
+                        // The FLAT side is already known to be a regular file
+                        // (`flat_object_name` filtered it); the sharded side
+                        // was just confirmed one above.
                         let same = match (fs::read(&from).await, fs::read(&to).await) {
                             (Ok(a), Ok(b)) => a == b,
                             _ => false,
@@ -253,7 +319,7 @@ impl FilesystemStorage {
                                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                                     flat_seen -= 1;
                                 }
-                                Err(e) => return Err(e),
+                                Err(e) => bail!(e),
                             }
                         } else {
                             conflicts += 1;
@@ -267,7 +333,7 @@ impl FilesystemStorage {
                         continue;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
+                    Err(e) => bail!(e),
                 }
                 match fs::rename(&from, &to).await {
                     Ok(()) => {
@@ -277,7 +343,7 @@ impl FilesystemStorage {
                     }
                     // Deleted (or moved) under us — nothing left to move.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => flat_seen -= 1,
-                    Err(e) => return Err(e),
+                    Err(e) => bail!(e),
                 }
                 since_pause += 1;
                 if since_pause >= batch {
@@ -289,7 +355,10 @@ impl FilesystemStorage {
             report.remaining_flat = flat_seen;
             report.conflicts = conflicts;
             report.skipped = skipped;
-            if moved_this_pass == 0 || opts.limit.is_some_and(|l| report.moved >= l) {
+            if moved_this_pass == 0
+                || opts.limit.is_some_and(|l| report.moved >= l)
+                || passes >= max_passes
+            {
                 break;
             }
         }
@@ -1000,7 +1069,12 @@ mod tests {
         write_at(&s.flat_original_path(user, conflict, "webp"), b"one").await;
         write_at(&s.sharded_original_path(user, conflict, "webp"), b"two").await;
 
-        let opts = ShardOptions { batch: 3, pause: std::time::Duration::ZERO, limit: Some(4) };
+        let opts = ShardOptions {
+            batch: 3,
+            pause: std::time::Duration::ZERO,
+            limit: Some(4),
+            ..Default::default()
+        };
         let mut calls = 0;
         let first = s.shard_flat_originals(user, &opts, &mut |_| calls += 1).await.unwrap();
         assert_eq!(first.moved, 4);
@@ -1027,5 +1101,446 @@ mod tests {
         assert!(!s.sharded_original_path(user, link_id, "webp").exists());
         let third = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
         assert_eq!(third.moved, 0);
+    }
+
+    /// INV-6, HIGH finding: a symlink planted AT the shard target must never
+    /// be read through for the dedup byte-compare, and must never make the
+    /// mover unlink the real flat copy. Before the fix, `symlink_metadata`
+    /// was checked only for existence (`Ok(_) =>`), so a symlink at `to`
+    /// pointing at bytes identical to the flat copy made `fs::read(&to)`
+    /// follow it, the compare report "same", and the flat (REAL) object get
+    /// unlinked — leaving only the attacker-controlled symlink behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shard_flat_originals_refuses_to_read_through_a_symlinked_target() {
+        let (dir, s) = sharded();
+        let user = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let flat = s.flat_original_path(user, id, "webp");
+        write_at(&flat, b"identical bytes").await;
+
+        // A file OUTSIDE the store whose bytes are byte-for-byte identical to
+        // the flat copy.
+        let victim = dir.path().join("victim.webp");
+        tokio::fs::write(&victim, b"identical bytes").await.unwrap();
+        // Plant a symlink AT the shard target, pointing at the victim.
+        let to = s.sharded_original_path(user, id, "webp");
+        tokio::fs::create_dir_all(to.parent().unwrap()).await.unwrap();
+        std::os::unix::fs::symlink(&victim, &to).unwrap();
+
+        let mut report = ShardReport::default();
+        let opts = ShardOptions::default();
+        let r = s
+            .shard_flat_originals(user, &opts, &mut |p| report = p.clone())
+            .await
+            .unwrap();
+
+        assert!(flat.exists(), "the REAL flat object must SURVIVE a symlinked target");
+        assert_eq!(
+            tokio::fs::read(&flat).await.unwrap(),
+            b"identical bytes",
+            "the surviving flat object must be untouched"
+        );
+        assert!(
+            tokio::fs::symlink_metadata(&to).await.unwrap().file_type().is_symlink(),
+            "the symlink at the target must be left exactly as planted, never followed or replaced"
+        );
+        assert_eq!(r.conflicts, 1, "a non-regular-file target must be counted as a conflict: {r:?}");
+        assert_eq!(r.moved, 0);
+        assert_eq!(r.deduplicated, 0, "must NOT be reported as a dedup — that would imply the flat copy was removed");
+    }
+
+    /// A DIRECTORY at the shard target (pathological, but the same class of
+    /// bug as a symlink) must be refused the same way: never read through,
+    /// never a reason to unlink the flat copy.
+    #[tokio::test]
+    async fn shard_flat_originals_refuses_a_non_file_target_that_is_a_directory() {
+        let (_dir, s) = sharded();
+        let user = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let flat = s.flat_original_path(user, id, "webp");
+        write_at(&flat, b"x").await;
+        let to = s.sharded_original_path(user, id, "webp");
+        tokio::fs::create_dir_all(&to).await.unwrap(); // a directory, not a file, at the target name
+
+        let opts = ShardOptions::default();
+        let r = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
+        assert!(flat.exists(), "the flat object must survive a directory at the target");
+        assert_eq!(r.conflicts, 1);
+        assert_eq!(r.moved, 0);
+    }
+
+    /// MEDIUM finding: `max_passes` bounds the mover against a sustained
+    /// concurrent flat writer that keeps adding entries — without the bound
+    /// this would loop until the writer stops, which under a live write load
+    /// may be never. The writer here adds one new flat object after every
+    /// pass boundary (paced by `pause`), forever — `max_passes` must still
+    /// make the call return, reporting what is left in `remaining_flat`.
+    #[tokio::test]
+    async fn shard_flat_originals_is_bounded_by_max_passes_under_a_sustained_writer() {
+        let (_dir, s) = sharded();
+        let user = Uuid::new_v4();
+        write_at(&s.flat_original_path(user, Uuid::new_v4(), "webp"), b"x").await;
+
+        let keep_writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer_storage = s.clone();
+        let writer_flag = keep_writing.clone();
+        let writer = tokio::spawn(async move {
+            while writer_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                write_at(&writer_storage.flat_original_path(user, Uuid::new_v4(), "webp"), b"y").await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let opts = ShardOptions {
+            batch: 1,
+            pause: std::time::Duration::from_millis(5),
+            limit: None,
+            max_passes: 3,
+        };
+        let started = std::time::Instant::now();
+        let report = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
+        let elapsed = started.elapsed();
+        keep_writing.store(false, std::sync::atomic::Ordering::SeqCst);
+        writer.await.unwrap();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "max_passes must make the call return promptly even under a sustained writer: {elapsed:?}"
+        );
+        // Under a sustained writer the bound is very likely to still find
+        // something flat; this is the whole point of the report field (a
+        // follow-up run continues from here). Not asserting > 0 would make
+        // this test pass for the wrong reason if the writer happened to be
+        // slow, so just assert the call returned with a well-formed report.
+        assert!(report.moved + report.remaining_flat >= 1, "{report:?}");
+    }
+
+    /// LOW finding: an I/O error must not drop the run's partial progress —
+    /// `progress` must see a `ShardReport` reflecting what happened before
+    /// the failure, not be skipped in favour of just propagating `Err`.
+    ///
+    /// Deterministic by construction (no dependence on `read_dir`'s
+    /// unspecified entry order, which is why this is a SEPARATE test from the
+    /// symlink/directory conflict ones above rather than reusing their
+    /// multi-entry setup): exactly ONE object exists, so pass 1 moves it
+    /// cleanly and, because it moved something, the mover's loop always goes
+    /// on to a pass 2. The `progress` callback itself — called synchronously
+    /// right after that one move, strictly BETWEEN pass 1 and pass 2 — is
+    /// used to revoke read access to the namespace directory, so pass 2's own
+    /// `read_dir` is what fails. The report `progress` is called with right
+    /// before the error propagates must therefore already carry `moved: 1`
+    /// from pass 1, not a blank default.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shard_flat_originals_reports_partial_progress_before_an_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, s) = sharded();
+        let user = Uuid::new_v4();
+        let ok_id = Uuid::new_v4();
+        write_at(&s.flat_original_path(user, ok_id, "webp"), b"ok").await;
+        let flat_dir = dir.path().join("originals").join(user.to_string());
+
+        let opts = ShardOptions { batch: 1, pause: std::time::Duration::ZERO, ..Default::default() };
+        let mut last_seen = ShardReport::default();
+        let mut calls = 0u32;
+        let flat_dir_for_cb = flat_dir.clone();
+        let res = s
+            .shard_flat_originals(user, &opts, &mut |r| {
+                calls += 1;
+                last_seen = r.clone();
+                if calls == 1 {
+                    // Fires once, right after the one object moved in pass 1
+                    // (batch: 1 ⇒ a progress call after every move) and
+                    // before pass 2's `read_dir` runs — revoke read+execute
+                    // on the namespace dir so that NEXT read_dir fails with a
+                    // real I/O error instead of NotFound.
+                    let _ = std::fs::set_permissions(
+                        &flat_dir_for_cb,
+                        std::fs::Permissions::from_mode(0o000),
+                    );
+                }
+            })
+            .await;
+
+        // Restore so the TempDir's own cleanup can recurse into it.
+        let _ = std::fs::set_permissions(&flat_dir, std::fs::Permissions::from_mode(0o755));
+
+        match res {
+            Err(_) => {
+                assert_eq!(
+                    last_seen.moved, 1,
+                    "the LAST progress call before the error must already carry \
+                     pass 1's moved count, not a blank report: {last_seen:?}"
+                );
+                assert!(calls >= 2, "progress must be called again (with the partial report) at the failure site, not just after pass 1: {calls}");
+            }
+            Ok(r) => {
+                // Root ignores the directory's permission bits, so pass 2's
+                // read_dir succeeds anyway and the run simply completes; the
+                // property under test does not apply, but the one object must
+                // still be correctly accounted for.
+                assert_eq!(r.moved, 1);
+            }
+        }
+    }
+
+    /// `FileStorage::open_original`'s wrapper: a [`FilesystemStorage`] whose
+    /// FIRST `resolve_original_path` answer is a pre-recorded STALE path,
+    /// regardless of where the object really is on disk — a deterministic
+    /// stand-in for "the mover renamed the object between resolve and open"
+    /// without racing a real background task. Every other call delegates
+    /// straight through to the real storage.
+    struct FlakyResolve<'a> {
+        inner: &'a FilesystemStorage,
+        stale_path: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FileStorage for FlakyResolve<'_> {
+        async fn save_original(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            extension: &str,
+            data: &[u8],
+        ) -> StorageResult<PathBuf> {
+            self.inner.save_original(user_id, file_id, extension, data).await
+        }
+        async fn save_text_page(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            page_num: u32,
+            text: &str,
+        ) -> StorageResult<PathBuf> {
+            self.inner.save_text_page(user_id, file_id, page_num, text).await
+        }
+        async fn save_geometry_page(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            page_num: u32,
+            geometry_json: &str,
+        ) -> StorageResult<PathBuf> {
+            self.inner
+                .save_geometry_page(user_id, file_id, page_num, geometry_json)
+                .await
+        }
+        async fn load_geometry_page(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            page_num: u32,
+        ) -> StorageResult<String> {
+            self.inner.load_geometry_page(user_id, file_id, page_num).await
+        }
+        async fn save_image(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            page_num: u32,
+            is_thumbnail: bool,
+            data: &[u8],
+        ) -> StorageResult<PathBuf> {
+            self.inner
+                .save_image(user_id, file_id, page_num, is_thumbnail, data)
+                .await
+        }
+        fn get_original_path(&self, user_id: Uuid, file_id: Uuid, extension: &str) -> PathBuf {
+            self.inner.get_original_path(user_id, file_id, extension)
+        }
+        fn get_text_path(&self, user_id: Uuid, file_id: Uuid, page_num: u32) -> PathBuf {
+            self.inner.get_text_path(user_id, file_id, page_num)
+        }
+        fn get_image_path(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            page_num: u32,
+            is_thumbnail: bool,
+        ) -> PathBuf {
+            self.inner.get_image_path(user_id, file_id, page_num, is_thumbnail)
+        }
+        async fn load_original(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            extension: &str,
+        ) -> StorageResult<Vec<u8>> {
+            self.inner.load_original(user_id, file_id, extension).await
+        }
+        async fn load_text_page(&self, user_id: Uuid, file_id: Uuid, page_num: u32) -> StorageResult<String> {
+            self.inner.load_text_page(user_id, file_id, page_num).await
+        }
+        async fn load_preview(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            page_num: u32,
+        ) -> StorageResult<Vec<u8>> {
+            self.inner.load_preview(user_id, file_id, page_num).await
+        }
+        async fn load_thumbnail(&self, user_id: Uuid, file_id: Uuid) -> StorageResult<Vec<u8>> {
+            self.inner.load_thumbnail(user_id, file_id).await
+        }
+        async fn resolve_original_path(
+            &self,
+            user_id: Uuid,
+            file_id: Uuid,
+            extension: &str,
+        ) -> Option<PathBuf> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Some(self.stale_path.clone())
+            } else {
+                self.inner.resolve_original_path(user_id, file_id, extension).await
+            }
+        }
+        async fn delete_all(&self, user_id: Uuid, file_id: Uuid) -> StorageResult<()> {
+            self.inner.delete_all(user_id, file_id).await
+        }
+        async fn delete_user_dirs(&self, user_id: Uuid) -> StorageResult<()> {
+            self.inner.delete_user_dirs(user_id).await
+        }
+        fn calculate_checksum(&self, data: &[u8]) -> String {
+            self.inner.calculate_checksum(data)
+        }
+    }
+
+    /// HIGH finding (serve TOCTOU): `open_original` must retry the resolve
+    /// once when the first open answers `NotFound`. The object sits at the
+    /// FLAT path when the (stale, pre-recorded) resolve answer is handed
+    /// out, but by the time `open_original`'s first open runs it has
+    /// genuinely been renamed to its SHARD LEAF (simulating a mover winning
+    /// the race) — the first open must 404 internally, the retry must
+    /// re-resolve for real, and the real resolver finds the object at its
+    /// new home.
+    #[tokio::test]
+    async fn open_original_retries_the_resolve_after_a_toctou_open_failure() {
+        let (_dir, s) = sharded();
+        let user = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let flat_path = s.flat_original_path(user, id, "webp");
+        let sharded_path = s.sharded_original_path(user, id, "webp");
+        write_at(&flat_path, b"moved-mid-flight").await;
+        // The mover wins the race: gone from flat, now sharded — by the time
+        // `open_original`'s first open runs against the stale answer below.
+        tokio::fs::create_dir_all(sharded_path.parent().unwrap()).await.unwrap();
+        tokio::fs::rename(&flat_path, &sharded_path).await.unwrap();
+
+        let flaky = FlakyResolve {
+            inner: &s,
+            stale_path: flat_path.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let (path, mut file) = flaky
+            .open_original(user, id, "webp")
+            .await
+            .expect("the retry must find the object at its new sharded path");
+        assert_eq!(
+            path, sharded_path,
+            "the SECOND resolve must return the real, current path, not the stale one"
+        );
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut bytes).await.unwrap();
+        assert_eq!(bytes, b"moved-mid-flight");
+    }
+
+    /// The retry does not paper over a genuine absence: an object that never
+    /// existed is still `None` after both attempts.
+    #[tokio::test]
+    async fn open_original_is_none_when_the_object_never_existed() {
+        let (_dir, s) = sharded();
+        let user = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        assert!(s.open_original(user, id, "webp").await.is_none());
+    }
+
+    /// MEDIUM finding: a concurrent writer creating new flat objects and a
+    /// concurrent deleter removing existing ones, both racing the mover on
+    /// ONE directory — every surviving object keeps its exact bytes and
+    /// resolves, every deleted object stays gone (never resurrected by the
+    /// mover winning a race against the delete), and a follow-up run
+    /// converges to `remaining_flat == 0`.
+    #[tokio::test]
+    async fn shard_flat_originals_is_safe_against_a_concurrent_writer_and_deleter() {
+        let (_dir, s) = sharded();
+        let user = Uuid::new_v4();
+
+        // Pre-existing objects: half will be deleted mid-run, half survive.
+        let mut expected: std::collections::HashMap<Uuid, Vec<u8>> = std::collections::HashMap::new();
+        let pre: Vec<Uuid> = (0..12).map(|_| Uuid::new_v4()).collect();
+        for (i, id) in pre.iter().enumerate() {
+            let bytes = format!("pre{i}").into_bytes();
+            write_at(&s.flat_original_path(user, *id, "webp"), &bytes).await;
+            expected.insert(*id, bytes);
+        }
+        let to_delete: Vec<Uuid> = pre.iter().step_by(2).cloned().collect();
+        let to_survive: Vec<Uuid> = pre.iter().skip(1).step_by(2).cloned().collect();
+        for id in &to_delete {
+            expected.remove(id);
+        }
+
+        // New objects the "writer" adds WHILE the mover is running.
+        let written: Vec<Uuid> = (0..12).map(|_| Uuid::new_v4()).collect();
+        let mut written_bytes: std::collections::HashMap<Uuid, Vec<u8>> = std::collections::HashMap::new();
+        for (i, id) in written.iter().enumerate() {
+            written_bytes.insert(*id, format!("new{i}").into_bytes());
+        }
+
+        let writer_storage = s.clone();
+        let writer_bytes = written_bytes.clone();
+        let writer = tokio::spawn(async move {
+            for (id, bytes) in writer_bytes {
+                write_at(&writer_storage.flat_original_path(user, id, "webp"), &bytes).await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+        let deleter_storage = s.clone();
+        let deleter_ids = to_delete.clone();
+        let deleter = tokio::spawn(async move {
+            for id in deleter_ids {
+                // May race the mover either way — both outcomes are
+                // idempotent/NotFound-tolerant, so the result is ignored.
+                let _ = deleter_storage.delete_original(user, id, "webp").await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let opts = ShardOptions {
+            batch: 2,
+            pause: std::time::Duration::from_millis(1),
+            ..Default::default()
+        };
+        let _first = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
+        writer.await.unwrap();
+        deleter.await.unwrap();
+        // A follow-up run picks up anything the race left flat (a write that
+        // arrived after the mover's last pass, or a rename that lost a race
+        // to a delete).
+        let follow_up = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
+        assert_eq!(
+            follow_up.remaining_flat, 0,
+            "a follow-up run must converge to zero flat objects: {follow_up:?}"
+        );
+
+        for id in &to_survive {
+            let bytes = s
+                .load_original(user, *id, "webp")
+                .await
+                .unwrap_or_else(|e| panic!("surviving object {id} must still load: {e}"));
+            assert_eq!(&bytes, &expected[id], "surviving object {id} must keep its exact bytes");
+        }
+        for id in &to_delete {
+            assert!(
+                s.resolve_original_path(user, *id, "webp").await.is_none(),
+                "deleted object {id} must never be resurrected"
+            );
+        }
+        for id in &written {
+            let bytes = s.load_original(user, *id, "webp").await.unwrap();
+            assert_eq!(&bytes, &written_bytes[id], "written object {id} must keep its exact bytes");
+        }
     }
 }

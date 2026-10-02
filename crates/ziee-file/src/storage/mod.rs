@@ -140,6 +140,38 @@ pub trait FileStorage: Send + Sync {
         }
     }
 
+    /// Resolve, then open, an original — retrying the resolve ONCE if the
+    /// first open answers `NotFound`.
+    ///
+    /// Closes a TOCTOU window a plain `resolve_original_path` + `File::open`
+    /// call pair leaves open: a relocator (the sharding mover, or any future
+    /// one) can rename the object between the resolve and the open, so the
+    /// open answers `NotFound` for an object that is very much still on
+    /// disk, one path over. Re-resolving picks up wherever the object landed
+    /// and opens that. `None` only when the object is genuinely absent (or a
+    /// symlink was refused) after the retry.
+    ///
+    /// Never follows a symlink: `resolve_original_path` already refuses one,
+    /// and this never opens a path that function did not just hand back.
+    async fn open_original(
+        &self,
+        user_id: Uuid,
+        file_id: Uuid,
+        extension: &str,
+    ) -> Option<(PathBuf, tokio::fs::File)> {
+        for attempt in 0..2u8 {
+            let path = self
+                .resolve_original_path(user_id, file_id, extension)
+                .await?;
+            match tokio::fs::File::open(&path).await {
+                Ok(file) => return Some((path, file)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt == 0 => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
     /// Delete all files for a file_id
     async fn delete_all(&self, user_id: Uuid, file_id: Uuid) -> StorageResult<()>;
 
