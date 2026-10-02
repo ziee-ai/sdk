@@ -194,6 +194,22 @@ impl Default for ShardOptions {
 }
 
 /// What one [`FilesystemStorage::shard_flat_originals`] run did.
+///
+/// **Field semantics (round-5 fix: `refused_samples` joins the per-pass
+/// set).** Exactly two fields are CUMULATIVE across every pass a call
+/// makes: `moved` and `deduplicated`. Every other field — `conflicts`,
+/// `refused`, `refused_samples`, `skipped`, `remaining_flat` — describes
+/// only the LAST COMPLETED pass (a pass whose `read_dir` listing finished)
+/// and all five are committed TOGETHER, atomically, at that moment. Before
+/// round 5, `refused_samples` was the odd one out: pushed onto this struct
+/// the INSTANT a refusal was seen, rather than held in a per-pass local like
+/// `refused`/`conflicts`/`skipped` and committed with them. A pass that saw
+/// a refusal and then aborted (a real I/O error, e.g. a dedup `remove_file`
+/// failing) before finishing therefore reported non-empty `refused_samples`
+/// alongside `refused == 0` from the last pass that DID complete — samples
+/// with no matching count. `refused_samples` is now a per-pass local too, so
+/// every descriptive field this struct ever reports describes exactly one
+/// pass, and a mid-pass abort can never produce that combination.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ShardReport {
     /// Flat objects renamed into their shard leaf.
@@ -220,13 +236,17 @@ pub struct ShardReport {
     /// these — distinct from `conflicts`, which is only a byte-different
     /// pair that both opened fine. Both sides are left on disk either way.
     pub refused: u64,
-    /// A bounded, FIRST-SEEN (not last) sample of this run's `refused`
-    /// reasons, capped at 5 regardless of how many passes or objects the run
-    /// covers — enough for a human to tell at a glance WHAT is being
-    /// refused (every sample reading "Too many levels of symbolic links" is
-    /// a planted symlink; every one reading "Permission denied" is a
-    /// permission/fd problem) without the report growing unbounded over a
-    /// large run.
+    /// A bounded, FIRST-SEEN (not last) sample of the LAST COMPLETED pass's
+    /// `refused` reasons, capped at 5 per pass — enough for a human to tell
+    /// at a glance WHAT is being refused (every sample reading "Too many
+    /// levels of symbolic links" is a planted symlink; every one reading
+    /// "Permission denied" is a permission/fd problem) without the report
+    /// growing unbounded over a large run. Round-5 fix: this used to be
+    /// cumulative across every pass in the call (pushed onto the report the
+    /// instant a refusal was seen); it is now committed together with
+    /// `refused` at the SAME pass-end moment, same per-pass semantics as
+    /// `conflicts`/`skipped`/`remaining_flat` — see this struct's doc
+    /// comment for the full cumulative-vs-last-completed-pass rule.
     pub refused_samples: Vec<String>,
     /// Directory entries that are not a regular `<uuid>.<ext>` object file
     /// (symlinks, foreign names; sub-directories are the shard levels and are
@@ -368,22 +388,34 @@ impl FilesystemStorage {
     /// is left when the bound is hit (or a `limit`/conflict stopped it
     /// early); a follow-up call continues from there.
     ///
-    /// **Error/progress semantics.** The four DESCRIPTIVE fields —
-    /// `conflicts`, `refused`, `skipped`, `remaining_flat` — describe the
-    /// LAST COMPLETED pass (a pass that finished listing the whole
-    /// directory); `moved`, `deduplicated` and `refused_samples` are
-    /// cumulative across every pass regardless (round-4: `refused_samples`
-    /// is capped at 5 total, first-seen, so it stays useful for diagnosing a
-    /// systemic open failure even across a many-pass run). On an I/O
-    /// error the best-effort `report` accumulated so far — i.e. still holding
-    /// the last COMPLETED pass's descriptive numbers, never the failing
-    /// pass's own partial, still-being-counted locals — is handed to
-    /// `progress` before the error propagates, so a caller does not lose a
-    /// long run's progress to its last failure. If the error hits during the
-    /// very FIRST pass, there is no completed pass yet and the descriptive
-    /// fields stay at their default `0` — meaning "unknown", not "zero found"
-    /// — which is why the CLI prints that its printed counts may be
-    /// incomplete whenever this call returns `Err`.
+    /// **Error/progress semantics (round-5: `refused_samples` joins the
+    /// per-pass set).** The five DESCRIPTIVE fields — `conflicts`,
+    /// `refused`, `refused_samples`, `skipped`, `remaining_flat` — describe
+    /// the LAST COMPLETED pass (a pass that finished listing the whole
+    /// directory) and are committed TOGETHER, atomically, the moment that
+    /// pass's listing finishes; `moved` and `deduplicated` are the only
+    /// cumulative fields, incremented directly on `report` as each object is
+    /// handled. Before round 5, `refused_samples` was pushed onto `report`
+    /// the INSTANT a refusal was seen rather than held in a per-pass local —
+    /// so a `bail!` partway through a pass that had already seen a refusal
+    /// (but not yet finished) reported `refused_samples` from the ABORTED
+    /// pass alongside `refused == 0` from the LAST COMPLETED one: samples
+    /// with no matching count, which also meant the CLI's
+    /// `if refused > 0 { print samples }` gate never fired on exactly the
+    /// run that needed it. `refused_samples` is now a per-pass local too
+    /// (capped at 5, first-seen within that pass), committed with `refused`
+    /// at the same moment — so every descriptive field this call ever
+    /// reports describes exactly one pass, and a mid-pass abort can never
+    /// produce non-empty samples alongside a zero count. On an I/O error the
+    /// best-effort `report` accumulated so far — i.e. still holding the last
+    /// COMPLETED pass's descriptive numbers, never the failing pass's own
+    /// partial, still-being-counted locals — is handed to `progress` before
+    /// the error propagates, so a caller does not lose a long run's progress
+    /// to its last failure. If the error hits during the very FIRST pass,
+    /// there is no completed pass yet and the descriptive fields stay at
+    /// their default `0`/empty — meaning "unknown", not "zero found" — which
+    /// is why the CLI prints that its printed counts may be incomplete
+    /// whenever this call returns `Err`.
     pub async fn shard_flat_originals(
         &self,
         user_id: Uuid,
@@ -409,23 +441,31 @@ impl FilesystemStorage {
             // are the report's).
             let mut conflicts = 0u64;
             let mut refused = 0u64;
+            // Round-5 fix (MEDIUM finding): `refused_samples` used to be
+            // pushed directly onto `report` the instant a refusal was seen,
+            // making it cumulative while `refused` stayed a per-pass local —
+            // so a bail partway through a pass that had already seen a
+            // refusal reported samples with `refused == 0`. It is now a
+            // per-pass local, same as `refused`, committed together at pass
+            // end — see `ShardReport`'s doc comment.
+            let mut refused_samples: Vec<String> = Vec::new();
             let mut skipped = 0u64;
             // On any I/O error below, hand `progress` the best-effort report
             // accumulated so far before propagating — a long run's partial
             // progress is not silently dropped on its last failure.
             //
             // Deliberately NOT folded in here: this pass's own (incomplete)
-            // `flat_seen`/`conflicts`/`refused`/`skipped` locals. `report`'s
-            // descriptive fields already hold the LAST COMPLETED pass's
-            // numbers (committed below, once a pass finishes its directory
-            // listing); overwriting them with a partial pass's partial counts
-            // is how a real error — e.g. this pass's `read_dir` itself
-            // failing, with its locals still at their just-reset zero —
-            // reported 0 conflicts / 0 remaining after a PRIOR pass had left
-            // real ones, which an operator reads as "fully converged".
-            // `moved`/`deduplicated`/`refused_samples` stay cumulative across
-            // passes either way (directly on `report`, never a per-pass
-            // local), so they need no such care.
+            // `flat_seen`/`conflicts`/`refused`/`refused_samples`/`skipped`
+            // locals. `report`'s descriptive fields already hold the LAST
+            // COMPLETED pass's numbers (committed below, once a pass finishes
+            // its directory listing); overwriting them with a partial pass's
+            // partial counts is how a real error — e.g. this pass's
+            // `read_dir` itself failing, with its locals still at their
+            // just-reset zero/empty — reported 0 conflicts / 0 remaining /
+            // no samples after a PRIOR pass had left real ones, which an
+            // operator reads as "fully converged". `moved`/`deduplicated`
+            // stay cumulative across passes either way (directly on
+            // `report`, never a per-pass local), so they need no such care.
             macro_rules! bail {
                 ($e:expr) => {{
                     progress(&report);
@@ -483,8 +523,11 @@ impl FilesystemStorage {
                         // special file must not be able to halt every future
                         // re-run (round-3 MEDIUM finding).
                         refused += 1;
-                        if report.refused_samples.len() < 5 {
-                            report.refused_samples.push(format!("target: {reason}"));
+                        // Round-5 fix: a per-pass local now, like `refused`
+                        // itself — never pushed straight onto `report` (see
+                        // `ShardReport`'s doc comment).
+                        if refused_samples.len() < 5 {
+                            refused_samples.push(format!("target: {reason}"));
                         }
                         tracing::warn!(
                             flat = %from.display(),
@@ -550,8 +593,9 @@ impl FilesystemStorage {
                                 // claim (round-3 LOW finding: no bytes were
                                 // ever compared here).
                                 refused += 1;
-                                if report.refused_samples.len() < 5 {
-                                    report.refused_samples.push(format!("source: {reason}"));
+                                // Round-5 fix: per-pass local, see above.
+                                if refused_samples.len() < 5 {
+                                    refused_samples.push(format!("source: {reason}"));
                                 }
                                 tracing::warn!(
                                     flat = %from.display(),
@@ -586,6 +630,12 @@ impl FilesystemStorage {
             report.remaining_flat = flat_seen;
             report.conflicts = conflicts;
             report.refused = refused;
+            // Round-5 fix: committed together with `refused`, at the SAME
+            // pass-end moment — never pushed onto `report` mid-pass. A
+            // `bail!` before this line is reached leaves both `report.refused`
+            // and `report.refused_samples` at whatever the LAST COMPLETED
+            // pass left them.
+            report.refused_samples = refused_samples;
             report.skipped = skipped;
             if moved_this_pass == 0
                 || opts.limit.is_some_and(|l| report.moved >= l)
@@ -1650,6 +1700,14 @@ mod tests {
     /// path reported `conflicts: 0, remaining_flat: 0` (pass 2's freshly-reset
     /// locals) even though pass 1 left one real conflict on disk — an
     /// operator reading that would believe the migration fully converged.
+    ///
+    /// Round-5 extension (finding 1): a THIRD object, refused via a symlinked
+    /// shard target, is added to the same pass-1 batch so this test also
+    /// pins `refused`/`refused_samples` through the identical last-completed-
+    /// pass path. This is order-independent: a refused object's processing
+    /// needs only EXECUTE (not READ) on the namespace dir to traverse to its
+    /// shard leaf, same as `conflict_id`'s opens, so it completes fine
+    /// regardless of when within pass 1 the EXECUTE-only revoke lands.
     #[cfg(unix)]
     #[tokio::test]
     async fn shard_flat_originals_keeps_last_completed_pass_numbers_on_a_later_io_error() {
@@ -1663,6 +1721,22 @@ mod tests {
         let conflict_id = Uuid::new_v4();
         write_at(&s.flat_original_path(user, conflict_id, "webp"), b"one").await;
         write_at(&s.sharded_original_path(user, conflict_id, "webp"), b"two").await;
+
+        // Round-5: a refused object in the SAME pass-1 batch (a symlink
+        // planted at its shard target, pointing outside the store).
+        let refused_id = Uuid::new_v4();
+        write_at(
+            &s.flat_original_path(user, refused_id, "webp"),
+            b"refused-bytes",
+        )
+        .await;
+        let victim = dir.path().join("victim-for-last-pass-test.webp");
+        tokio::fs::write(&victim, b"victim-bytes").await.unwrap();
+        let refused_target = s.sharded_original_path(user, refused_id, "webp");
+        tokio::fs::create_dir_all(refused_target.parent().unwrap())
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&victim, &refused_target).unwrap();
 
         let flat_dir = dir.path().join("originals").join(user.to_string());
         let opts = ShardOptions { batch: 1, pause: std::time::Duration::ZERO, ..Default::default() };
@@ -1717,9 +1791,22 @@ mod tests {
                      real conflict, not a later pass's unwritten zero: {last_seen:?}"
                 );
                 assert_eq!(
-                    last_seen.remaining_flat, 1,
-                    "ditto for remaining_flat — the conflicting object is still on \
-                     disk, flat: {last_seen:?}"
+                    last_seen.remaining_flat, 2,
+                    "ditto for remaining_flat — the conflicting AND the refused object \
+                     are both still on disk, flat: {last_seen:?}"
+                );
+                // Round-5 extension: `refused`/`refused_samples` must carry
+                // the SAME last-completed-pass guarantee as `conflicts` does.
+                assert_eq!(
+                    last_seen.refused, 1,
+                    "ditto for refused — pass 1's real refusal must survive into the \
+                     error-path report, not a later pass's unwritten zero: {last_seen:?}"
+                );
+                assert_eq!(
+                    last_seen.refused_samples.len(),
+                    1,
+                    "refused_samples must be committed alongside refused, from the \
+                     SAME last-completed pass: {last_seen:?}"
                 );
             }
             Ok(r) => {
@@ -1728,7 +1815,160 @@ mod tests {
                 // completes; assert the steady-state numbers instead.
                 assert_eq!(r.moved, 1);
                 assert_eq!(r.conflicts, 1);
-                assert_eq!(r.remaining_flat, 1);
+                assert_eq!(r.remaining_flat, 2);
+                assert_eq!(r.refused, 1);
+                assert_eq!(r.refused_samples.len(), 1);
+            }
+        }
+    }
+
+    /// Round-5 fix-round regression for the MEDIUM finding (ledger: before
+    /// this round, `refused_samples` was pushed onto `report` the INSTANT a
+    /// refusal was seen, while `refused` (like `conflicts`/`skipped`/
+    /// `remaining_flat`) was a per-pass local committed only once a pass's
+    /// `read_dir` listing finished. A pass that recorded a refusal and then
+    /// `bail!`ed on a LATER entry in the SAME, still-incomplete pass
+    /// therefore reported `refused_samples` non-empty alongside
+    /// `refused == 0` (the last COMPLETED pass's committed value, which never
+    /// saw this refusal) — a report with samples but no matching count, which
+    /// also meant the CLI's `if r.refused > 0 { print samples }` gate never
+    /// fired on exactly the run that needed it.
+    ///
+    /// Pass 1 moves one object (`moved_id`); its `progress` callback (batch:
+    /// 1, fires right after that rename) then plants MANY new objects into
+    /// the SAME namespace directory — all absent until now, so pass 1's
+    /// already-open `read_dir` iterator never sees them and they land in
+    /// pass 2 — and revokes WRITE only (keeps read+execute) on that
+    /// directory: `read_dir` and every path-based `open` still work, but
+    /// `remove_file`/`rename` of an entry directly inside it do not. Of the
+    /// planted objects, 20 are REFUSED (a symlink at each shard target): a
+    /// refusal's path never touches the filesystem beyond opens, so it is
+    /// UNAFFECTED by the write revocation regardless of when in pass 2 it is
+    /// visited. The last is a DEDUP pair (identical bytes both sides): it
+    /// opens and compares equal, then its flat copy's `remove_file` hits the
+    /// revoked write bit and `bail!`s before pass 2's own
+    /// `refused`/`refused_samples` locals are ever committed. Directory
+    /// enumeration order is unspecified, so 20 refused entries (vs. the
+    /// single aborting one) make it overwhelmingly likely at least one
+    /// refusal is visited before the abort on every run, without requiring
+    /// control over the real order.
+    ///
+    /// The invariant under test: whichever object pass 2 visits first, the
+    /// reported `refused`/`refused_samples` after the bail must describe the
+    /// LAST COMPLETED pass (pass 1, which saw no refusal) — never a sample
+    /// from the aborted pass 2 paired with a stale/zero count. Before the
+    /// fix, visiting any refused object before the dedup one made this fail
+    /// (`refused_samples` non-empty while `refused == 0`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shard_flat_originals_never_reports_refused_samples_with_a_stale_refused_count_on_mid_pass_abort()
+     {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, s) = sharded();
+        let user = Uuid::new_v4();
+
+        let moved_id = Uuid::new_v4();
+        write_at(&s.flat_original_path(user, moved_id, "webp"), b"ok").await;
+
+        let ns_dir = dir.path().join("originals").join(user.to_string());
+        let opts = ShardOptions {
+            batch: 1,
+            pause: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let mut last_seen = ShardReport::default();
+        let mut calls = 0u32;
+        let ns_dir_for_cb = ns_dir.clone();
+        // RAII-restored: even if an assertion below panics, this guard's
+        // Drop still restores the namespace dir's permissions, so the
+        // TempDir's own cleanup can recurse into it.
+        struct RestorePerms {
+            path: PathBuf,
+            mode: u32,
+        }
+        impl Drop for RestorePerms {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.path,
+                    std::fs::Permissions::from_mode(self.mode),
+                );
+            }
+        }
+        let _restore = RestorePerms {
+            path: ns_dir.clone(),
+            mode: 0o755,
+        };
+
+        let res = s
+            .shard_flat_originals(user, &opts, &mut |r| {
+                calls += 1;
+                last_seen = r.clone();
+                if calls == 1 {
+                    // Fires once, right after `moved_id` is renamed. Plant
+                    // all new objects now — AFTER pass 1's `read_dir` was
+                    // already opened, so they land in pass 2, never pass 1.
+                    let victim = ns_dir_for_cb
+                        .parent()
+                        .unwrap()
+                        .join("victim-for-mid-pass-abort-test.webp");
+                    std::fs::write(&victim, b"victim-bytes").unwrap();
+                    // 20 refused objects (order-independence margin — see the
+                    // doc comment above).
+                    for i in 0..20u32 {
+                        let refused_id = Uuid::new_v4();
+                        std::fs::write(
+                            ns_dir_for_cb.join(format!("{refused_id}.webp")),
+                            format!("refused-flat-bytes-{i}").as_bytes(),
+                        )
+                        .unwrap();
+                        let refused_target = s.sharded_original_path(user, refused_id, "webp");
+                        std::fs::create_dir_all(refused_target.parent().unwrap()).unwrap();
+                        std::os::unix::fs::symlink(&victim, &refused_target).unwrap();
+                    }
+
+                    let dedup_id = Uuid::new_v4();
+                    std::fs::write(
+                        ns_dir_for_cb.join(format!("{dedup_id}.webp")),
+                        b"identical-bytes",
+                    )
+                    .unwrap();
+                    let dedup_target = s.sharded_original_path(user, dedup_id, "webp");
+                    std::fs::create_dir_all(dedup_target.parent().unwrap()).unwrap();
+                    std::fs::write(&dedup_target, b"identical-bytes").unwrap();
+
+                    // Revoke WRITE only (keep read+execute): `read_dir` and
+                    // every path-based open still succeed; `remove_file` of
+                    // an entry directly inside this dir does not.
+                    let _ = std::fs::set_permissions(
+                        &ns_dir_for_cb,
+                        std::fs::Permissions::from_mode(0o500),
+                    );
+                }
+            })
+            .await;
+
+        match res {
+            Err(_) => {
+                assert_eq!(
+                    last_seen.refused, 0,
+                    "pass 1 (the only COMPLETED pass) saw no refusal; pass 2's own \
+                     refusal must never be committed without pass 2 itself completing: \
+                     {last_seen:?}"
+                );
+                assert!(
+                    last_seen.refused_samples.is_empty(),
+                    "a sample from the ABORTED pass 2 must never be reported alongside \
+                     a `refused` count that does not include it — exactly the round-5 \
+                     bug: {last_seen:?}"
+                );
+            }
+            Ok(r) => {
+                // Root ignores permission bits (see the sibling tests'
+                // identical caveat) — the run simply completes (including the
+                // dedup's `remove_file`); all 20 plants are refused, and
+                // samples cap at 5 per pass.
+                assert_eq!(r.refused, 20, "{r:?}");
+                assert_eq!(r.refused_samples.len(), 5, "{r:?}");
             }
         }
     }
