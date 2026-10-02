@@ -201,9 +201,33 @@ pub struct ShardReport {
     /// Flat objects whose shard target already held IDENTICAL bytes — the
     /// flat copy was removed.
     pub deduplicated: u64,
-    /// Flat objects whose shard target holds DIFFERENT bytes — both left in
-    /// place and logged, for a human to decide (as found by the final pass).
+    /// Flat objects whose shard target and flat source BOTH opened fine as
+    /// regular files, but hold DIFFERENT bytes — both left in place and
+    /// logged, for a human to decide (as found by the final pass). An object
+    /// whose target or source could not even be OPENED as a regular file at
+    /// all (a symlink, a directory, a socket, a permission error, ...) is
+    /// never counted here — see `refused`. Round-4 LOW finding: before this
+    /// field existed, `conflicts` lumped the two together, so the CLI
+    /// summary's single `conflicts` number made a systemic open failure (e.g.
+    /// every shard target refused with `EACCES`) read exactly like N benign
+    /// byte-different duplicates.
     pub conflicts: u64,
+    /// Flat objects whose shard target or flat source exists but could not
+    /// be opened and confirmed as a regular file — a symlink, a directory, a
+    /// FIFO/device/socket node, a permission error, or any other `open`
+    /// failure other than "nothing there" (as found by the final pass, same
+    /// per-pass semantics as `conflicts`). No bytes were ever compared for
+    /// these — distinct from `conflicts`, which is only a byte-different
+    /// pair that both opened fine. Both sides are left on disk either way.
+    pub refused: u64,
+    /// A bounded, FIRST-SEEN (not last) sample of this run's `refused`
+    /// reasons, capped at 5 regardless of how many passes or objects the run
+    /// covers — enough for a human to tell at a glance WHAT is being
+    /// refused (every sample reading "Too many levels of symbolic links" is
+    /// a planted symlink; every one reading "Permission denied" is a
+    /// permission/fd problem) without the report growing unbounded over a
+    /// large run.
+    pub refused_samples: Vec<String>,
     /// Directory entries that are not a regular `<uuid>.<ext>` object file
     /// (symlinks, foreign names; sub-directories are the shard levels and are
     /// not counted) — never touched (as found by the final pass).
@@ -313,7 +337,8 @@ impl FilesystemStorage {
     /// `symlink_metadata` probe followed by a separate `fs::read`: if either
     /// side exists and is NOT a regular file — a symlink, a directory,
     /// anything else — it is never opened and the flat copy is never
-    /// unlinked on its say-so; that is counted as a conflict and both are
+    /// unlinked on its say-so; that is counted as `refused` (round-4: no
+    /// bytes were ever compared, so it is not a `conflicts`) and both are
     /// left in place. A check-then-read pair would leave a gap for a symlink
     /// swapped in between the two steps; `open_regular_nofollow` has none.
     /// Without this, a symlink planted at the shard target pointing at bytes
@@ -325,15 +350,17 @@ impl FilesystemStorage {
     /// (flat side) that cannot be opened as a regular file for ANY reason
     /// other than not existing — a symlink, a directory, a FIFO/device/
     /// socket, a permission error, anything else a filesystem can throw at
-    /// an `open` — is a CONFLICT for that ONE object, logged at `warn` with
-    /// the real reason, and the run continues; it is never a reason to abort
-    /// the whole migration. The flat source specifically distinguishes
-    /// "vanished" (`NotFound` — a racing delete got there first: nothing to
-    /// compare, nothing to move, not a conflict, counts exactly like the
-    /// `rename`-`NotFound` path below) from "exists but unsafe to open"
-    /// (`Refused` — a genuine conflict, counted and logged with its real
+    /// an `open` — is counted as `refused` for that ONE object (round-4: NOT
+    /// `conflicts` — no bytes were ever compared), logged at `warn` with the
+    /// real reason (and sampled into `ShardReport::refused_samples`, capped
+    /// at 5), and the run continues; it is never a reason to abort the whole
+    /// migration. The flat source specifically distinguishes "vanished"
+    /// (`NotFound` — a racing delete got there first: nothing to compare,
+    /// nothing to move, not a conflict, not a refusal, counts exactly like
+    /// the `rename`-`NotFound` path below) from "exists but unsafe to open"
+    /// (`Refused` — genuinely `refused`, counted and logged with its real
     /// reason) from "opened fine" (byte-compared against the target as
-    /// before).
+    /// before — a mismatch there, and only there, is a `conflicts`).
     ///
     /// Bounded by `opts.max_passes`: a sustained concurrent flat writer can
     /// keep adding entries to the directory forever, so without a ceiling
@@ -342,9 +369,12 @@ impl FilesystemStorage {
     /// early); a follow-up call continues from there.
     ///
     /// **Error/progress semantics.** The four DESCRIPTIVE fields —
-    /// `conflicts`, `skipped`, `remaining_flat` — describe the LAST COMPLETED
-    /// pass (a pass that finished listing the whole directory); `moved` and
-    /// `deduplicated` are cumulative across every pass regardless. On an I/O
+    /// `conflicts`, `refused`, `skipped`, `remaining_flat` — describe the
+    /// LAST COMPLETED pass (a pass that finished listing the whole
+    /// directory); `moved`, `deduplicated` and `refused_samples` are
+    /// cumulative across every pass regardless (round-4: `refused_samples`
+    /// is capped at 5 total, first-seen, so it stays useful for diagnosing a
+    /// systemic open failure even across a many-pass run). On an I/O
     /// error the best-effort `report` accumulated so far — i.e. still holding
     /// the last COMPLETED pass's descriptive numbers, never the failing
     /// pass's own partial, still-being-counted locals — is handed to
@@ -374,25 +404,28 @@ impl FilesystemStorage {
             passes += 1;
             let mut moved_this_pass = 0u64;
             let mut flat_seen = 0u64;
-            // Conflicts and skips are a property of what is in the directory,
-            // so each pass recounts them (the last pass's numbers are the
-            // report's).
+            // Conflicts, refusals and skips are a property of what is in the
+            // directory, so each pass recounts them (the last pass's numbers
+            // are the report's).
             let mut conflicts = 0u64;
+            let mut refused = 0u64;
             let mut skipped = 0u64;
             // On any I/O error below, hand `progress` the best-effort report
             // accumulated so far before propagating — a long run's partial
             // progress is not silently dropped on its last failure.
             //
             // Deliberately NOT folded in here: this pass's own (incomplete)
-            // `flat_seen`/`conflicts`/`skipped` locals. `report`'s descriptive
-            // fields already hold the LAST COMPLETED pass's numbers (committed
-            // below, once a pass finishes its directory listing); overwriting
-            // them with a partial pass's partial counts is how a real error —
-            // e.g. this pass's `read_dir` itself failing, with its locals
-            // still at their just-reset zero — reported 0 conflicts / 0
-            // remaining after a PRIOR pass had left real ones, which an
-            // operator reads as "fully converged". `moved`/`deduplicated` stay
-            // cumulative across passes either way, so they need no such care.
+            // `flat_seen`/`conflicts`/`refused`/`skipped` locals. `report`'s
+            // descriptive fields already hold the LAST COMPLETED pass's
+            // numbers (committed below, once a pass finishes its directory
+            // listing); overwriting them with a partial pass's partial counts
+            // is how a real error — e.g. this pass's `read_dir` itself
+            // failing, with its locals still at their just-reset zero —
+            // reported 0 conflicts / 0 remaining after a PRIOR pass had left
+            // real ones, which an operator reads as "fully converged".
+            // `moved`/`deduplicated`/`refused_samples` stay cumulative across
+            // passes either way (directly on `report`, never a per-pass
+            // local), so they need no such care.
             macro_rules! bail {
                 ($e:expr) => {{
                     progress(&report);
@@ -441,11 +474,18 @@ impl FilesystemStorage {
                         // device/socket, a permission error, or any other
                         // open failure (ENXIO from a UNIX socket node,
                         // EACCES, ...). INV-6: never read through it, never
-                        // unlink the flat copy on its say-so. A conflict for
+                        // unlink the flat copy on its say-so. Round-4 LOW
+                        // finding: counted as `refused`, NOT `conflicts` — no
+                        // bytes were ever compared here, so lumping it into
+                        // `conflicts` made a systemic open failure read like
+                        // N benign byte-different duplicates. A refusal for
                         // THIS ONE OBJECT, never fatal to the run — a planted
                         // special file must not be able to halt every future
                         // re-run (round-3 MEDIUM finding).
-                        conflicts += 1;
+                        refused += 1;
+                        if report.refused_samples.len() < 5 {
+                            report.refused_samples.push(format!("target: {reason}"));
+                        }
                         tracing::warn!(
                             flat = %from.display(),
                             sharded = %to.display(),
@@ -503,12 +543,16 @@ impl FilesystemStorage {
                             }
                             RegularFile::Refused(reason) => {
                                 // The flat source itself exists but could not
-                                // be opened safely — a genuine conflict (not
-                                // "vanished"), logged with the REAL reason
-                                // rather than the old, misleading "DIFFERENT
-                                // bytes" claim (round-3 LOW finding: no bytes
-                                // were ever compared here).
-                                conflicts += 1;
+                                // be opened safely — genuinely `refused` (not
+                                // "vanished", and round-4: not `conflicts`
+                                // either), logged with the REAL reason rather
+                                // than the old, misleading "DIFFERENT bytes"
+                                // claim (round-3 LOW finding: no bytes were
+                                // ever compared here).
+                                refused += 1;
+                                if report.refused_samples.len() < 5 {
+                                    report.refused_samples.push(format!("source: {reason}"));
+                                }
                                 tracing::warn!(
                                     flat = %from.display(),
                                     sharded = %to.display(),
@@ -541,6 +585,7 @@ impl FilesystemStorage {
             }
             report.remaining_flat = flat_seen;
             report.conflicts = conflicts;
+            report.refused = refused;
             report.skipped = skipped;
             if moved_this_pass == 0
                 || opts.limit.is_some_and(|l| report.moved >= l)
@@ -1332,9 +1377,30 @@ mod tests {
             tokio::fs::symlink_metadata(&to).await.unwrap().file_type().is_symlink(),
             "the symlink at the target must be left exactly as planted, never followed or replaced"
         );
-        assert_eq!(r.conflicts, 1, "a non-regular-file target must be counted as a conflict: {r:?}");
+        // Round-4 LOW finding: a non-regular-file target never had its bytes
+        // compared, so it is counted as `refused`, NOT `conflicts` (which is
+        // reserved for a pair that both opened fine but differ byte-for-byte
+        // — see
+        // `shard_flat_originals_keeps_last_completed_pass_numbers_on_a_later_io_error`
+        // for that case).
+        assert_eq!(
+            r.refused, 1,
+            "a non-regular-file target must be counted as refused, not conflicts: {r:?}"
+        );
+        assert_eq!(
+            r.conflicts, 0,
+            "no bytes were ever compared for a symlinked target: {r:?}"
+        );
         assert_eq!(r.moved, 0);
-        assert_eq!(r.deduplicated, 0, "must NOT be reported as a dedup — that would imply the flat copy was removed");
+        assert_eq!(
+            r.deduplicated, 0,
+            "must NOT be reported as a dedup — that would imply the flat copy was removed"
+        );
+        assert_eq!(r.refused_samples.len(), 1, "{r:?}");
+        assert!(
+            r.refused_samples[0].contains("target:"),
+            "the sample must say which side (target/source) was refused: {r:?}"
+        );
     }
 
     /// A DIRECTORY at the shard target (pathological, but the same class of
@@ -1353,8 +1419,107 @@ mod tests {
         let opts = ShardOptions::default();
         let r = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
         assert!(flat.exists(), "the flat object must survive a directory at the target");
-        assert_eq!(r.conflicts, 1);
+        // Round-4 LOW finding: never-opened, so `refused`, not `conflicts`.
+        assert_eq!(r.refused, 1, "{r:?}");
+        assert_eq!(r.conflicts, 0, "{r:?}");
         assert_eq!(r.moved, 0);
+    }
+
+    /// Round-4 LOW finding (both auditors): `ShardReport.conflicts` used to
+    /// lump byte-different duplicates together with every kind of open
+    /// refusal (symlink, socket, directory, permission error), so the CLI
+    /// summary's single `conflicts` number made a systemic open failure read
+    /// like N benign duplicate conflicts. This test proves the split with
+    /// BOTH classes present in the SAME run: seven objects refused via a
+    /// symlinked shard target (more than `refused_samples`'s 5-entry cap, to
+    /// prove the cap too) plus one genuine byte-different pair (both sides
+    /// open fine as regular files, differing bytes) — `refused` must count
+    /// only the seven, `conflicts` must count only the one, and
+    /// `refused_samples` must stay at exactly 5 despite seven refusals.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shard_flat_originals_separates_refused_opens_from_byte_different_conflicts_and_caps_samples()
+     {
+        let (dir, s) = sharded();
+        let user = Uuid::new_v4();
+
+        // Seven objects, each refused via a symlink planted at its shard
+        // target (pointing at bytes identical to the flat copy, so a
+        // pre-round-3 implementation would have reported these as dedups —
+        // the point here is only that they must never land in `conflicts`).
+        let refused_ids: Vec<Uuid> = (0..7).map(|_| Uuid::new_v4()).collect();
+        for (i, id) in refused_ids.iter().enumerate() {
+            let flat = s.flat_original_path(user, *id, "webp");
+            write_at(&flat, format!("bytes-{i}").as_bytes()).await;
+            let victim = dir.path().join(format!("victim-{i}.webp"));
+            tokio::fs::write(&victim, format!("bytes-{i}").as_bytes())
+                .await
+                .unwrap();
+            let to = s.sharded_original_path(user, *id, "webp");
+            tokio::fs::create_dir_all(to.parent().unwrap())
+                .await
+                .unwrap();
+            std::os::unix::fs::symlink(&victim, &to).unwrap();
+        }
+
+        // One genuine conflict: both sides open fine as regular files, but
+        // hold DIFFERENT bytes.
+        let conflict_id = Uuid::new_v4();
+        write_at(
+            &s.flat_original_path(user, conflict_id, "webp"),
+            b"flat-bytes",
+        )
+        .await;
+        write_at(
+            &s.sharded_original_path(user, conflict_id, "webp"),
+            b"sharded-bytes",
+        )
+        .await;
+
+        let opts = ShardOptions::default();
+        let r = s
+            .shard_flat_originals(user, &opts, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.refused, 7,
+            "every symlinked target must count as refused, not conflicts: {r:?}"
+        );
+        assert_eq!(
+            r.conflicts, 1,
+            "only the byte-different pair may count as a conflict: {r:?}"
+        );
+        assert_eq!(
+            r.refused_samples.len(),
+            5,
+            "refused_samples must cap at 5 even though 7 objects were refused: {r:?}"
+        );
+        assert_eq!(r.moved, 0);
+        assert_eq!(r.deduplicated, 0);
+
+        // Every refused flat object survives untouched.
+        for (i, id) in refused_ids.iter().enumerate() {
+            assert_eq!(
+                tokio::fs::read(s.flat_original_path(user, *id, "webp"))
+                    .await
+                    .unwrap(),
+                format!("bytes-{i}").as_bytes()
+            );
+        }
+        // The conflicting pair survives on both sides, unchanged.
+        assert_eq!(
+            tokio::fs::read(s.flat_original_path(user, conflict_id, "webp"))
+                .await
+                .unwrap(),
+            b"flat-bytes"
+        );
+        assert_eq!(
+            tokio::fs::read(s.sharded_original_path(user, conflict_id, "webp"))
+                .await
+                .unwrap(),
+            b"sharded-bytes"
+        );
     }
 
     /// MEDIUM finding: `max_passes` bounds the mover against a sustained
@@ -1615,6 +1780,57 @@ mod tests {
                 );
             }
             other => panic!("a regular file must Open, not {other:?}"),
+        }
+    }
+
+    /// Round-4 MEDIUM finding (test gap): the test above and
+    /// `shard_flat_originals_refuses_to_read_through_a_symlinked_target`
+    /// both assert only the MAPPED OUTCOME (`RegularFile::Refused`) of
+    /// `open_regular_nofollow` ITSELF — which a check-then-open
+    /// implementation of `open_regular_nofollow` (reverting its body to a
+    /// `symlink_metadata` check, the exact shape the `#[cfg(not(unix))]`
+    /// fallback below already is) reaches too, via its own `stat`, WITHOUT
+    /// ever calling `open_nofollow`/attempting a real `O_NOFOLLOW` open.
+    /// `open_nofollow_fails_with_eloop_on_a_symlink_leaf` (below) pins the
+    /// MECHANISM of the raw `open_nofollow` helper, called directly — but
+    /// nothing pinned that `open_regular_nofollow`, the mover's actual call
+    /// path, still ROUTES THROUGH that helper rather than bypassing it.
+    /// Mutation-confirmed (see FIX_ROUND-4.md): reverting `open_regular_nofollow`'s
+    /// unix body to check-then-open keeps every other test in this file
+    /// green, `open_nofollow_fails_with_eloop_on_a_symlink_leaf` included (it
+    /// calls the untouched `open_nofollow` directly, never through
+    /// `open_regular_nofollow`).
+    ///
+    /// This test closes that gap by asserting the `Refused` reason STRING
+    /// carries the real OS-level `ELOOP` message
+    /// (`io::Error::from_raw_os_error(ELOOP).to_string()`, e.g. "Too many
+    /// levels of symbolic links (os error 40)") — a message that can only
+    /// come from a REAL `open()` syscall failing with that errno. A
+    /// check-then-open implementation's refusal reads `"not a regular file
+    /// (<FileType Debug>)"` instead (see the `#[cfg(not(unix))]` fallback's
+    /// identical message), which never contains the OS's ELOOP text, because
+    /// it never performs the open that could produce it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_regular_nofollow_refusal_carries_the_real_eloop_os_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.bin");
+        tokio::fs::write(&target, b"real bytes").await.unwrap();
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let expected_os_message = std::io::Error::from_raw_os_error(libc::ELOOP).to_string();
+        match open_regular_nofollow(&link).await {
+            RegularFile::Refused(reason) => {
+                assert!(
+                    reason.contains(&expected_os_message),
+                    "a real O_NOFOLLOW open is the only thing on open_regular_nofollow's \
+                     call path that can produce the OS's own ELOOP message ({expected_os_message:?}); \
+                     a check-then-open implementation's refusal comes from `symlink_metadata` \
+                     instead and can never contain it: {reason:?}"
+                );
+            }
+            other => panic!("a symlink leaf must be Refused, not {other:?}"),
         }
     }
 
@@ -1965,13 +2181,19 @@ mod tests {
             .await
             .expect("a planted socket must not make the whole run return Err");
 
+        // Round-4 LOW finding: a socket was never opened, so it is counted
+        // as `refused` (this test's name predates that split — see
+        // FIX_ROUND-3.md, left as written per the "don't rewrite history"
+        // convention — `conflicts` is now reserved for a byte-different pair
+        // that both opened fine).
         assert_eq!(
-            r.conflicts, 1,
-            "the socket target must be counted as a conflict: {r:?}"
+            r.refused, 1,
+            "the socket target must be counted as refused, not conflicts: {r:?}"
         );
+        assert_eq!(r.conflicts, 0, "no bytes were ever compared: {r:?}");
         assert!(
             flat_blocked.exists(),
-            "the flat object behind a conflicting target must survive"
+            "the flat object behind a refused target must survive"
         );
         assert_eq!(
             tokio::fs::read(&flat_blocked).await.unwrap(),
@@ -2055,13 +2277,17 @@ mod tests {
         // Restore so TempDir cleanup can remove it.
         std::fs::set_permissions(&flat, std::fs::Permissions::from_mode(0o644)).unwrap();
 
+        // Round-4 LOW finding: never opened, so `refused`, not `conflicts`
+        // (this test's name predates that split — see FIX_ROUND-3.md, left
+        // as written per the "don't rewrite history" convention).
         assert_eq!(
-            r.conflicts, 1,
-            "an unreadable flat source must be counted as a conflict, not silently resolved: {r:?}"
+            r.refused, 1,
+            "an unreadable flat source must be counted as refused, not silently resolved: {r:?}"
         );
+        assert_eq!(r.conflicts, 0, "no bytes were ever compared: {r:?}");
         assert!(
             flat.exists(),
-            "the flat object must survive being left as a conflict"
+            "the flat object must survive being left as refused"
         );
 
         let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
