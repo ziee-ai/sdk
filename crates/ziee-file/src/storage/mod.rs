@@ -101,6 +101,45 @@ pub trait FileStorage: Send + Sync {
     /// Load thumbnail (300px, always from first page)
     async fn load_thumbnail(&self, user_id: Uuid, file_id: Uuid) -> StorageResult<Vec<u8>>;
 
+    /// Where an original's bytes are on disk RIGHT NOW, or `None` when it is
+    /// not stored. Differs from [`Self::get_original_path`] (where a NEW write
+    /// goes) for a store that is migrating between layouts: an implementation
+    /// that keeps a legacy location answers it here too, so readers find an
+    /// object wherever it currently is. A symlink is never returned.
+    async fn resolve_original_path(
+        &self,
+        user_id: Uuid,
+        file_id: Uuid,
+        extension: &str,
+    ) -> Option<PathBuf> {
+        let path = self.get_original_path(user_id, file_id, extension);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(meta) if meta.file_type().is_file() => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Delete exactly ONE original — `<file_id>.<extension>` — from every
+    /// location this storage may hold it at. `Ok(true)` when something was
+    /// removed, `Ok(false)` when it was already absent (idempotent), `Err` when
+    /// an unlink failed and the object may still be on disk.
+    async fn delete_original(
+        &self,
+        user_id: Uuid,
+        file_id: Uuid,
+        extension: &str,
+    ) -> std::io::Result<bool> {
+        let path = self.get_original_path(user_id, file_id, extension);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(std::io::Error::new(
+                e.kind(),
+                format!("remove {}: {e}", path.display()),
+            )),
+        }
+    }
+
     /// Delete all files for a file_id
     async fn delete_all(&self, user_id: Uuid, file_id: Uuid) -> StorageResult<()>;
 

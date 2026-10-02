@@ -47,8 +47,8 @@ pub mod utils;
 // Re-export the repository for the app's global `Repos.file` aggregator.
 pub use repository::FileRepository;
 pub use storage::{
-    filesystem::FilesystemStorage,
-    manager::{get_file_storage, init_file_storage},
+    filesystem::{FilesystemStorage, OriginalsLayout, ShardOptions, ShardReport},
+    manager::{get_file_storage, init_file_storage, init_file_storage_with_layout},
     FileStorage,
 };
 

@@ -1,6 +1,9 @@
 // Global file storage manager
 
-use super::{filesystem::FilesystemStorage, FileStorage};
+use super::{
+    filesystem::{FilesystemStorage, OriginalsLayout},
+    FileStorage,
+};
 use std::sync::Arc;
 
 /// Global file storage instance.
@@ -26,7 +29,17 @@ static FILE_STORAGE: std::sync::RwLock<Option<&'static Arc<dyn FileStorage>>> =
 /// call is logged as a warning (it signals a second bootstrap path in
 /// production), but the overwrite still happens.
 pub fn init_file_storage(base_path: impl AsRef<std::path::Path>) -> Arc<dyn FileStorage> {
-    let storage = Arc::new(FilesystemStorage::new(base_path)) as Arc<dyn FileStorage>;
+    init_file_storage_with_layout(base_path, OriginalsLayout::Flat)
+}
+
+/// [`init_file_storage`] with an explicit write layout for originals. Reads
+/// and deletes look in both layouts whatever is chosen here.
+pub fn init_file_storage_with_layout(
+    base_path: impl AsRef<std::path::Path>,
+    layout: OriginalsLayout,
+) -> Arc<dyn FileStorage> {
+    let storage =
+        Arc::new(FilesystemStorage::with_layout(base_path, layout)) as Arc<dyn FileStorage>;
     let leaked: &'static Arc<dyn FileStorage> = Box::leak(Box::new(storage.clone()));
     let mut guard = FILE_STORAGE.write().unwrap_or_else(|e| e.into_inner());
     #[cfg(not(test))]
