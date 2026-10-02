@@ -8809,6 +8809,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "ziee-auth",
  "ziee-core",

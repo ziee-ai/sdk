@@ -80,6 +80,13 @@ libc = "0.2"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 # The in-source `storage::filesystem` unit tests provision a scratch dir.
 tempfile = "3.15"
+# Round-3 regression test for the mover's dedup-compare conflict logging
+# (`shard_flat_originals_counts_an_unreadable_flat_source_as_a_conflict_with_the_real_reason`)
+# captures the `tracing::warn!` text to assert the log states the REAL reason
+# instead of the old, misleading "both locations hold DIFFERENT bytes" claim.
+# Version matches `sandbox-guest-agent`'s existing use elsewhere in this
+# workspace, so the resolver reuses the already-locked version.
+tracing-subscriber = "0.3"
 # `tests/http_routes.rs` drives the mountable `file_routes` bundle in-process via
 # `tower::oneshot` (mirrors ziee-health's crate-scoped HTTP test).
 tower = { version = "0.5.3", features = ["util"] }

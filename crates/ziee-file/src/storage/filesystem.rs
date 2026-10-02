@@ -30,7 +30,11 @@ async fn reject_if_symlink(path: &Path) -> StorageResult<()> {
     }
 }
 
-/// The outcome of [`open_regular_nofollow`].
+/// The outcome of [`open_regular_nofollow`]. Deliberately INFALLIBLE (no
+/// `Err` arm anywhere this type is produced) — see that function's doc for
+/// why: a type that cannot express "propagate" is what makes "every open
+/// failure other than NotFound is this object's problem, never the whole
+/// run's" true by construction instead of by convention.
 #[derive(Debug)]
 enum RegularFile {
     /// Opened, and confirmed FROM THE HANDLE (never a separate `stat`) to be
@@ -40,45 +44,76 @@ enum RegularFile {
     /// free to create.
     NotFound,
     /// Something is there but it is not safe to read as a plain regular
-    /// file — a symlink, or (unix only) a non-regular special file (FIFO,
-    /// device, socket). The caller must treat this as a conflict and never
-    /// read through it or act on its say-so.
-    Refused,
+    /// file, OR it could not be opened/stat'd at all, for any reason OTHER
+    /// than not existing — a symlink (`ELOOP`), a non-regular special file
+    /// (FIFO, device, socket — `ENXIO` on Linux for a socket node), a
+    /// permission error (`EACCES`), or anything else. The caller must treat
+    /// this as a conflict for THIS ONE OBJECT — never read through it, never
+    /// act on its say-so, and never let it abort the whole run — and should
+    /// log the carried reason (the real `io::Error`/explanation text, not a
+    /// generic claim).
+    Refused(String),
+}
+
+/// Open `path` read-only with `O_NOFOLLOW` (unix only) — the raw, UNMAPPED
+/// operation `open_regular_nofollow` builds on. Exists as its own function
+/// (rather than inlined) so a test can assert the exact OS-level error
+/// (`ELOOP` on a symlink leaf) that only a REAL `O_NOFOLLOW` open can
+/// produce — a mechanism a check-then-open implementation could never be
+/// mistaken for, unlike asserting on `open_regular_nofollow`'s mapped
+/// `RegularFile::Refused` outcome, which a check-then-open implementation
+/// reaches too (via its `symlink_metadata` check), just by a different route.
+/// `O_NONBLOCK` keeps a planted FIFO from hanging the open.
+#[cfg(unix)]
+async fn open_nofollow(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
 }
 
 /// Open `path` read-only and confirm it is a REGULAR file, atomically with
 /// respect to a symlink swap landing between "check what's there" and "read
-/// it".
+/// it" — and INFALLIBLY: every way this can fail other than "nothing there"
+/// comes back as `RegularFile::Refused(reason)`, never a propagated `Err`.
 ///
 /// `shard_flat_originals`'s dedup compare used to `symlink_metadata` the
 /// shard target, then — only if that said "regular file" — `fs::read` it: two
 /// syscalls with a gap an attacker able to write into the shard leaf could
 /// land a symlink swap into. On unix this collapses to ONE syscall-level
-/// operation: `O_NOFOLLOW` makes `open` itself fail with `ELOOP` if the leaf
-/// name is a symlink, so a symlink is refused before a single byte is ever
-/// read through it; `O_NONBLOCK` keeps a planted FIFO from hanging the open.
-/// The `metadata()` check on the returned HANDLE (not a fresh path lookup) is
-/// defense in depth against a non-symlink special file that `O_NOFOLLOW`
-/// does not filter (a device node, another FIFO opened non-blocking still
-/// reports as a FIFO).
+/// operation via [`open_nofollow`]: `O_NOFOLLOW` makes `open` itself fail
+/// with `ELOOP` if the leaf name is a symlink, so a symlink is refused before
+/// a single byte is ever read through it. The `metadata()` check on the
+/// returned HANDLE (not a fresh path lookup) is defense in depth against a
+/// non-symlink special file that `O_NOFOLLOW` does not filter (a device
+/// node, another FIFO opened non-blocking still reports as a FIFO).
+///
+/// Round 3's MEDIUM finding: an earlier version of this function mapped only
+/// `NotFound` and `ELOOP`, letting any OTHER open error (`ENXIO` from a UNIX
+/// socket node, `EACCES`, …) propagate as `Err` — the mover's `bail!` then
+/// aborted the WHOLE migration over one object it could not open, where the
+/// pre-`open_regular_nofollow` check-then-read code (a plain
+/// `symlink_metadata`) would have skipped exactly such a target as a
+/// conflict. This function is now infallible so that regression class cannot
+/// recur: the return type has no `Err` variant to propagate through.
 #[cfg(unix)]
-async fn open_regular_nofollow(path: &Path) -> std::io::Result<RegularFile> {
-    match tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .await
-    {
+async fn open_regular_nofollow(path: &Path) -> RegularFile {
+    match open_nofollow(path).await {
         Ok(file) => match file.metadata().await {
-            Ok(meta) if meta.file_type().is_file() => Ok(RegularFile::Open(file)),
-            Ok(_) => Ok(RegularFile::Refused),
-            Err(e) => Err(e),
+            Ok(meta) if meta.file_type().is_file() => RegularFile::Open(file),
+            Ok(meta) => {
+                RegularFile::Refused(format!("not a regular file ({:?})", meta.file_type()))
+            }
+            Err(e) => RegularFile::Refused(format!("metadata after open failed: {e}")),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RegularFile::NotFound),
-        // O_NOFOLLOW on a symlink leaf fails the open itself with ELOOP on
-        // Linux — this IS the refusal, nothing was read.
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Ok(RegularFile::Refused),
-        Err(e) => Err(e),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegularFile::NotFound,
+        // Any other open error — ELOOP (a symlink leaf), ENXIO (a UNIX
+        // socket node; Linux refuses to open those at all), EACCES, or
+        // anything else — means THIS ONE OBJECT cannot be safely opened as a
+        // regular file. That is a conflict for this object, never a reason
+        // to abort the whole migration.
+        Err(e) => RegularFile::Refused(format!("open failed: {e}")),
     }
 }
 
@@ -86,17 +121,21 @@ async fn open_regular_nofollow(path: &Path) -> std::io::Result<RegularFile> {
 /// check-then-read (`symlink_metadata` then `fs::File::open`) — the same gap
 /// as before `open_regular_nofollow` existed. Accepted because this storage
 /// backend's shipped targets are unix servers; revisit if that changes.
+/// Infallible for the same reason as the unix version above: any failure
+/// other than "nothing there" is this object's conflict, never the run's.
 #[cfg(not(unix))]
-async fn open_regular_nofollow(path: &Path) -> std::io::Result<RegularFile> {
+async fn open_regular_nofollow(path: &Path) -> RegularFile {
     match tokio::fs::symlink_metadata(path).await {
-        Ok(meta) if !meta.file_type().is_file() => Ok(RegularFile::Refused),
+        Ok(meta) if !meta.file_type().is_file() => {
+            RegularFile::Refused(format!("not a regular file ({:?})", meta.file_type()))
+        }
         Ok(_) => match tokio::fs::File::open(path).await {
-            Ok(file) => Ok(RegularFile::Open(file)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RegularFile::NotFound),
-            Err(e) => Err(e),
+            Ok(file) => RegularFile::Open(file),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegularFile::NotFound,
+            Err(e) => RegularFile::Refused(format!("open failed: {e}")),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RegularFile::NotFound),
-        Err(e) => Err(e),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RegularFile::NotFound,
+        Err(e) => RegularFile::Refused(format!("stat failed: {e}")),
     }
 }
 
@@ -282,6 +321,20 @@ impl FilesystemStorage {
     /// and the mover would unlink the REAL flat object, leaving only the
     /// attacker-controlled symlink behind.
     ///
+    /// `open_regular_nofollow` is INFALLIBLE: a target (shard side) or source
+    /// (flat side) that cannot be opened as a regular file for ANY reason
+    /// other than not existing — a symlink, a directory, a FIFO/device/
+    /// socket, a permission error, anything else a filesystem can throw at
+    /// an `open` — is a CONFLICT for that ONE object, logged at `warn` with
+    /// the real reason, and the run continues; it is never a reason to abort
+    /// the whole migration. The flat source specifically distinguishes
+    /// "vanished" (`NotFound` — a racing delete got there first: nothing to
+    /// compare, nothing to move, not a conflict, counts exactly like the
+    /// `rename`-`NotFound` path below) from "exists but unsafe to open"
+    /// (`Refused` — a genuine conflict, counted and logged with its real
+    /// reason) from "opened fine" (byte-compared against the target as
+    /// before).
+    ///
     /// Bounded by `opts.max_passes`: a sustained concurrent flat writer can
     /// keep adding entries to the directory forever, so without a ceiling
     /// this would never return. `ShardReport::remaining_flat` reports what
@@ -382,66 +435,92 @@ impl FilesystemStorage {
                     leaves.insert(leaf);
                 }
                 match open_regular_nofollow(&to).await {
-                    Ok(RegularFile::Refused) => {
-                        // The target exists but is not safely readable as a
-                        // regular file (a symlink, or another special file).
-                        // INV-6: never read through it, never unlink the
-                        // flat copy on its say-so.
+                    RegularFile::Refused(reason) => {
+                        // The target exists but could not be opened safely as
+                        // a regular file — a symlink, a directory, a FIFO/
+                        // device/socket, a permission error, or any other
+                        // open failure (ENXIO from a UNIX socket node,
+                        // EACCES, ...). INV-6: never read through it, never
+                        // unlink the flat copy on its say-so. A conflict for
+                        // THIS ONE OBJECT, never fatal to the run — a planted
+                        // special file must not be able to halt every future
+                        // re-run (round-3 MEDIUM finding).
                         conflicts += 1;
                         tracing::warn!(
                             flat = %from.display(),
                             sharded = %to.display(),
-                            "shard move: target exists but is not a safely-readable \
-                             regular file (symlink or other) — left the flat copy in place"
+                            reason = %reason,
+                            "shard move: target exists but could not be safely opened as \
+                             a regular file — left the flat copy in place"
                         );
                         continue;
                     }
-                    Ok(RegularFile::Open(mut to_file)) => {
+                    RegularFile::Open(mut to_file) => {
                         // The FLAT side goes through the SAME atomic
                         // open+confirm as the sharded side above — closing
                         // the identical check-then-read gap on the flat leaf
                         // too, not only the shard target.
-                        let same = match open_regular_nofollow(&from).await {
-                            Ok(RegularFile::Open(mut from_file)) => {
+                        match open_regular_nofollow(&from).await {
+                            RegularFile::Open(mut from_file) => {
                                 let mut a = Vec::new();
                                 let mut b = Vec::new();
-                                matches!(
+                                let same = matches!(
                                     (
                                         from_file.read_to_end(&mut a).await,
                                         to_file.read_to_end(&mut b).await,
                                     ),
                                     (Ok(_), Ok(_))
-                                ) && a == b
-                            }
-                            // The flat side vanished or turned unsafe between
-                            // the directory listing and here — never treat
-                            // that as "same".
-                            _ => false,
-                        };
-                        if same {
-                            match fs::remove_file(&from).await {
-                                Ok(()) => {
-                                    report.deduplicated += 1;
-                                    flat_seen -= 1;
+                                ) && a == b;
+                                if same {
+                                    match fs::remove_file(&from).await {
+                                        Ok(()) => {
+                                            report.deduplicated += 1;
+                                            flat_seen -= 1;
+                                        }
+                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                            flat_seen -= 1;
+                                        }
+                                        Err(e) => bail!(e),
+                                    }
+                                } else {
+                                    conflicts += 1;
+                                    tracing::warn!(
+                                        flat = %from.display(),
+                                        sharded = %to.display(),
+                                        "shard move: both locations hold DIFFERENT bytes for one \
+                                         object — left both in place"
+                                    );
                                 }
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                    flat_seen -= 1;
-                                }
-                                Err(e) => bail!(e),
                             }
-                        } else {
-                            conflicts += 1;
-                            tracing::warn!(
-                                flat = %from.display(),
-                                sharded = %to.display(),
-                                "shard move: both locations hold DIFFERENT bytes for one \
-                                 object — left both in place"
-                            );
+                            RegularFile::NotFound => {
+                                // The flat side vanished (a racing delete)
+                                // between the directory listing and here —
+                                // nothing to compare, nothing to move. NOT a
+                                // conflict: matches the rename-NotFound path
+                                // below ("deleted under us") — round-3 LOW
+                                // finding.
+                                flat_seen -= 1;
+                            }
+                            RegularFile::Refused(reason) => {
+                                // The flat source itself exists but could not
+                                // be opened safely — a genuine conflict (not
+                                // "vanished"), logged with the REAL reason
+                                // rather than the old, misleading "DIFFERENT
+                                // bytes" claim (round-3 LOW finding: no bytes
+                                // were ever compared here).
+                                conflicts += 1;
+                                tracing::warn!(
+                                    flat = %from.display(),
+                                    sharded = %to.display(),
+                                    reason = %reason,
+                                    "shard move: flat source exists but could not be safely \
+                                     opened as a regular file — left both in place"
+                                );
+                            }
                         }
                         continue;
                     }
-                    Ok(RegularFile::NotFound) => {}
-                    Err(e) => bail!(e),
+                    RegularFile::NotFound => {}
                 }
                 match fs::rename(&from, &to).await {
                     Ok(()) => {
@@ -1497,6 +1576,15 @@ mod tests {
     /// leaf must come back `Refused` — refused at the `open` syscall itself
     /// (unix `O_NOFOLLOW` → `ELOOP`), never a successful `Open` that a caller
     /// could then read through.
+    ///
+    /// Round-3 note (test-gap LOW finding): this test asserts the OUTCOME
+    /// (`Refused`) only, which a check-then-open implementation reaches too
+    /// (via its own `symlink_metadata` call) — it does NOT, by itself, pin
+    /// that the refusal comes from a real `O_NOFOLLOW` open. That mechanism
+    /// is pinned separately by `open_nofollow_fails_with_eloop_on_a_symlink_leaf`
+    /// below, which calls the raw, unmapped `open_nofollow` directly. Since
+    /// `open_regular_nofollow` is now infallible (round-3 MEDIUM fix), it
+    /// returns `RegularFile` directly rather than `io::Result<RegularFile>`.
     #[cfg(unix)]
     #[tokio::test]
     async fn open_regular_nofollow_refuses_a_symlink_with_eloop() {
@@ -1506,25 +1594,70 @@ mod tests {
         let link = dir.path().join("link.bin");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        match open_regular_nofollow(&link).await.unwrap() {
-            RegularFile::Refused => {}
+        match open_regular_nofollow(&link).await {
+            RegularFile::Refused(_) => {}
             other => panic!("a symlink leaf must be Refused, not {other:?}"),
         }
 
         let missing = dir.path().join("missing.bin");
-        match open_regular_nofollow(&missing).await.unwrap() {
+        match open_regular_nofollow(&missing).await {
             RegularFile::NotFound => {}
             other => panic!("a missing path must be NotFound, not {other:?}"),
         }
 
-        match open_regular_nofollow(&target).await.unwrap() {
+        match open_regular_nofollow(&target).await {
             RegularFile::Open(mut f) => {
                 let mut buf = Vec::new();
                 f.read_to_end(&mut buf).await.unwrap();
-                assert_eq!(buf, b"real bytes", "a genuine regular file must still open and read");
+                assert_eq!(
+                    buf, b"real bytes",
+                    "a genuine regular file must still open and read"
+                );
             }
             other => panic!("a regular file must Open, not {other:?}"),
         }
+    }
+
+    /// Round-3 LOW finding (test gap): pins the `O_NOFOLLOW` MECHANISM
+    /// itself, independent of `open_regular_nofollow`'s error-mapping layer.
+    /// Before this test, reverting `open_nofollow`'s body to a plain
+    /// `tokio::fs::File::open(path).await` (dropping the `O_NOFOLLOW` custom
+    /// flag) kept every other test in this file green: they only assert the
+    /// mapped OUTCOME ("Refused"/a conflict), which a check-then-open
+    /// implementation reaches too, just via a `symlink_metadata` call rather
+    /// than a real `O_NOFOLLOW` open. This test calls `open_nofollow`
+    /// directly and asserts the SPECIFIC OS error (`ELOOP`) that only a
+    /// genuine `O_NOFOLLOW` open against a symlink leaf can produce — a
+    /// check-then-open implementation never attempts this open at all on
+    /// that path, so it cannot produce this error (manually mutation-checked:
+    /// reverting `open_nofollow` to drop `O_NOFOLLOW` makes this test fail —
+    /// the open SUCCEEDS instead of returning `ELOOP`, since it silently
+    /// follows the symlink; see FIX_ROUND-3.md).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_nofollow_fails_with_eloop_on_a_symlink_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.bin");
+        tokio::fs::write(&target, b"real bytes").await.unwrap();
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = open_nofollow(&link)
+            .await
+            .expect_err("O_NOFOLLOW must refuse to open a symlink leaf");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "a check-then-open implementation cannot produce this specific OS error: {err:?}"
+        );
+
+        // A genuine regular file still opens fine through the same raw helper.
+        let mut f = open_nofollow(&target)
+            .await
+            .expect("a regular file must open");
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"real bytes");
     }
 
     /// `FileStorage::open_original`'s wrapper: a [`FilesystemStorage`] whose
@@ -1782,7 +1915,164 @@ mod tests {
         }
         for id in &written {
             let bytes = s.load_original(user, *id, "webp").await.unwrap();
-            assert_eq!(&bytes, &written_bytes[id], "written object {id} must keep its exact bytes");
+            assert_eq!(
+                &bytes, &written_bytes[id],
+                "written object {id} must keep its exact bytes"
+            );
         }
+    }
+
+    /// Round-3 regression, MEDIUM finding: `open_regular_nofollow` used to map
+    /// only `NotFound` and `ELOOP`; ANY other open error (ENXIO from a UNIX
+    /// socket planted at the shard target, EACCES, ENOTDIR, ...) propagated
+    /// and the mover's `bail!` aborted the WHOLE migration. A single planted
+    /// socket halted every future re-run. Binds a real `UnixListener`
+    /// somewhere short (so it fits `sun_path`'s length limit) and hard-links
+    /// the resulting socket special file into the shard target — a hard link
+    /// to a socket is a normal directory-entry operation on the same
+    /// filesystem, and `open()`'s behavior is driven by the inode's type
+    /// regardless of which link reached it, so this is a genuine socket at
+    /// the target, not a synthesized stand-in.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shard_flat_originals_treats_a_socket_at_the_target_as_a_conflict_not_a_fatal_error() {
+        let (dir, s) = sharded();
+        let user = Uuid::new_v4();
+
+        let blocked = Uuid::new_v4();
+        let flat_blocked = s.flat_original_path(user, blocked, "webp");
+        write_at(&flat_blocked, b"should survive").await;
+        let to = s.sharded_original_path(user, blocked, "webp");
+        tokio::fs::create_dir_all(to.parent().unwrap())
+            .await
+            .unwrap();
+
+        let short_dir = tempfile::Builder::new().prefix("sk").tempdir().unwrap();
+        let short_sock = short_dir.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&short_sock)
+            .expect("bind a real unix socket at a short path");
+        std::fs::hard_link(&short_sock, &to)
+            .expect("hard-link the socket special file into the shard target (same fs as /tmp)");
+
+        // A SECOND, unrelated object in the same user namespace must still
+        // move normally in the SAME run — the socket must not stall it.
+        let other = Uuid::new_v4();
+        write_at(&s.flat_original_path(user, other, "webp"), b"moves fine").await;
+
+        let opts = ShardOptions::default();
+        let r = s
+            .shard_flat_originals(user, &opts, &mut |_| {})
+            .await
+            .expect("a planted socket must not make the whole run return Err");
+
+        assert_eq!(
+            r.conflicts, 1,
+            "the socket target must be counted as a conflict: {r:?}"
+        );
+        assert!(
+            flat_blocked.exists(),
+            "the flat object behind a conflicting target must survive"
+        );
+        assert_eq!(
+            tokio::fs::read(&flat_blocked).await.unwrap(),
+            b"should survive",
+            "the surviving flat object must be untouched"
+        );
+        assert!(
+            s.resolve_original_path(user, other, "webp").await.is_some(),
+            "an unrelated object must still have moved despite the socket conflict"
+        );
+        assert!(!s.flat_original_path(user, other, "webp").exists());
+        drop(dir);
+    }
+
+    /// A small writer that forwards every `write` into a shared buffer, used
+    /// to capture `tracing` output for the next test (asserting on the LOG
+    /// TEXT, not just the counters — the bug this regresses only changes the
+    /// message, not the count).
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Round-3 regression, LOW finding: the FLAT-source side of the
+    /// dedup-compare used to collapse `NotFound`/`Refused`/any real `Err`
+    /// into a bare `_ => false`, so an unreadable (not vanished) flat source
+    /// got logged with the same "both locations hold DIFFERENT bytes" text as
+    /// a genuine byte mismatch — false, since no bytes were ever compared.
+    /// Captures the actual `tracing::warn!` text to prove the log now states
+    /// the REAL reason and no longer makes that false claim.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shard_flat_originals_counts_an_unreadable_flat_source_as_a_conflict() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root — chmod 000 does not deny root's own reads");
+            return;
+        }
+        let (dir, s) = sharded();
+        let user = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let flat = s.flat_original_path(user, id, "webp");
+        write_at(&flat, b"unreadable").await;
+        // A pre-existing sharded target (any regular file) so the mover
+        // reaches the dedup-compare's flat-source open at all — with no
+        // target there it would simply rename, never opening `from` through
+        // this path.
+        write_at(&s.sharded_original_path(user, id, "webp"), b"target").await;
+        std::fs::set_permissions(&flat, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_level(false)
+            .with_target(false)
+            .finish();
+        let opts = ShardOptions::default();
+        let r = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            s.shard_flat_originals(user, &opts, &mut |_| {})
+                .await
+                .unwrap()
+        };
+
+        // Restore so TempDir cleanup can remove it.
+        std::fs::set_permissions(&flat, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            r.conflicts, 1,
+            "an unreadable flat source must be counted as a conflict, not silently resolved: {r:?}"
+        );
+        assert!(
+            flat.exists(),
+            "the flat object must survive being left as a conflict"
+        );
+
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("DIFFERENT bytes"),
+            "the log must not claim a byte mismatch when no bytes were ever compared: {logs}"
+        );
+        assert!(
+            logs.to_ascii_lowercase().contains("permission") || logs.contains("reason"),
+            "the log must state the REAL reason (a permission error), not a generic claim: {logs}"
+        );
+        drop(dir);
     }
 }
