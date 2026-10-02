@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 /// Reject reads that would follow a symlink. If the storage tree
@@ -26,6 +27,76 @@ async fn reject_if_symlink(path: &Path) -> StorageResult<()> {
         // ENOENT → propagate as not_found later in the read call.
         // Other errors (permission denied, etc.) → propagate the same.
         _ => Ok(()),
+    }
+}
+
+/// The outcome of [`open_regular_nofollow`].
+#[derive(Debug)]
+enum RegularFile {
+    /// Opened, and confirmed FROM THE HANDLE (never a separate `stat`) to be
+    /// a regular file.
+    Open(tokio::fs::File),
+    /// Nothing at the path (`ENOENT`) — the caller proceeds as if it were
+    /// free to create.
+    NotFound,
+    /// Something is there but it is not safe to read as a plain regular
+    /// file — a symlink, or (unix only) a non-regular special file (FIFO,
+    /// device, socket). The caller must treat this as a conflict and never
+    /// read through it or act on its say-so.
+    Refused,
+}
+
+/// Open `path` read-only and confirm it is a REGULAR file, atomically with
+/// respect to a symlink swap landing between "check what's there" and "read
+/// it".
+///
+/// `shard_flat_originals`'s dedup compare used to `symlink_metadata` the
+/// shard target, then — only if that said "regular file" — `fs::read` it: two
+/// syscalls with a gap an attacker able to write into the shard leaf could
+/// land a symlink swap into. On unix this collapses to ONE syscall-level
+/// operation: `O_NOFOLLOW` makes `open` itself fail with `ELOOP` if the leaf
+/// name is a symlink, so a symlink is refused before a single byte is ever
+/// read through it; `O_NONBLOCK` keeps a planted FIFO from hanging the open.
+/// The `metadata()` check on the returned HANDLE (not a fresh path lookup) is
+/// defense in depth against a non-symlink special file that `O_NOFOLLOW`
+/// does not filter (a device node, another FIFO opened non-blocking still
+/// reports as a FIFO).
+#[cfg(unix)]
+async fn open_regular_nofollow(path: &Path) -> std::io::Result<RegularFile> {
+    match tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .await
+    {
+        Ok(file) => match file.metadata().await {
+            Ok(meta) if meta.file_type().is_file() => Ok(RegularFile::Open(file)),
+            Ok(_) => Ok(RegularFile::Refused),
+            Err(e) => Err(e),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RegularFile::NotFound),
+        // O_NOFOLLOW on a symlink leaf fails the open itself with ELOOP on
+        // Linux — this IS the refusal, nothing was read.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Ok(RegularFile::Refused),
+        Err(e) => Err(e),
+    }
+}
+
+/// Non-unix fallback: no portable `O_NOFOLLOW` in `std`/`tokio`, so this stays
+/// check-then-read (`symlink_metadata` then `fs::File::open`) — the same gap
+/// as before `open_regular_nofollow` existed. Accepted because this storage
+/// backend's shipped targets are unix servers; revisit if that changes.
+#[cfg(not(unix))]
+async fn open_regular_nofollow(path: &Path) -> std::io::Result<RegularFile> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if !meta.file_type().is_file() => Ok(RegularFile::Refused),
+        Ok(_) => match tokio::fs::File::open(path).await {
+            Ok(file) => Ok(RegularFile::Open(file)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RegularFile::NotFound),
+            Err(e) => Err(e),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RegularFile::NotFound),
+        Err(e) => Err(e),
     }
 }
 
@@ -197,24 +268,39 @@ impl FilesystemStorage {
     /// other — either the unlink wins (the rename then fails `ENOENT` and is
     /// skipped) or the rename wins (the sharded unlink, which runs after, hits).
     ///
-    /// The target of a move is probed with `symlink_metadata` (never
-    /// followed) before anything is read through it: if it exists and is
-    /// NOT a regular file — a symlink, a directory, anything else — it is
-    /// never opened and the flat copy is never unlinked on its say-so; that
-    /// is counted as a conflict and both are left in place. Without this, a
-    /// symlink planted at the shard target pointing at bytes identical to
-    /// the flat copy would make the byte-compare report "same" and the
-    /// mover would unlink the REAL flat object, leaving only the
+    /// Both sides of the byte-compare — the shard target and the flat
+    /// source — are opened through [`open_regular_nofollow`] (unix:
+    /// `O_NOFOLLOW`, atomic with the symlink check) rather than a
+    /// `symlink_metadata` probe followed by a separate `fs::read`: if either
+    /// side exists and is NOT a regular file — a symlink, a directory,
+    /// anything else — it is never opened and the flat copy is never
+    /// unlinked on its say-so; that is counted as a conflict and both are
+    /// left in place. A check-then-read pair would leave a gap for a symlink
+    /// swapped in between the two steps; `open_regular_nofollow` has none.
+    /// Without this, a symlink planted at the shard target pointing at bytes
+    /// identical to the flat copy would make the byte-compare report "same"
+    /// and the mover would unlink the REAL flat object, leaving only the
     /// attacker-controlled symlink behind.
     ///
     /// Bounded by `opts.max_passes`: a sustained concurrent flat writer can
     /// keep adding entries to the directory forever, so without a ceiling
     /// this would never return. `ShardReport::remaining_flat` reports what
     /// is left when the bound is hit (or a `limit`/conflict stopped it
-    /// early); a follow-up call continues from there. On an I/O error the
-    /// best-effort report accumulated so far is handed to `progress` before
-    /// the error propagates, so a caller does not lose a long run's progress
-    /// to its last failure.
+    /// early); a follow-up call continues from there.
+    ///
+    /// **Error/progress semantics.** The four DESCRIPTIVE fields —
+    /// `conflicts`, `skipped`, `remaining_flat` — describe the LAST COMPLETED
+    /// pass (a pass that finished listing the whole directory); `moved` and
+    /// `deduplicated` are cumulative across every pass regardless. On an I/O
+    /// error the best-effort `report` accumulated so far — i.e. still holding
+    /// the last COMPLETED pass's descriptive numbers, never the failing
+    /// pass's own partial, still-being-counted locals — is handed to
+    /// `progress` before the error propagates, so a caller does not lose a
+    /// long run's progress to its last failure. If the error hits during the
+    /// very FIRST pass, there is no completed pass yet and the descriptive
+    /// fields stay at their default `0` — meaning "unknown", not "zero found"
+    /// — which is why the CLI prints that its printed counts may be
+    /// incomplete whenever this call returns `Err`.
     pub async fn shard_flat_originals(
         &self,
         user_id: Uuid,
@@ -241,14 +327,21 @@ impl FilesystemStorage {
             let mut conflicts = 0u64;
             let mut skipped = 0u64;
             // On any I/O error below, hand `progress` the best-effort report
-            // accumulated so far (this pass's counters folded in) before
-            // propagating — a long run's partial progress is not silently
-            // dropped on its last failure.
+            // accumulated so far before propagating — a long run's partial
+            // progress is not silently dropped on its last failure.
+            //
+            // Deliberately NOT folded in here: this pass's own (incomplete)
+            // `flat_seen`/`conflicts`/`skipped` locals. `report`'s descriptive
+            // fields already hold the LAST COMPLETED pass's numbers (committed
+            // below, once a pass finishes its directory listing); overwriting
+            // them with a partial pass's partial counts is how a real error —
+            // e.g. this pass's `read_dir` itself failing, with its locals
+            // still at their just-reset zero — reported 0 conflicts / 0
+            // remaining after a PRIOR pass had left real ones, which an
+            // operator reads as "fully converged". `moved`/`deduplicated` stay
+            // cumulative across passes either way, so they need no such care.
             macro_rules! bail {
                 ($e:expr) => {{
-                    report.remaining_flat = flat_seen;
-                    report.conflicts = conflicts;
-                    report.skipped = skipped;
                     progress(&report);
                     return Err($e);
                 }};
@@ -288,26 +381,41 @@ impl FilesystemStorage {
                     }
                     leaves.insert(leaf);
                 }
-                match fs::symlink_metadata(&to).await {
-                    Ok(meta) if !meta.file_type().is_file() => {
-                        // The target exists but is not a regular file.
+                match open_regular_nofollow(&to).await {
+                    Ok(RegularFile::Refused) => {
+                        // The target exists but is not safely readable as a
+                        // regular file (a symlink, or another special file).
                         // INV-6: never read through it, never unlink the
                         // flat copy on its say-so.
                         conflicts += 1;
                         tracing::warn!(
                             flat = %from.display(),
                             sharded = %to.display(),
-                            "shard move: target exists but is not a regular file \
-                             (symlink or other) — left the flat copy in place"
+                            "shard move: target exists but is not a safely-readable \
+                             regular file (symlink or other) — left the flat copy in place"
                         );
                         continue;
                     }
-                    Ok(_) => {
-                        // The FLAT side is already known to be a regular file
-                        // (`flat_object_name` filtered it); the sharded side
-                        // was just confirmed one above.
-                        let same = match (fs::read(&from).await, fs::read(&to).await) {
-                            (Ok(a), Ok(b)) => a == b,
+                    Ok(RegularFile::Open(mut to_file)) => {
+                        // The FLAT side goes through the SAME atomic
+                        // open+confirm as the sharded side above — closing
+                        // the identical check-then-read gap on the flat leaf
+                        // too, not only the shard target.
+                        let same = match open_regular_nofollow(&from).await {
+                            Ok(RegularFile::Open(mut from_file)) => {
+                                let mut a = Vec::new();
+                                let mut b = Vec::new();
+                                matches!(
+                                    (
+                                        from_file.read_to_end(&mut a).await,
+                                        to_file.read_to_end(&mut b).await,
+                                    ),
+                                    (Ok(_), Ok(_))
+                                ) && a == b
+                            }
+                            // The flat side vanished or turned unsafe between
+                            // the directory listing and here — never treat
+                            // that as "same".
                             _ => false,
                         };
                         if same {
@@ -332,7 +440,7 @@ impl FilesystemStorage {
                         }
                         continue;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(RegularFile::NotFound) => {}
                     Err(e) => bail!(e),
                 }
                 match fs::rename(&from, &to).await {
@@ -1282,6 +1390,140 @@ mod tests {
                 // still be correctly accounted for.
                 assert_eq!(r.moved, 1);
             }
+        }
+    }
+
+    /// Round-2 fix-round regression for the MEDIUM finding (ledger: "the
+    /// bail! macro commits the CURRENT incomplete pass's per-pass locals
+    /// (conflicts/remaining_flat/skipped) over the previous completed pass's
+    /// report"). The round-1 test above uses a SINGLE object, so its pass 1
+    /// has zero conflicts/remaining either way — the bug and the fix are
+    /// indistinguishable there, which is exactly why it survived round 1. TWO
+    /// objects close that gap: one moves cleanly, one is left as a genuine
+    /// CONFLICT (a pre-existing sharded target with different bytes), so pass
+    /// 1 completes with `conflicts: 1, remaining_flat: 1`. Pass 2's `read_dir`
+    /// is then made to fail the same way as above. Before the fix, the error
+    /// path reported `conflicts: 0, remaining_flat: 0` (pass 2's freshly-reset
+    /// locals) even though pass 1 left one real conflict on disk — an
+    /// operator reading that would believe the migration fully converged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shard_flat_originals_keeps_last_completed_pass_numbers_on_a_later_io_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, s) = sharded();
+        let user = Uuid::new_v4();
+
+        let moved_id = Uuid::new_v4();
+        write_at(&s.flat_original_path(user, moved_id, "webp"), b"ok").await;
+
+        let conflict_id = Uuid::new_v4();
+        write_at(&s.flat_original_path(user, conflict_id, "webp"), b"one").await;
+        write_at(&s.sharded_original_path(user, conflict_id, "webp"), b"two").await;
+
+        let flat_dir = dir.path().join("originals").join(user.to_string());
+        let opts = ShardOptions { batch: 1, pause: std::time::Duration::ZERO, ..Default::default() };
+        let mut last_seen = ShardReport::default();
+        let mut calls = 0u32;
+        let flat_dir_for_cb = flat_dir.clone();
+        let res = s
+            .shard_flat_originals(user, &opts, &mut |r| {
+                calls += 1;
+                last_seen = r.clone();
+                if calls == 1 {
+                    // Fires once, right after `moved_id` is renamed (batch: 1
+                    // ⇒ a progress call after every move; the conflict entry
+                    // never reaches this callback since it `continue`s before
+                    // the move/since_pause bookkeeping). `read_dir`'s
+                    // `entries` iterator is already-open and keeps working
+                    // past this revocation (an open fd's further `readdir`s
+                    // are not permission-rechecked) — only a FRESH `read_dir`
+                    // (pass 2's) fails. EXECUTE-only (no READ) is deliberate,
+                    // not just a weaker version of denying everything: shard
+                    // leaves (`xx/yy/`) live INSIDE this same namespace
+                    // directory, so `conflict_id`'s path-based opens (its
+                    // shard target AND its flat source, whichever of the two
+                    // entries this pass happens to reach first — directory
+                    // enumeration order is unspecified) must keep resolving
+                    // regardless of when in pass 1 they land relative to this
+                    // revoke; a full 0o000 would deny that traversal too and
+                    // make the test flaky on entry order (caught empirically
+                    // — a prior version of this test using 0o000 failed
+                    // intermittently for exactly this reason). `fs::read_dir`
+                    // (`opendir`+listing) needs READ; a path-based `open` of a
+                    // file whose full path is already known needs only
+                    // EXECUTE (search) on every ancestor directory — so
+                    // 0o100 blocks the former while leaving the latter alone.
+                    let _ = std::fs::set_permissions(
+                        &flat_dir_for_cb,
+                        std::fs::Permissions::from_mode(0o100),
+                    );
+                }
+            })
+            .await;
+
+        // Restore so the TempDir's own cleanup can recurse into it.
+        let _ = std::fs::set_permissions(&flat_dir, std::fs::Permissions::from_mode(0o755));
+
+        match res {
+            Err(_) => {
+                assert_eq!(last_seen.moved, 1, "{last_seen:?}");
+                assert_eq!(
+                    last_seen.conflicts, 1,
+                    "the LAST progress call before the error must still carry pass 1's \
+                     real conflict, not a later pass's unwritten zero: {last_seen:?}"
+                );
+                assert_eq!(
+                    last_seen.remaining_flat, 1,
+                    "ditto for remaining_flat — the conflicting object is still on \
+                     disk, flat: {last_seen:?}"
+                );
+            }
+            Ok(r) => {
+                // Root ignores the directory's permission bits (see the
+                // round-1 test's identical caveat) — the run simply
+                // completes; assert the steady-state numbers instead.
+                assert_eq!(r.moved, 1);
+                assert_eq!(r.conflicts, 1);
+                assert_eq!(r.remaining_flat, 1);
+            }
+        }
+    }
+
+    /// Round-2 fix-round regression for the LOW finding (ledger: "the
+    /// non-regular-file guard is check-then-read ... an attacker with write
+    /// access to the shard leaf could swap the regular file for a symlink
+    /// between `symlink_metadata` and `fs::read`"). Exercises
+    /// `open_regular_nofollow` directly, isolated from the mover: a symlink
+    /// leaf must come back `Refused` — refused at the `open` syscall itself
+    /// (unix `O_NOFOLLOW` → `ELOOP`), never a successful `Open` that a caller
+    /// could then read through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_regular_nofollow_refuses_a_symlink_with_eloop() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.bin");
+        tokio::fs::write(&target, b"real bytes").await.unwrap();
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        match open_regular_nofollow(&link).await.unwrap() {
+            RegularFile::Refused => {}
+            other => panic!("a symlink leaf must be Refused, not {other:?}"),
+        }
+
+        let missing = dir.path().join("missing.bin");
+        match open_regular_nofollow(&missing).await.unwrap() {
+            RegularFile::NotFound => {}
+            other => panic!("a missing path must be NotFound, not {other:?}"),
+        }
+
+        match open_regular_nofollow(&target).await.unwrap() {
+            RegularFile::Open(mut f) => {
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf).await.unwrap();
+                assert_eq!(buf, b"real bytes", "a genuine regular file must still open and read");
+            }
+            other => panic!("a regular file must Open, not {other:?}"),
         }
     }
 

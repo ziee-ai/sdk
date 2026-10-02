@@ -63,6 +63,15 @@ aide = { version = "0.15", features = ["axum", "axum-json", "axum-query", "macro
 axum = { version = "0.8.4", features = ["macros", "multipart"], optional = true }
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# `shard_flat_originals`'s mover opens its byte-compare targets with
+# `O_NOFOLLOW` (+ `O_NONBLOCK`, so a planted FIFO can't hang the open) so the
+# symlink-refusal and the open are one atomic syscall instead of a
+# check-then-read `symlink_metadata` + `fs::read` pair. Already present
+# transitively (tokio, sqlx); pinned directly here because this crate now
+# references `libc::O_NOFOLLOW`/`libc::ELOOP` itself.
+libc = "0.2"
+
 [dev-dependencies]
 # Crate-scoped integration tests (tests/repository.rs) drive the async
 # `FileRepository` against a throwaway DB, so they need a `#[tokio::test]`
