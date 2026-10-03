@@ -139,6 +139,65 @@ async fn open_regular_nofollow(path: &Path) -> RegularFile {
     }
 }
 
+/// The outcome of comparing ONE flat object (`from`) against its shard
+/// target (`to`) — the single decision procedure both
+/// [`FilesystemStorage::shard_flat_originals`]'s mover and
+/// [`FilesystemStorage::census`] resolve a flat entry through (via
+/// [`classify_against_target`]), so the two can never classify the same
+/// object differently. FIX_ROUND-6.md: this is what replaced a per-pass
+/// descriptive snapshot that drifted from reality on every early-return path
+/// — there is now exactly one place that decides refused/conflict/identical
+/// for a given pair, called by both the actor (the mover) and the observer
+/// (the census).
+#[derive(Debug)]
+enum Classification {
+    /// No shard target exists yet.
+    TargetAbsent,
+    /// The shard target exists but could not be opened and confirmed as a
+    /// regular file (symlink, directory, FIFO/device/socket, permission
+    /// error, ...). No bytes were ever compared.
+    TargetRefused(String),
+    /// The target opened fine, but the flat source itself vanished (a racing
+    /// delete) between being listed and this check. Nothing to compare,
+    /// nothing to move — not a refusal, not a conflict.
+    SourceVanished,
+    /// The target opened fine, but the flat source could not be opened and
+    /// confirmed as a regular file. No bytes were ever compared.
+    SourceRefused(String),
+    /// Both sides opened fine as regular files and were byte-compared.
+    Compared { identical: bool },
+}
+
+/// Resolve [`Classification`] for flat object `from` against its shard
+/// target `to`, using [`open_regular_nofollow`] on BOTH sides — unix:
+/// `O_NOFOLLOW`, atomic with the symlink check, never a `symlink_metadata`
+/// probe followed by a separate `fs::read` (the gap a symlink swapped in
+/// between those two steps could use to make an attacker-controlled target
+/// read as "identical" and get the REAL flat object unlinked out from under
+/// it). Never mutates anything — opens for read only.
+async fn classify_against_target(to: &Path, from: &Path) -> Classification {
+    match open_regular_nofollow(to).await {
+        RegularFile::NotFound => Classification::TargetAbsent,
+        RegularFile::Refused(reason) => Classification::TargetRefused(reason),
+        RegularFile::Open(mut to_file) => match open_regular_nofollow(from).await {
+            RegularFile::NotFound => Classification::SourceVanished,
+            RegularFile::Refused(reason) => Classification::SourceRefused(reason),
+            RegularFile::Open(mut from_file) => {
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                let identical = matches!(
+                    (
+                        from_file.read_to_end(&mut a).await,
+                        to_file.read_to_end(&mut b).await,
+                    ),
+                    (Ok(_), Ok(_))
+                ) && a == b;
+                Classification::Compared { identical }
+            }
+        },
+    }
+}
+
 /// Where NEW originals are written under `originals/<user>/`.
 ///
 /// Reads and deletes are layout-agnostic: they look in BOTH places
@@ -177,8 +236,8 @@ pub struct ShardOptions {
     /// normally stops when a pass moves nothing, but a sustained concurrent
     /// flat writer (a not-yet-restarted server still writing flat) can keep
     /// adding entries forever, so without a ceiling the call would never
-    /// return. `ShardReport::remaining_flat` reports what is still flat when
-    /// the bound is hit; a follow-up call continues from there.
+    /// return. [`ShardCensus::remaining_flat`] reports what is still flat
+    /// when the bound is hit; a follow-up call continues from there.
     pub max_passes: usize,
 }
 
@@ -193,68 +252,91 @@ impl Default for ShardOptions {
     }
 }
 
-/// What one [`FilesystemStorage::shard_flat_originals`] run did.
+/// A point-in-time snapshot of what [`FilesystemStorage::census`] found still
+/// sitting in the flat directory, produced by walking it ONCE, read-only,
+/// classifying every entry with the EXACT SAME predicates
+/// [`FilesystemStorage::shard_flat_originals`]'s mover uses for its own
+/// open/compare decisions (so "what the mover would do with this entry" and
+/// "what the census says about it" can never drift apart by construction —
+/// there is only one classification function, not two kept in sync by hand).
 ///
-/// **Field semantics (round-5 fix: `refused_samples` joins the per-pass
-/// set).** Exactly two fields are CUMULATIVE across every pass a call
-/// makes: `moved` and `deduplicated`. Every other field — `conflicts`,
-/// `refused`, `refused_samples`, `skipped`, `remaining_flat` — describes
-/// only the LAST COMPLETED pass (a pass whose `read_dir` listing finished)
-/// and all five are committed TOGETHER, atomically, at that moment. Before
-/// round 5, `refused_samples` was the odd one out: pushed onto this struct
-/// the INSTANT a refusal was seen, rather than held in a per-pass local like
-/// `refused`/`conflicts`/`skipped` and committed with them. A pass that saw
-/// a refusal and then aborted (a real I/O error, e.g. a dedup `remove_file`
-/// failing) before finishing therefore reported non-empty `refused_samples`
-/// alongside `refused == 0` from the last pass that DID complete — samples
-/// with no matching count. `refused_samples` is now a per-pass local too, so
-/// every descriptive field this struct ever reports describes exactly one
-/// pass, and a mid-pass abort can never produce that combination.
+/// **This is the ONLY place these fields are ever produced.** The mover's
+/// pass loop never constructs, mutates, or carries one of these between
+/// passes — see [`ShardReport`]'s doc comment for why that used to be a
+/// recurring bug class (FIX_ROUND-6.md).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ShardReport {
-    /// Flat objects renamed into their shard leaf.
-    pub moved: u64,
-    /// Flat objects whose shard target already held IDENTICAL bytes — the
-    /// flat copy was removed.
-    pub deduplicated: u64,
+pub struct ShardCensus {
+    /// Flat object files present right now. Zero ⇒ the directory is fully
+    /// migrated. `conflicts + refused` is a LOWER bound on this (a flat
+    /// object whose shard target is simply absent — not yet visited by a
+    /// mover, or left by a `limit`ed/bounded run — counts here but is
+    /// neither a conflict nor a refusal).
+    pub remaining_flat: u64,
     /// Flat objects whose shard target and flat source BOTH opened fine as
-    /// regular files, but hold DIFFERENT bytes — both left in place and
-    /// logged, for a human to decide (as found by the final pass). An object
-    /// whose target or source could not even be OPENED as a regular file at
-    /// all (a symlink, a directory, a socket, a permission error, ...) is
-    /// never counted here — see `refused`. Round-4 LOW finding: before this
-    /// field existed, `conflicts` lumped the two together, so the CLI
-    /// summary's single `conflicts` number made a systemic open failure (e.g.
-    /// every shard target refused with `EACCES`) read exactly like N benign
-    /// byte-different duplicates.
+    /// regular files, but hold DIFFERENT bytes — both left in place, for a
+    /// human to decide. An object whose target or source could not even be
+    /// OPENED as a regular file at all (a symlink, a directory, a socket, a
+    /// permission error, ...) is never counted here — see `refused`.
     pub conflicts: u64,
     /// Flat objects whose shard target or flat source exists but could not
     /// be opened and confirmed as a regular file — a symlink, a directory, a
     /// FIFO/device/socket node, a permission error, or any other `open`
-    /// failure other than "nothing there" (as found by the final pass, same
-    /// per-pass semantics as `conflicts`). No bytes were ever compared for
-    /// these — distinct from `conflicts`, which is only a byte-different
-    /// pair that both opened fine. Both sides are left on disk either way.
+    /// failure other than "nothing there". No bytes were ever compared for
+    /// these — distinct from `conflicts`, which is only a byte-different pair
+    /// that both opened fine. Both sides are left on disk either way.
     pub refused: u64,
-    /// A bounded, FIRST-SEEN (not last) sample of the LAST COMPLETED pass's
-    /// `refused` reasons, capped at 5 per pass — enough for a human to tell
-    /// at a glance WHAT is being refused (every sample reading "Too many
-    /// levels of symbolic links" is a planted symlink; every one reading
-    /// "Permission denied" is a permission/fd problem) without the report
-    /// growing unbounded over a large run. Round-5 fix: this used to be
-    /// cumulative across every pass in the call (pushed onto the report the
-    /// instant a refusal was seen); it is now committed together with
-    /// `refused` at the SAME pass-end moment, same per-pass semantics as
-    /// `conflicts`/`skipped`/`remaining_flat` — see this struct's doc
-    /// comment for the full cumulative-vs-last-completed-pass rule.
+    /// A bounded, FIRST-SEEN sample of `refused`'s reasons, capped at 5 —
+    /// enough for a human to tell at a glance WHAT is being refused (every
+    /// sample reading "Too many levels of symbolic links" is a planted
+    /// symlink; every one reading "Permission denied" is a permission/fd
+    /// problem) without this growing unbounded over a large store.
     pub refused_samples: Vec<String>,
     /// Directory entries that are not a regular `<uuid>.<ext>` object file
     /// (symlinks, foreign names; sub-directories are the shard levels and are
-    /// not counted) — never touched (as found by the final pass).
+    /// not counted) — never touched.
     pub skipped: u64,
-    /// Flat object files still present when the run ended (a `limit`ed run,
-    /// a conflict, or a racing writer). Zero ⇒ the directory is migrated.
-    pub remaining_flat: u64,
+}
+
+/// What one [`FilesystemStorage::shard_flat_originals`] call did, plus what
+/// the directory looked like when it finished.
+///
+/// **Re-scoped in FIX_ROUND-6.md (phase-7 ABORT — the fix loop stopped
+/// converging across rounds 2–5, every finding landing in this struct's OWN
+/// bookkeeping, never in what happens to the files).** The root cause was a
+/// CLASS, not a field: a per-pass descriptive snapshot (`conflicts`,
+/// `refused`, `refused_samples`, `skipped`, `remaining_flat`) held as locals
+/// and copied into the report at chosen moments — "the last completed pass",
+/// "the instant a refusal is seen" — drifts from both reality and each other
+/// on every early-return path, and each round's fix just relocated the copy
+/// point to a different early-return.
+///
+/// The fix removes the class by construction. Exactly two fields are
+/// EVENT counters: `moved` and `deduplicated`, bumped the instant the
+/// action happens and NEVER reset, reassigned, or copied — the pass loop
+/// touches nothing else. Everything descriptive — "what does the flat
+/// directory look like" — lives in [`ShardCensus`], produced by exactly ONE
+/// function, [`FilesystemStorage::census`], which walks the directory
+/// ONCE, independently of the pass loop, and never mid-run: `census` is
+/// `None` for every progress callback during the run (there is no
+/// "in-progress" descriptive state to read — the type cannot express a
+/// stale one) and is filled exactly once, at the very end — on a normal
+/// finish AND on an aborting I/O error alike. If the end-of-run census
+/// itself cannot run (e.g. the same abort also broke directory access),
+/// `census` stays `None` — UNKNOWN, which a caller must not confuse with
+/// "zero found" / "fully converged".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShardReport {
+    /// Flat objects renamed into their shard leaf. Cumulative across every
+    /// pass this call made; bumped the instant a rename succeeds.
+    pub moved: u64,
+    /// Flat objects whose shard target already held IDENTICAL bytes — the
+    /// flat copy was removed. Cumulative across every pass this call made;
+    /// bumped the instant the removal succeeds.
+    pub deduplicated: u64,
+    /// What [`FilesystemStorage::census`] found in the flat directory at the
+    /// END of this call — `None` only when that end-of-run census itself
+    /// could not complete (UNKNOWN, never to be read as zero/converged).
+    pub census: Option<ShardCensus>,
 }
 
 /// Filesystem-based file storage
@@ -351,71 +433,54 @@ impl FilesystemStorage {
     /// other — either the unlink wins (the rename then fails `ENOENT` and is
     /// skipped) or the rename wins (the sharded unlink, which runs after, hits).
     ///
-    /// Both sides of the byte-compare — the shard target and the flat
-    /// source — are opened through [`open_regular_nofollow`] (unix:
-    /// `O_NOFOLLOW`, atomic with the symlink check) rather than a
-    /// `symlink_metadata` probe followed by a separate `fs::read`: if either
-    /// side exists and is NOT a regular file — a symlink, a directory,
-    /// anything else — it is never opened and the flat copy is never
-    /// unlinked on its say-so; that is counted as `refused` (round-4: no
-    /// bytes were ever compared, so it is not a `conflicts`) and both are
-    /// left in place. A check-then-read pair would leave a gap for a symlink
-    /// swapped in between the two steps; `open_regular_nofollow` has none.
-    /// Without this, a symlink planted at the shard target pointing at bytes
-    /// identical to the flat copy would make the byte-compare report "same"
-    /// and the mover would unlink the REAL flat object, leaving only the
-    /// attacker-controlled symlink behind.
-    ///
-    /// `open_regular_nofollow` is INFALLIBLE: a target (shard side) or source
-    /// (flat side) that cannot be opened as a regular file for ANY reason
-    /// other than not existing — a symlink, a directory, a FIFO/device/
-    /// socket, a permission error, anything else a filesystem can throw at
-    /// an `open` — is counted as `refused` for that ONE object (round-4: NOT
-    /// `conflicts` — no bytes were ever compared), logged at `warn` with the
-    /// real reason (and sampled into `ShardReport::refused_samples`, capped
-    /// at 5), and the run continues; it is never a reason to abort the whole
-    /// migration. The flat source specifically distinguishes "vanished"
-    /// (`NotFound` — a racing delete got there first: nothing to compare,
-    /// nothing to move, not a conflict, not a refusal, counts exactly like
-    /// the `rename`-`NotFound` path below) from "exists but unsafe to open"
-    /// (`Refused` — genuinely `refused`, counted and logged with its real
-    /// reason) from "opened fine" (byte-compared against the target as
-    /// before — a mismatch there, and only there, is a `conflicts`).
+    /// Both sides of the byte-compare go through [`classify_against_target`],
+    /// which opens each side with [`open_regular_nofollow`] (unix: `O_NOFOLLOW`,
+    /// atomic with the symlink check) rather than a `symlink_metadata` probe
+    /// followed by a separate `fs::read`: if either side exists and is NOT a
+    /// regular file — a symlink, a directory, anything else — it is never
+    /// opened and the flat copy is never unlinked on its say-so. A
+    /// check-then-read pair would leave a gap for a symlink swapped in between
+    /// the two steps; `open_regular_nofollow` has none. Without this, a
+    /// symlink planted at the shard target pointing at bytes identical to the
+    /// flat copy would make the byte-compare report "same" and the mover would
+    /// unlink the REAL flat object, leaving only the attacker-controlled
+    /// symlink behind.
     ///
     /// Bounded by `opts.max_passes`: a sustained concurrent flat writer can
     /// keep adding entries to the directory forever, so without a ceiling
-    /// this would never return. `ShardReport::remaining_flat` reports what
-    /// is left when the bound is hit (or a `limit`/conflict stopped it
-    /// early); a follow-up call continues from there.
+    /// this would never return. [`ShardCensus::remaining_flat`] (in
+    /// [`ShardReport::census`]) reports what is left when the bound is hit
+    /// (or a `limit`/conflict stopped it early); a follow-up call continues
+    /// from there.
     ///
-    /// **Error/progress semantics (round-5: `refused_samples` joins the
-    /// per-pass set).** The five DESCRIPTIVE fields — `conflicts`,
-    /// `refused`, `refused_samples`, `skipped`, `remaining_flat` — describe
-    /// the LAST COMPLETED pass (a pass that finished listing the whole
-    /// directory) and are committed TOGETHER, atomically, the moment that
-    /// pass's listing finishes; `moved` and `deduplicated` are the only
-    /// cumulative fields, incremented directly on `report` as each object is
-    /// handled. Before round 5, `refused_samples` was pushed onto `report`
-    /// the INSTANT a refusal was seen rather than held in a per-pass local —
-    /// so a `bail!` partway through a pass that had already seen a refusal
-    /// (but not yet finished) reported `refused_samples` from the ABORTED
-    /// pass alongside `refused == 0` from the LAST COMPLETED one: samples
-    /// with no matching count, which also meant the CLI's
-    /// `if refused > 0 { print samples }` gate never fired on exactly the
-    /// run that needed it. `refused_samples` is now a per-pass local too
-    /// (capped at 5, first-seen within that pass), committed with `refused`
-    /// at the same moment — so every descriptive field this call ever
-    /// reports describes exactly one pass, and a mid-pass abort can never
-    /// produce non-empty samples alongside a zero count. On an I/O error the
-    /// best-effort `report` accumulated so far — i.e. still holding the last
-    /// COMPLETED pass's descriptive numbers, never the failing pass's own
-    /// partial, still-being-counted locals — is handed to `progress` before
-    /// the error propagates, so a caller does not lose a long run's progress
-    /// to its last failure. If the error hits during the very FIRST pass,
-    /// there is no completed pass yet and the descriptive fields stay at
-    /// their default `0`/empty — meaning "unknown", not "zero found" — which
-    /// is why the CLI prints that its printed counts may be incomplete
-    /// whenever this call returns `Err`.
+    /// **Reporting model (FIX_ROUND-6.md — re-scoped after the fix loop
+    /// stopped converging: rounds 2–5 each found issues ONLY in this
+    /// function's OWN bookkeeping, never in what happens to the files,
+    /// because the root cause was a per-pass descriptive snapshot held as
+    /// locals and copied into the report at a chosen moment — a CLASS of
+    /// bug, fixed here by removing the class rather than patching another
+    /// copy point).** This function's pass loop now touches exactly two
+    /// fields on `report`: `moved` and `deduplicated`, bumped the instant the
+    /// action happens and never reset or reassigned. It carries NO
+    /// descriptive per-pass locals at all — no `conflicts`, `refused`,
+    /// `refused_samples`, `skipped`, or `remaining_flat` tracking of any
+    /// kind. Every `progress` callback made DURING the pass loop therefore
+    /// reports `report.census == None` — there is no in-progress descriptive
+    /// state to read, so there is no stale copy of it to leak.
+    ///
+    /// At the END of the run — whether the loop finished normally or an I/O
+    /// error aborted it — [`Self::census`] walks the flat directory ONCE,
+    /// fresh, independent of anything the pass loop tracked, and its result
+    /// becomes `report.census`. On an aborting error, the census is still
+    /// attempted (best-effort): if it succeeds, the report describes the
+    /// directory exactly as it stands after the abort; if it ALSO fails
+    /// (e.g. the same permission/I-O problem that aborted the mover blocks
+    /// the census's own `read_dir` too), `report.census` stays `None` —
+    /// UNKNOWN, never a zero that a caller could misread as "converged" —
+    /// and the MOVER's own error (never the census's) is what propagates. If
+    /// the run finishes normally but the end-of-run census itself fails,
+    /// `report.census` stays `None` for the same reason and the census's
+    /// error (the only one there is) propagates instead.
     pub async fn shard_flat_originals(
         &self,
         user_id: Uuid,
@@ -429,196 +494,124 @@ impl FilesystemStorage {
         let mut since_pause = 0u64;
         let max_passes = opts.max_passes.max(1);
         let mut passes = 0usize;
+
+        // On ANY abort — a real I/O error anywhere below — attempt the SAME
+        // end-of-run census a normal finish gets (best-effort: `.ok()`
+        // leaves `report.census` at `None`, i.e. UNKNOWN, if the census
+        // itself can't run either), hand `progress` the result, and
+        // propagate the MOVER's error — never the census's. There is no
+        // per-pass descriptive local left to get out of sync with reality:
+        // the loop below never builds one.
+        macro_rules! abort {
+            ($e:expr) => {{
+                report.census = self.census(user_id).await.ok();
+                progress(&report);
+                return Err($e);
+            }};
+        }
+
         // Passes until one moves nothing (or the bound is hit): a directory
         // being renamed out of while it is read may skip entries, and a
         // concurrent writer may add flat ones — the next pass picks both up.
         loop {
             passes += 1;
             let mut moved_this_pass = 0u64;
-            let mut flat_seen = 0u64;
-            // Conflicts, refusals and skips are a property of what is in the
-            // directory, so each pass recounts them (the last pass's numbers
-            // are the report's).
-            let mut conflicts = 0u64;
-            let mut refused = 0u64;
-            // Round-5 fix (MEDIUM finding): `refused_samples` used to be
-            // pushed directly onto `report` the instant a refusal was seen,
-            // making it cumulative while `refused` stayed a per-pass local —
-            // so a bail partway through a pass that had already seen a
-            // refusal reported samples with `refused == 0`. It is now a
-            // per-pass local, same as `refused`, committed together at pass
-            // end — see `ShardReport`'s doc comment.
-            let mut refused_samples: Vec<String> = Vec::new();
-            let mut skipped = 0u64;
-            // On any I/O error below, hand `progress` the best-effort report
-            // accumulated so far before propagating — a long run's partial
-            // progress is not silently dropped on its last failure.
-            //
-            // Deliberately NOT folded in here: this pass's own (incomplete)
-            // `flat_seen`/`conflicts`/`refused`/`refused_samples`/`skipped`
-            // locals. `report`'s descriptive fields already hold the LAST
-            // COMPLETED pass's numbers (committed below, once a pass finishes
-            // its directory listing); overwriting them with a partial pass's
-            // partial counts is how a real error — e.g. this pass's
-            // `read_dir` itself failing, with its locals still at their
-            // just-reset zero/empty — reported 0 conflicts / 0 remaining /
-            // no samples after a PRIOR pass had left real ones, which an
-            // operator reads as "fully converged". `moved`/`deduplicated`
-            // stay cumulative across passes either way (directly on
-            // `report`, never a per-pass local), so they need no such care.
-            macro_rules! bail {
-                ($e:expr) => {{
-                    progress(&report);
-                    return Err($e);
-                }};
-            }
             let mut entries = match fs::read_dir(&dir).await {
                 Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
-                Err(e) => bail!(e),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Nothing ever existed for this user — an empty,
+                    // converged census, same shape `census` itself would
+                    // report against an absent directory.
+                    report.census = Some(ShardCensus::default());
+                    return Ok(report);
+                }
+                Err(e) => abort!(e),
             };
             loop {
                 let entry = match entries.next_entry().await {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
-                    Err(e) => bail!(e),
+                    Err(e) => abort!(e),
                 };
                 if opts.limit.is_some_and(|l| report.moved >= l) {
-                    // Count what is left without moving it.
-                    if Self::flat_object_name(&entry).await.is_some() {
-                        flat_seen += 1;
-                    }
                     continue;
                 }
                 let Some((file_id, ext)) = Self::flat_object_name(&entry).await else {
-                    match entry.file_type().await {
-                        Ok(t) if t.is_dir() => {}
-                        _ => skipped += 1,
-                    }
                     continue;
                 };
-                flat_seen += 1;
                 let from = entry.path();
                 let to = self.sharded_original_path(user_id, file_id, &ext);
                 let leaf = self.shard_dir(user_id, file_id);
                 if !leaves.contains(&leaf) {
                     if let Err(e) = fs::create_dir_all(&leaf).await {
-                        bail!(e);
+                        abort!(e);
                     }
                     leaves.insert(leaf);
                 }
-                match open_regular_nofollow(&to).await {
-                    RegularFile::Refused(reason) => {
-                        // The target exists but could not be opened safely as
-                        // a regular file — a symlink, a directory, a FIFO/
-                        // device/socket, a permission error, or any other
-                        // open failure (ENXIO from a UNIX socket node,
-                        // EACCES, ...). INV-6: never read through it, never
-                        // unlink the flat copy on its say-so. Round-4 LOW
-                        // finding: counted as `refused`, NOT `conflicts` — no
-                        // bytes were ever compared here, so lumping it into
-                        // `conflicts` made a systemic open failure read like
-                        // N benign byte-different duplicates. A refusal for
-                        // THIS ONE OBJECT, never fatal to the run — a planted
-                        // special file must not be able to halt every future
-                        // re-run (round-3 MEDIUM finding).
-                        refused += 1;
-                        // Round-5 fix: a per-pass local now, like `refused`
-                        // itself — never pushed straight onto `report` (see
-                        // `ShardReport`'s doc comment).
-                        if refused_samples.len() < 5 {
-                            refused_samples.push(format!("target: {reason}"));
-                        }
+                match classify_against_target(&to, &from).await {
+                    Classification::TargetAbsent => {}
+                    Classification::TargetRefused(reason) => {
+                        // INV-6: never read through it, never unlink the flat
+                        // copy on its say-so. Never fatal to the run — a
+                        // planted special file must not be able to halt
+                        // every future re-run. The end-of-run census counts
+                        // and samples this; the pass loop tracks nothing
+                        // about it beyond this log line.
                         tracing::warn!(
                             flat = %from.display(),
                             sharded = %to.display(),
                             reason = %reason,
                             "shard move: target exists but could not be safely opened as \
-                             a regular file — left the flat copy in place"
+                             a regular file — left the flat copy in place; the end-of-run \
+                             census will count it"
                         );
                         continue;
                     }
-                    RegularFile::Open(mut to_file) => {
-                        // The FLAT side goes through the SAME atomic
-                        // open+confirm as the sharded side above — closing
-                        // the identical check-then-read gap on the flat leaf
-                        // too, not only the shard target.
-                        match open_regular_nofollow(&from).await {
-                            RegularFile::Open(mut from_file) => {
-                                let mut a = Vec::new();
-                                let mut b = Vec::new();
-                                let same = matches!(
-                                    (
-                                        from_file.read_to_end(&mut a).await,
-                                        to_file.read_to_end(&mut b).await,
-                                    ),
-                                    (Ok(_), Ok(_))
-                                ) && a == b;
-                                if same {
-                                    match fs::remove_file(&from).await {
-                                        Ok(()) => {
-                                            report.deduplicated += 1;
-                                            flat_seen -= 1;
-                                        }
-                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                            flat_seen -= 1;
-                                        }
-                                        Err(e) => bail!(e),
-                                    }
-                                } else {
-                                    conflicts += 1;
-                                    tracing::warn!(
-                                        flat = %from.display(),
-                                        sharded = %to.display(),
-                                        "shard move: both locations hold DIFFERENT bytes for one \
-                                         object — left both in place"
-                                    );
-                                }
-                            }
-                            RegularFile::NotFound => {
-                                // The flat side vanished (a racing delete)
-                                // between the directory listing and here —
-                                // nothing to compare, nothing to move. NOT a
-                                // conflict: matches the rename-NotFound path
-                                // below ("deleted under us") — round-3 LOW
-                                // finding.
-                                flat_seen -= 1;
-                            }
-                            RegularFile::Refused(reason) => {
-                                // The flat source itself exists but could not
-                                // be opened safely — genuinely `refused` (not
-                                // "vanished", and round-4: not `conflicts`
-                                // either), logged with the REAL reason rather
-                                // than the old, misleading "DIFFERENT bytes"
-                                // claim (round-3 LOW finding: no bytes were
-                                // ever compared here).
-                                refused += 1;
-                                // Round-5 fix: per-pass local, see above.
-                                if refused_samples.len() < 5 {
-                                    refused_samples.push(format!("source: {reason}"));
-                                }
-                                tracing::warn!(
-                                    flat = %from.display(),
-                                    sharded = %to.display(),
-                                    reason = %reason,
-                                    "shard move: flat source exists but could not be safely \
-                                     opened as a regular file — left both in place"
-                                );
-                            }
+                    Classification::SourceVanished => {
+                        // A racing delete got there first between the
+                        // directory listing and here — nothing to compare,
+                        // nothing to move, matches the rename-`NotFound` path
+                        // below.
+                        continue;
+                    }
+                    Classification::SourceRefused(reason) => {
+                        tracing::warn!(
+                            flat = %from.display(),
+                            sharded = %to.display(),
+                            reason = %reason,
+                            "shard move: flat source exists but could not be safely opened \
+                             as a regular file — left both in place; the end-of-run census \
+                             will count it"
+                        );
+                        continue;
+                    }
+                    Classification::Compared { identical: true } => {
+                        match fs::remove_file(&from).await {
+                            Ok(()) => report.deduplicated += 1,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => abort!(e),
                         }
                         continue;
                     }
-                    RegularFile::NotFound => {}
+                    Classification::Compared { identical: false } => {
+                        tracing::warn!(
+                            flat = %from.display(),
+                            sharded = %to.display(),
+                            "shard move: both locations hold DIFFERENT bytes for one object \
+                             — left both in place; the end-of-run census will count it as a \
+                             conflict"
+                        );
+                        continue;
+                    }
                 }
                 match fs::rename(&from, &to).await {
                     Ok(()) => {
                         report.moved += 1;
                         moved_this_pass += 1;
-                        flat_seen -= 1;
                     }
                     // Deleted (or moved) under us — nothing left to move.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => flat_seen -= 1,
-                    Err(e) => bail!(e),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => abort!(e),
                 }
                 since_pause += 1;
                 if since_pause >= batch {
@@ -627,16 +620,6 @@ impl FilesystemStorage {
                     tokio::time::sleep(opts.pause).await;
                 }
             }
-            report.remaining_flat = flat_seen;
-            report.conflicts = conflicts;
-            report.refused = refused;
-            // Round-5 fix: committed together with `refused`, at the SAME
-            // pass-end moment — never pushed onto `report` mid-pass. A
-            // `bail!` before this line is reached leaves both `report.refused`
-            // and `report.refused_samples` at whatever the LAST COMPLETED
-            // pass left them.
-            report.refused_samples = refused_samples;
-            report.skipped = skipped;
             if moved_this_pass == 0
                 || opts.limit.is_some_and(|l| report.moved >= l)
                 || passes >= max_passes
@@ -644,8 +627,90 @@ impl FilesystemStorage {
                 break;
             }
         }
-        progress(&report);
-        Ok(report)
+        match self.census(user_id).await {
+            Ok(c) => {
+                report.census = Some(c);
+                progress(&report);
+                Ok(report)
+            }
+            Err(e) => {
+                // The run itself finished; only the END-OF-RUN census
+                // failed. `report.census` stays `None` (UNKNOWN, never a
+                // zero that reads as "converged") and the census's own error
+                // — the only one there is here — propagates.
+                progress(&report);
+                Err(e)
+            }
+        }
+    }
+
+    /// Walk `originals/<user>/` ONCE, read-only, and report what is still
+    /// flat — the ONLY function that ever produces a [`ShardCensus`]. Uses
+    /// the EXACT SAME [`classify_against_target`] decision procedure
+    /// [`Self::shard_flat_originals`]'s mover uses for its own open/compare
+    /// step, so "what the mover would do with this entry" and "what the
+    /// census says about it" are the same computation, never two
+    /// hand-synchronized ones. Never renames, removes, or creates anything.
+    ///
+    /// Safe to call at any time, including while a mover is running
+    /// concurrently (it is read-only), though a report taken mid-run is a
+    /// snapshot of that moment, not a prediction of the run's eventual
+    /// outcome.
+    pub async fn census(&self, user_id: Uuid) -> std::io::Result<ShardCensus> {
+        let dir = self.get_user_path(user_id, "originals");
+        let mut c = ShardCensus::default();
+        let mut entries = match fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(c),
+            Err(e) => return Err(e),
+        };
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => return Err(e),
+            };
+            let Some((file_id, ext)) = Self::flat_object_name(&entry).await else {
+                match entry.file_type().await {
+                    Ok(t) if t.is_dir() => {}
+                    _ => c.skipped += 1,
+                }
+                continue;
+            };
+            let from = entry.path();
+            let to = self.sharded_original_path(user_id, file_id, &ext);
+            match classify_against_target(&to, &from).await {
+                Classification::TargetAbsent => c.remaining_flat += 1,
+                Classification::TargetRefused(reason) => {
+                    c.remaining_flat += 1;
+                    c.refused += 1;
+                    if c.refused_samples.len() < 5 {
+                        c.refused_samples.push(format!("target: {reason}"));
+                    }
+                }
+                // The flat entry this census just listed vanished (a racing
+                // delete) between the listing and here — it is no longer
+                // there to count.
+                Classification::SourceVanished => {}
+                Classification::SourceRefused(reason) => {
+                    c.remaining_flat += 1;
+                    c.refused += 1;
+                    if c.refused_samples.len() < 5 {
+                        c.refused_samples.push(format!("source: {reason}"));
+                    }
+                }
+                // Identical ⇒ a dedup opportunity not yet collected by a
+                // mover pass; different ⇒ a genuine conflict. Either way the
+                // object is still flat.
+                Classification::Compared { identical } => {
+                    c.remaining_flat += 1;
+                    if !identical {
+                        c.conflicts += 1;
+                    }
+                }
+            }
+        }
+        Ok(c)
     }
 
     /// `Some((id, ext))` when `entry` is a REGULAR file named `<uuid>.<ext>`
@@ -1367,8 +1432,9 @@ mod tests {
         let opts = ShardOptions { limit: None, ..opts };
         let second = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
         assert_eq!(second.moved, 6);
-        assert_eq!(second.remaining_flat, 1, "only the conflict stays flat: {second:?}");
-        assert_eq!(second.conflicts, 1);
+        let second_census = second.census.as_ref().expect("a normal finish always carries a census");
+        assert_eq!(second_census.remaining_flat, 1, "only the conflict stays flat: {second:?}");
+        assert_eq!(second_census.conflicts, 1);
         assert_eq!(first.deduplicated + second.deduplicated, 1);
         for (i, id) in ids.iter().enumerate() {
             let p = s.sharded_original_path(user, *id, "webp");
@@ -1429,16 +1495,16 @@ mod tests {
         );
         // Round-4 LOW finding: a non-regular-file target never had its bytes
         // compared, so it is counted as `refused`, NOT `conflicts` (which is
-        // reserved for a pair that both opened fine but differ byte-for-byte
-        // — see
-        // `shard_flat_originals_keeps_last_completed_pass_numbers_on_a_later_io_error`
-        // for that case).
+        // reserved for a pair that both opened fine but differ byte-for-byte).
+        // FIX_ROUND-6: these numbers now come from the end-of-run `census`,
+        // not a per-pass local.
+        let c = r.census.as_ref().expect("a normal finish always carries a census");
         assert_eq!(
-            r.refused, 1,
+            c.refused, 1,
             "a non-regular-file target must be counted as refused, not conflicts: {r:?}"
         );
         assert_eq!(
-            r.conflicts, 0,
+            c.conflicts, 0,
             "no bytes were ever compared for a symlinked target: {r:?}"
         );
         assert_eq!(r.moved, 0);
@@ -1446,9 +1512,9 @@ mod tests {
             r.deduplicated, 0,
             "must NOT be reported as a dedup — that would imply the flat copy was removed"
         );
-        assert_eq!(r.refused_samples.len(), 1, "{r:?}");
+        assert_eq!(c.refused_samples.len(), 1, "{r:?}");
         assert!(
-            r.refused_samples[0].contains("target:"),
+            c.refused_samples[0].contains("target:"),
             "the sample must say which side (target/source) was refused: {r:?}"
         );
     }
@@ -1470,8 +1536,9 @@ mod tests {
         let r = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
         assert!(flat.exists(), "the flat object must survive a directory at the target");
         // Round-4 LOW finding: never-opened, so `refused`, not `conflicts`.
-        assert_eq!(r.refused, 1, "{r:?}");
-        assert_eq!(r.conflicts, 0, "{r:?}");
+        let c = r.census.as_ref().expect("a normal finish always carries a census");
+        assert_eq!(c.refused, 1, "{r:?}");
+        assert_eq!(c.conflicts, 0, "{r:?}");
         assert_eq!(r.moved, 0);
     }
 
@@ -1532,16 +1599,17 @@ mod tests {
             .await
             .unwrap();
 
+        let c = r.census.as_ref().expect("a normal finish always carries a census");
         assert_eq!(
-            r.refused, 7,
+            c.refused, 7,
             "every symlinked target must count as refused, not conflicts: {r:?}"
         );
         assert_eq!(
-            r.conflicts, 1,
+            c.conflicts, 1,
             "only the byte-different pair may count as a conflict: {r:?}"
         );
         assert_eq!(
-            r.refused_samples.len(),
+            c.refused_samples.len(),
             5,
             "refused_samples must cap at 5 even though 7 objects were refused: {r:?}"
         );
@@ -1611,11 +1679,12 @@ mod tests {
             "max_passes must make the call return promptly even under a sustained writer: {elapsed:?}"
         );
         // Under a sustained writer the bound is very likely to still find
-        // something flat; this is the whole point of the report field (a
+        // something flat; this is the whole point of the census (a
         // follow-up run continues from here). Not asserting > 0 would make
         // this test pass for the wrong reason if the writer happened to be
         // slow, so just assert the call returned with a well-formed report.
-        assert!(report.moved + report.remaining_flat >= 1, "{report:?}");
+        let c = report.census.as_ref().expect("a normal finish always carries a census");
+        assert!(report.moved + c.remaining_flat >= 1, "{report:?}");
     }
 
     /// LOW finding: an I/O error must not drop the run's partial progress —
@@ -1676,6 +1745,16 @@ mod tests {
                      pass 1's moved count, not a blank report: {last_seen:?}"
                 );
                 assert!(calls >= 2, "progress must be called again (with the partial report) at the failure site, not just after pass 1: {calls}");
+                // The SAME revoke that aborted the mover's own `read_dir`
+                // also blocks `census`'s `read_dir` on the identical
+                // directory — FIX_ROUND-6: this is the UNKNOWN case, and
+                // `report.census` must stay `None`, never a stale or zeroed
+                // value that could be misread as "0 conflicts found".
+                assert!(
+                    last_seen.census.is_none(),
+                    "a census that cannot run must report UNKNOWN (None), never a zero \
+                     that reads as converged: {last_seen:?}"
+                );
             }
             Ok(r) => {
                 // Root ignores the directory's permission bits, so pass 2's
@@ -1683,144 +1762,22 @@ mod tests {
                 // property under test does not apply, but the one object must
                 // still be correctly accounted for.
                 assert_eq!(r.moved, 1);
+                assert!(r.census.is_some(), "a normal finish always carries a census: {r:?}");
             }
         }
     }
 
-    /// Round-2 fix-round regression for the MEDIUM finding (ledger: "the
-    /// bail! macro commits the CURRENT incomplete pass's per-pass locals
-    /// (conflicts/remaining_flat/skipped) over the previous completed pass's
-    /// report"). The round-1 test above uses a SINGLE object, so its pass 1
-    /// has zero conflicts/remaining either way — the bug and the fix are
-    /// indistinguishable there, which is exactly why it survived round 1. TWO
-    /// objects close that gap: one moves cleanly, one is left as a genuine
-    /// CONFLICT (a pre-existing sharded target with different bytes), so pass
-    /// 1 completes with `conflicts: 1, remaining_flat: 1`. Pass 2's `read_dir`
-    /// is then made to fail the same way as above. Before the fix, the error
-    /// path reported `conflicts: 0, remaining_flat: 0` (pass 2's freshly-reset
-    /// locals) even though pass 1 left one real conflict on disk — an
-    /// operator reading that would believe the migration fully converged.
-    ///
-    /// Round-5 extension (finding 1): a THIRD object, refused via a symlinked
-    /// shard target, is added to the same pass-1 batch so this test also
-    /// pins `refused`/`refused_samples` through the identical last-completed-
-    /// pass path. This is order-independent: a refused object's processing
-    /// needs only EXECUTE (not READ) on the namespace dir to traverse to its
-    /// shard leaf, same as `conflict_id`'s opens, so it completes fine
-    /// regardless of when within pass 1 the EXECUTE-only revoke lands.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shard_flat_originals_keeps_last_completed_pass_numbers_on_a_later_io_error() {
-        use std::os::unix::fs::PermissionsExt;
-        let (dir, s) = sharded();
-        let user = Uuid::new_v4();
-
-        let moved_id = Uuid::new_v4();
-        write_at(&s.flat_original_path(user, moved_id, "webp"), b"ok").await;
-
-        let conflict_id = Uuid::new_v4();
-        write_at(&s.flat_original_path(user, conflict_id, "webp"), b"one").await;
-        write_at(&s.sharded_original_path(user, conflict_id, "webp"), b"two").await;
-
-        // Round-5: a refused object in the SAME pass-1 batch (a symlink
-        // planted at its shard target, pointing outside the store).
-        let refused_id = Uuid::new_v4();
-        write_at(
-            &s.flat_original_path(user, refused_id, "webp"),
-            b"refused-bytes",
-        )
-        .await;
-        let victim = dir.path().join("victim-for-last-pass-test.webp");
-        tokio::fs::write(&victim, b"victim-bytes").await.unwrap();
-        let refused_target = s.sharded_original_path(user, refused_id, "webp");
-        tokio::fs::create_dir_all(refused_target.parent().unwrap())
-            .await
-            .unwrap();
-        std::os::unix::fs::symlink(&victim, &refused_target).unwrap();
-
-        let flat_dir = dir.path().join("originals").join(user.to_string());
-        let opts = ShardOptions { batch: 1, pause: std::time::Duration::ZERO, ..Default::default() };
-        let mut last_seen = ShardReport::default();
-        let mut calls = 0u32;
-        let flat_dir_for_cb = flat_dir.clone();
-        let res = s
-            .shard_flat_originals(user, &opts, &mut |r| {
-                calls += 1;
-                last_seen = r.clone();
-                if calls == 1 {
-                    // Fires once, right after `moved_id` is renamed (batch: 1
-                    // ⇒ a progress call after every move; the conflict entry
-                    // never reaches this callback since it `continue`s before
-                    // the move/since_pause bookkeeping). `read_dir`'s
-                    // `entries` iterator is already-open and keeps working
-                    // past this revocation (an open fd's further `readdir`s
-                    // are not permission-rechecked) — only a FRESH `read_dir`
-                    // (pass 2's) fails. EXECUTE-only (no READ) is deliberate,
-                    // not just a weaker version of denying everything: shard
-                    // leaves (`xx/yy/`) live INSIDE this same namespace
-                    // directory, so `conflict_id`'s path-based opens (its
-                    // shard target AND its flat source, whichever of the two
-                    // entries this pass happens to reach first — directory
-                    // enumeration order is unspecified) must keep resolving
-                    // regardless of when in pass 1 they land relative to this
-                    // revoke; a full 0o000 would deny that traversal too and
-                    // make the test flaky on entry order (caught empirically
-                    // — a prior version of this test using 0o000 failed
-                    // intermittently for exactly this reason). `fs::read_dir`
-                    // (`opendir`+listing) needs READ; a path-based `open` of a
-                    // file whose full path is already known needs only
-                    // EXECUTE (search) on every ancestor directory — so
-                    // 0o100 blocks the former while leaving the latter alone.
-                    let _ = std::fs::set_permissions(
-                        &flat_dir_for_cb,
-                        std::fs::Permissions::from_mode(0o100),
-                    );
-                }
-            })
-            .await;
-
-        // Restore so the TempDir's own cleanup can recurse into it.
-        let _ = std::fs::set_permissions(&flat_dir, std::fs::Permissions::from_mode(0o755));
-
-        match res {
-            Err(_) => {
-                assert_eq!(last_seen.moved, 1, "{last_seen:?}");
-                assert_eq!(
-                    last_seen.conflicts, 1,
-                    "the LAST progress call before the error must still carry pass 1's \
-                     real conflict, not a later pass's unwritten zero: {last_seen:?}"
-                );
-                assert_eq!(
-                    last_seen.remaining_flat, 2,
-                    "ditto for remaining_flat — the conflicting AND the refused object \
-                     are both still on disk, flat: {last_seen:?}"
-                );
-                // Round-5 extension: `refused`/`refused_samples` must carry
-                // the SAME last-completed-pass guarantee as `conflicts` does.
-                assert_eq!(
-                    last_seen.refused, 1,
-                    "ditto for refused — pass 1's real refusal must survive into the \
-                     error-path report, not a later pass's unwritten zero: {last_seen:?}"
-                );
-                assert_eq!(
-                    last_seen.refused_samples.len(),
-                    1,
-                    "refused_samples must be committed alongside refused, from the \
-                     SAME last-completed pass: {last_seen:?}"
-                );
-            }
-            Ok(r) => {
-                // Root ignores the directory's permission bits (see the
-                // round-1 test's identical caveat) — the run simply
-                // completes; assert the steady-state numbers instead.
-                assert_eq!(r.moved, 1);
-                assert_eq!(r.conflicts, 1);
-                assert_eq!(r.remaining_flat, 2);
-                assert_eq!(r.refused, 1);
-                assert_eq!(r.refused_samples.len(), 1);
-            }
-        }
-    }
+    // FIX_ROUND-6.md: `shard_flat_originals_keeps_last_completed_pass_numbers_on_a_later_io_error`
+    // (round-2 regression test) was DELETED here. It pinned the exact
+    // mechanism this round removes — "the LAST COMPLETED pass's numbers
+    // survive a later pass's abort" — which presupposes a per-pass
+    // descriptive snapshot that no longer exists. Its scenario (an
+    // EXECUTE-only revoke that blocks the mover's `read_dir` but leaves
+    // path-based opens working) is now covered more directly by
+    // `shard_flat_originals_never_reports_refused_samples_with_a_stale_refused_count_on_mid_pass_abort`
+    // below, rewritten to assert the NEW behavior: an abort whose end-of-run
+    // census CAN still run reports the directory's true, fresh state, not a
+    // frozen "last completed pass" snapshot.
 
     /// Round-5 fix-round regression for the MEDIUM finding (ledger: before
     /// this round, `refused_samples` was pushed onto `report` the INSTANT a
@@ -1834,6 +1791,16 @@ mod tests {
     /// also meant the CLI's `if r.refused > 0 { print samples }` gate never
     /// fired on exactly the run that needed it.
     ///
+    /// **Rewritten for FIX_ROUND-6.md.** The per-pass "last completed pass"
+    /// snapshot this test originally pinned no longer exists: there is no
+    /// pass-scoped `refused`/`refused_samples` to go stale. Same setup (the
+    /// scenario is still a real, valuable one — an abort whose `read_dir`
+    /// keeps working because only WRITE was revoked), but the invariant under
+    /// test is now the opposite of "stays frozen at the last safe value": the
+    /// end-of-run census, attempted even on this abort, can still walk the
+    /// (read+execute-only) directory fine, so it must report the directory's
+    /// TRUE, FRESH state — not a zero, not a stale snapshot, not "unknown".
+    ///
     /// Pass 1 moves one object (`moved_id`); its `progress` callback (batch:
     /// 1, fires right after that rename) then plants MANY new objects into
     /// the SAME namespace directory — all absent until now, so pass 1's
@@ -1846,19 +1813,13 @@ mod tests {
     /// UNAFFECTED by the write revocation regardless of when in pass 2 it is
     /// visited. The last is a DEDUP pair (identical bytes both sides): it
     /// opens and compares equal, then its flat copy's `remove_file` hits the
-    /// revoked write bit and `bail!`s before pass 2's own
-    /// `refused`/`refused_samples` locals are ever committed. Directory
-    /// enumeration order is unspecified, so 20 refused entries (vs. the
-    /// single aborting one) make it overwhelmingly likely at least one
-    /// refusal is visited before the abort on every run, without requiring
-    /// control over the real order.
-    ///
-    /// The invariant under test: whichever object pass 2 visits first, the
-    /// reported `refused`/`refused_samples` after the bail must describe the
-    /// LAST COMPLETED pass (pass 1, which saw no refusal) — never a sample
-    /// from the aborted pass 2 paired with a stale/zero count. Before the
-    /// fix, visiting any refused object before the dedup one made this fail
-    /// (`refused_samples` non-empty while `refused == 0`).
+    /// revoked write bit and aborts the run. Directory enumeration order is
+    /// unspecified, so 20 refused entries (vs. the single aborting one) make
+    /// it overwhelmingly likely at least one refusal is visited before the
+    /// abort on every run, without requiring control over the real order —
+    /// this is what makes the end-of-run census's answer deterministic
+    /// regardless of visit order: `census` walks the WHOLE directory
+    /// independent of where the mover happened to abort.
     #[cfg(unix)]
     #[tokio::test]
     async fn shard_flat_originals_never_reports_refused_samples_with_a_stale_refused_count_on_mid_pass_abort()
@@ -1950,25 +1911,50 @@ mod tests {
         match res {
             Err(_) => {
                 assert_eq!(
-                    last_seen.refused, 0,
-                    "pass 1 (the only COMPLETED pass) saw no refusal; pass 2's own \
-                     refusal must never be committed without pass 2 itself completing: \
+                    last_seen.moved, 1,
+                    "moved_id's rename in pass 1 must survive into the abort report: \
                      {last_seen:?}"
                 );
-                assert!(
-                    last_seen.refused_samples.is_empty(),
-                    "a sample from the ABORTED pass 2 must never be reported alongside \
-                     a `refused` count that does not include it — exactly the round-5 \
-                     bug: {last_seen:?}"
+                assert_eq!(
+                    last_seen.deduplicated, 0,
+                    "the dedup's remove_file is exactly what failed — it must not be \
+                     counted as a successful dedup: {last_seen:?}"
+                );
+                // FIX_ROUND-6: the end-of-run census CAN still run here (only
+                // WRITE was revoked) and must report the TRUE, FRESH state —
+                // never a stale snapshot, never "unknown".
+                let c = last_seen.census.as_ref().expect(
+                    "read+execute still works, so the end-of-run census must succeed \
+                     on this abort, not report UNKNOWN",
+                );
+                assert_eq!(
+                    c.refused, 20,
+                    "all 20 planted symlinks are refused, regardless of which one the \
+                     mover happened to abort on: {last_seen:?}"
+                );
+                assert_eq!(
+                    c.refused_samples.len(),
+                    5,
+                    "refused_samples caps at 5 even though 20 are refused: {last_seen:?}"
+                );
+                assert_eq!(
+                    c.conflicts, 0,
+                    "the dedup pair holds IDENTICAL bytes — never a conflict: {last_seen:?}"
+                );
+                assert_eq!(
+                    c.remaining_flat, 21,
+                    "20 refused + 1 not-yet-deduped pair, independent of visit order: \
+                     {last_seen:?}"
                 );
             }
             Ok(r) => {
                 // Root ignores permission bits (see the sibling tests'
                 // identical caveat) — the run simply completes (including the
                 // dedup's `remove_file`); all 20 plants are refused, and
-                // samples cap at 5 per pass.
-                assert_eq!(r.refused, 20, "{r:?}");
-                assert_eq!(r.refused_samples.len(), 5, "{r:?}");
+                // samples cap at 5.
+                let c = r.census.as_ref().expect("a normal finish always carries a census");
+                assert_eq!(c.refused, 20, "{r:?}");
+                assert_eq!(c.refused_samples.len(), 5, "{r:?}");
             }
         }
     }
@@ -2351,8 +2337,12 @@ mod tests {
         // arrived after the mover's last pass, or a rename that lost a race
         // to a delete).
         let follow_up = s.shard_flat_originals(user, &opts, &mut |_| {}).await.unwrap();
+        let follow_up_census = follow_up
+            .census
+            .as_ref()
+            .expect("a normal finish always carries a census");
         assert_eq!(
-            follow_up.remaining_flat, 0,
+            follow_up_census.remaining_flat, 0,
             "a follow-up run must converge to zero flat objects: {follow_up:?}"
         );
 
@@ -2425,12 +2415,14 @@ mod tests {
         // as `refused` (this test's name predates that split — see
         // FIX_ROUND-3.md, left as written per the "don't rewrite history"
         // convention — `conflicts` is now reserved for a byte-different pair
-        // that both opened fine).
+        // that both opened fine). FIX_ROUND-6: these come from the
+        // end-of-run census now.
+        let c = r.census.as_ref().expect("a normal finish always carries a census");
         assert_eq!(
-            r.refused, 1,
+            c.refused, 1,
             "the socket target must be counted as refused, not conflicts: {r:?}"
         );
-        assert_eq!(r.conflicts, 0, "no bytes were ever compared: {r:?}");
+        assert_eq!(c.conflicts, 0, "no bytes were ever compared: {r:?}");
         assert!(
             flat_blocked.exists(),
             "the flat object behind a refused target must survive"
@@ -2520,11 +2512,13 @@ mod tests {
         // Round-4 LOW finding: never opened, so `refused`, not `conflicts`
         // (this test's name predates that split — see FIX_ROUND-3.md, left
         // as written per the "don't rewrite history" convention).
+        // FIX_ROUND-6: these come from the end-of-run census now.
+        let c = r.census.as_ref().expect("a normal finish always carries a census");
         assert_eq!(
-            r.refused, 1,
+            c.refused, 1,
             "an unreadable flat source must be counted as refused, not silently resolved: {r:?}"
         );
-        assert_eq!(r.conflicts, 0, "no bytes were ever compared: {r:?}");
+        assert_eq!(c.conflicts, 0, "no bytes were ever compared: {r:?}");
         assert!(
             flat.exists(),
             "the flat object must survive being left as refused"
@@ -2540,5 +2534,202 @@ mod tests {
             "the log must state the REAL reason (a permission error), not a generic claim: {logs}"
         );
         drop(dir);
+    }
+
+    /// FIX_ROUND-6.md property test: for a randomized mix of flat-directory
+    /// entries, a `shard_flat_originals` call's own `census` must equal an
+    /// INDEPENDENT, freshly-taken `census()` of the same directory, and
+    /// `moved + deduplicated + remaining_flat` must account for every flat
+    /// object this test created — regardless of the random mix, batch size,
+    /// or stopping point. This is the invariant the FIX_ROUND-6 re-scope
+    /// exists to make true BY CONSTRUCTION (one classification function,
+    /// one census function, called fresh at the end — never a per-pass
+    /// snapshot that could drift).
+    ///
+    /// "Random abort point": this crate has no portable way to land a REAL
+    /// I/O error at a specific, unspecified-`read_dir`-order point
+    /// deterministically (that's exactly the kind of non-determinism the
+    /// dedicated abort tests above work hard to avoid). This property test
+    /// instead randomizes `limit` — a bounded/interrupted run is the
+    /// realistic shape an operator's own re-run resumes from, and it
+    /// exercises the SAME code path (the loop breaking before every flat
+    /// object is visited) that a real I/O abort also leaves behind. Fixed
+    /// seeds keep every run deterministic.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shard_flat_originals_census_matches_an_independent_recount_for_randomized_mixes() {
+        for seed in [1u64, 7, 42, 1_000, 99_999] {
+            run_one_randomized_census_check(seed).await;
+        }
+    }
+
+    /// A tiny, dependency-free xorshift64* PRNG — deterministic per seed,
+    /// which is the whole point of the property test above (no external
+    /// `rand` crate dependency pulled in for one test).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// Uniform-enough in `0..n` for test fixture generation (not
+        /// cryptographic, not perfectly unbiased — fine for picking a
+        /// category out of 6 or a batch size out of 5).
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n.max(1)
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_one_randomized_census_check(seed: u64) {
+        let mut rng = Lcg(seed.wrapping_mul(2) | 1); // nonzero, xorshift needs it
+        let (dir, s) = sharded();
+        let user = Uuid::new_v4();
+        let ns_dir = dir.path().join("originals").join(user.to_string());
+
+        // A shared socket special file, hard-linked into every
+        // "refused-socket" target — same trick as
+        // `shard_flat_originals_treats_a_socket_at_the_target_as_a_conflict_not_a_fatal_error`.
+        let short_dir = tempfile::Builder::new().prefix("sk").tempdir().unwrap();
+        let short_sock = short_dir.path().join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&short_sock)
+            .expect("bind a real unix socket at a short path");
+
+        let n = 15 + rng.below(15); // 15..30 entries
+        let mut initial_flat_objects = 0u64;
+        for i in 0..n {
+            match rng.below(6) {
+                0 => {
+                    // plain: no pre-existing shard target.
+                    let id = Uuid::new_v4();
+                    write_at(
+                        &s.flat_original_path(user, id, "webp"),
+                        format!("plain-{seed}-{i}").as_bytes(),
+                    )
+                    .await;
+                    initial_flat_objects += 1;
+                }
+                1 => {
+                    // dedup: an IDENTICAL pre-existing shard target.
+                    let id = Uuid::new_v4();
+                    let bytes = format!("dedup-{seed}-{i}");
+                    write_at(&s.flat_original_path(user, id, "webp"), bytes.as_bytes()).await;
+                    write_at(&s.sharded_original_path(user, id, "webp"), bytes.as_bytes()).await;
+                    initial_flat_objects += 1;
+                }
+                2 => {
+                    // conflict: a DIFFERENT pre-existing shard target.
+                    let id = Uuid::new_v4();
+                    write_at(
+                        &s.flat_original_path(user, id, "webp"),
+                        format!("flat-{seed}-{i}").as_bytes(),
+                    )
+                    .await;
+                    write_at(
+                        &s.sharded_original_path(user, id, "webp"),
+                        format!("sharded-{seed}-{i}").as_bytes(),
+                    )
+                    .await;
+                    initial_flat_objects += 1;
+                }
+                3 => {
+                    // refused: a symlink planted at the shard target.
+                    let id = Uuid::new_v4();
+                    write_at(
+                        &s.flat_original_path(user, id, "webp"),
+                        format!("refused-sym-{seed}-{i}").as_bytes(),
+                    )
+                    .await;
+                    let victim = dir.path().join(format!("victim-{seed}-{i}.webp"));
+                    tokio::fs::write(&victim, format!("victim-{seed}-{i}").as_bytes())
+                        .await
+                        .unwrap();
+                    let to = s.sharded_original_path(user, id, "webp");
+                    tokio::fs::create_dir_all(to.parent().unwrap()).await.unwrap();
+                    std::os::unix::fs::symlink(&victim, &to).unwrap();
+                    initial_flat_objects += 1;
+                }
+                4 => {
+                    // refused: a socket special file hard-linked at the
+                    // shard target.
+                    let id = Uuid::new_v4();
+                    write_at(
+                        &s.flat_original_path(user, id, "webp"),
+                        format!("refused-sock-{seed}-{i}").as_bytes(),
+                    )
+                    .await;
+                    let to = s.sharded_original_path(user, id, "webp");
+                    tokio::fs::create_dir_all(to.parent().unwrap()).await.unwrap();
+                    std::fs::hard_link(&short_sock, &to).unwrap();
+                    initial_flat_objects += 1;
+                }
+                _ => {
+                    // junk: never a flat OBJECT, so never counted in
+                    // `initial_flat_objects` — a non-uuid regular file, or a
+                    // symlink sitting directly at the flat level (its NAME
+                    // may look like `<uuid>.<ext>`, but `flat_object_name`
+                    // requires `is_file()`, which a symlink never is).
+                    if rng.below(2) == 0 {
+                        write_at(
+                            &ns_dir.join(format!("junk-{seed}-{i}.txt")),
+                            b"not an object",
+                        )
+                        .await;
+                    } else {
+                        tokio::fs::create_dir_all(&ns_dir).await.unwrap();
+                        let victim = ns_dir.join(format!("victim-junk-{seed}-{i}.webp"));
+                        tokio::fs::write(&victim, b"x").await.unwrap();
+                        std::os::unix::fs::symlink(
+                            &victim,
+                            ns_dir.join(format!("{}.webp", Uuid::new_v4())),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
+
+        let batch = 1 + rng.below(5); // 1..=5
+        // Random "stopping point": either an unbounded run (converges fully
+        // in this single-threaded, no-concurrent-writer test) or a limited
+        // one (the shape of a real interrupted/resumed migration).
+        let limit = if rng.below(2) == 0 {
+            None
+        } else {
+            Some(rng.below(initial_flat_objects + 1))
+        };
+        let opts = ShardOptions {
+            batch: batch as usize,
+            pause: std::time::Duration::ZERO,
+            limit,
+            max_passes: 50,
+        };
+        let report = s
+            .shard_flat_originals(user, &opts, &mut |_| {})
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}: shard_flat_originals failed: {e}"));
+        let fresh = s
+            .census(user)
+            .await
+            .unwrap_or_else(|e| panic!("seed {seed}: independent recount failed: {e}"));
+
+        let c = report.census.as_ref().unwrap_or_else(|| {
+            panic!("seed {seed}: a normal finish always carries a census: {report:?}")
+        });
+        assert_eq!(
+            c, &fresh,
+            "seed {seed}: the report's own census must equal an independent recount taken \
+             right after the run: {report:?} vs {fresh:?}"
+        );
+        assert_eq!(
+            report.moved + report.deduplicated + c.remaining_flat,
+            initial_flat_objects,
+            "seed {seed}: moved + deduplicated + remaining_flat must account for every flat \
+             object this test created (no concurrent deletions here): {report:?}"
+        );
     }
 }
