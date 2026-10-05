@@ -13,6 +13,7 @@ use axum::http::header::HeaderName;
 use axum::http::Method;
 use sqlx::PgPool;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use ziee_core::ServerConfig;
@@ -129,6 +130,29 @@ pub fn build_api_router(
     (api_router, api_doc)
 }
 
+/// Convert a configured sustained requests-per-second RATE into the
+/// token-bucket replenish INTERVAL tower_governor wants.
+///
+/// This is the inverse, and the trap, of `GovernorConfigBuilder::per_second`:
+/// despite its name that method sets the replenish INTERVAL to `n` seconds
+/// (`self.period = Duration::from_secs(seconds)`, tower_governor 0.7.0
+/// `governor.rs:183`; same for `per_millisecond`/`per_nanosecond`). Passing
+/// the config's `per_second: 50` there therefore meant ONE token every 50 s —
+/// the deployment's rate, inverted (#627). A rate of `n`/s is one token every
+/// `1/n` s, e.g. 50/s → 20 ms, 3/s → ~333.3 ms, 1/s → 1 s.
+///
+/// `None` for `per_second == 0`: a zero rate has no finite interval, and
+/// tower_governor refuses a zero period — callers must refuse that config
+/// (a zero rate silently throttling to "no tokens ever" or silently disabling
+/// DoS protection are both worse than a boot error).
+pub fn rate_limit_replenish_interval(per_second: u64) -> Option<Duration> {
+    if per_second == 0 {
+        None
+    } else {
+        Some(Duration::from_secs_f64(1.0 / per_second as f64))
+    }
+}
+
 /// Conditionally apply the global rate limiter (tower-governor).
 ///
 /// Behavior, by `server.rate_limit`:
@@ -175,9 +199,20 @@ pub fn apply_rate_limit_layer(
         None => return router,
     };
 
+    // `per_second` is a RATE; tower_governor's builder takes a replenish
+    // INTERVAL. `.per_second(n)` would set the interval to n seconds — the
+    // inverse (#627).
+    let interval = rate_limit_replenish_interval(per_second).unwrap_or_else(|| {
+        panic!(
+            "server.rate_limit.per_second must be >= 1 (got {per_second}) — a \
+             zero rate cannot be converted to a replenish interval; refusing to \
+             boot rather than silently disabling (or deadlocking) the limiter"
+        )
+    });
+
     let governor_conf = Arc::new(
         tower_governor::governor::GovernorConfigBuilder::default()
-            .per_second(per_second)
+            .period(interval)
             .burst_size(burst_size)
             .key_extractor(tower_governor::key_extractor::PeerIpKeyExtractor)
             .finish()
@@ -399,6 +434,133 @@ mod order_determinism_tests {
             old(vec![&b, &a]),
             "if these matched, order-only sorting would already be deterministic \
              and the (order, name) tiebreak would be pointless"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    /// A minimal `ServerConfig` with an explicit rate-limit block.
+    ///
+    /// `ServerConfig` derives `Deserialize` but not `Default`, so the test
+    /// deserializes the exact key shape a real config file carries (all other
+    /// values are defaults; the builder reads only `server.rate_limit`).
+    fn config_with_rate_limit(per_second: u64, burst_size: u32) -> ServerConfig {
+        serde_json::from_str(&format!(
+            r#"{{
+                "postgresql": {{ "use_embedded": false }},
+                "server": {{
+                    "host": "127.0.0.1",
+                    "port": 0,
+                    "api_prefix": "/api",
+                    "rate_limit": {{
+                        "enabled": true,
+                        "per_second": {per_second},
+                        "burst_size": {burst_size}
+                    }}
+                }},
+                "jwt": {{
+                    "secret": "0123456789abcdef0123456789abcdef-strong",
+                    "issuer": "test",
+                    "audience": "test-api",
+                    "access_token_expiry_hours": 24
+                }}
+            }}"#
+        ))
+        .expect("test config must deserialize")
+    }
+
+    async fn send(app: axum::Router) -> StatusCode {
+        // `PeerIpKeyExtractor` keys on `ConnectInfo<SocketAddr>` (tower_governor
+        // key_extractor.rs `maybe_connect_info`), which a real `serve()` supplies
+        // but `oneshot` does not — without it the governor answers 500
+        // (`UnableToExtractKey`). Pin one fixed peer for all requests, exactly
+        // like one client hitting a running server.
+        let mut request =
+            Request::builder().uri("/").body(Body::empty()).expect("request");
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4000))));
+        app.oneshot(request).await.expect("oneshot").status()
+    }
+
+    /// The rate → interval mapping, i.e. that `per_second` is a RATE and not
+    /// an interval. This is the exact inverse bug of #627: the old code passed
+    /// `50` to `GovernorConfigBuilder::per_second` and got a 50 s interval.
+    #[test]
+    fn rate_limit_replenish_interval_maps_rate_to_period() {
+        assert_eq!(
+            rate_limit_replenish_interval(50),
+            Some(Duration::from_millis(20)),
+            "50/s must be one token every 20 ms"
+        );
+        // 3/s → ~333.3 ms. Integer-nanosecond truncation must not round this
+        // to 0 (div-by-zero clone) or to 1 s (the buggy pre-fix behaviour).
+        let three = rate_limit_replenish_interval(3).expect("3/s is a valid rate");
+        assert!(
+            three >= Duration::from_millis(333) && three < Duration::from_millis(334),
+            "3/s must be one token every ~333 ms, got {three:?}"
+        );
+        assert_eq!(
+            rate_limit_replenish_interval(1),
+            Some(Duration::from_secs(1)),
+            "1/s must be one token every 1 s"
+        );
+        // 0 is not a rate — defined behaviour: None, so the builder refuses it.
+        assert_eq!(rate_limit_replenish_interval(0), None, "0/s has no interval");
+    }
+
+    /// A zero rate is REFUSED with a clear boot-time error rather than
+    /// silently deadlocking (zero interval) or silently disabling the limiter.
+    #[test]
+    #[should_panic(expected = "server.rate_limit.per_second must be >= 1")]
+    fn zero_per_second_is_refused_with_a_clear_error() {
+        let config = config_with_rate_limit(0, 2);
+        let _ = apply_rate_limit_layer(axum::Router::new(), &config, Some((50, 500)));
+    }
+
+    /// THE load-bearing regression test for #627: `per_second` is a RATE, so
+    /// after the burst is spent, waiting one replenish interval (1/rate) must
+    /// refund the next request.
+    ///
+    /// With the pre-fix `.per_second(n)` builder call the interval was n
+    /// SECONDS (tower_governor 0.7.0 `governor.rs:183` — `self.period =
+    /// Duration::from_secs(seconds)`), so at 20/s a 100 ms wait refunds
+    /// nothing and the final assert goes RED (429 instead of 200). The old
+    /// tests only asserted that a burst trips the limiter, which both
+    /// behaviours satisfy — that is the hole this test closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sustained_rate_refunds_one_interval_after_the_burst() {
+        // 20/s → 50 ms replenish interval; burst of 2.
+        let config = config_with_rate_limit(20, 2);
+        let app = apply_rate_limit_layer(
+            axum::Router::new().route("/", axum::routing::get(|| async { "ok" })),
+            &config,
+            None,
+        );
+
+        // The burst (2 tokens) serves.
+        assert_eq!(send(app.clone()).await, StatusCode::OK, "1st request");
+        assert_eq!(send(app.clone()).await, StatusCode::OK, "2nd request");
+        // Burst spent, nothing replenished yet → 429.
+        assert_eq!(
+            send(app.clone()).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "3rd request must trip the limiter once the 2-token burst is spent"
+        );
+        // 20/s ⇒ one token every 50 ms; after 100 ms the bucket must hold
+        // two tokens again and the next request passes.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            send(app.clone()).await,
+            StatusCode::OK,
+            "after 100 ms (2 × 50 ms at 20/s) the next request must be 200, \
+             not 429 — per_second is requests-per-second, not a seconds interval"
         );
     }
 }
