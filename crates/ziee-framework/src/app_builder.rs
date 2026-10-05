@@ -212,7 +212,7 @@ pub fn apply_rate_limit_layer(
 
     let governor_conf = Arc::new(
         tower_governor::governor::GovernorConfigBuilder::default()
-            .per_second(per_second)
+            .period(interval)
             .burst_size(burst_size)
             .key_extractor(tower_governor::key_extractor::PeerIpKeyExtractor)
             .finish()
