@@ -35,11 +35,13 @@ const assignedKeys = new WeakMap<LayoutDefinition, string>()
 let sequence = 0
 
 export function layoutRouteKey(layoutDef: LayoutDefinition): string {
-  // TEMP-REVERT-PROOF (#506): the OLD name-based key. A lazy layout is an
-  // exotic object with no `.name`, so every lazy layout keyed as 'layout' and
-  // adjacent groups collided. Restored ONLY to prove the X4 tests are red
-  // without identity keying.
-  return (layoutDef.component as { name?: string }).name || 'layout'
+  if (layoutDef.id) return `layout:${layoutDef.id}`
+  let key = assignedKeys.get(layoutDef)
+  if (!key) {
+    key = `layout:${++sequence}`
+    assignedKeys.set(layoutDef, key)
+  }
+  return key
 }
 
 /** TEST SEAM — reset the ordinal counter so key assertions are not order-coupled. */
