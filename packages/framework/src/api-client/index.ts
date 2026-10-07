@@ -18,6 +18,13 @@ export {
   setUnauthorizedHandler,
 } from './core'
 export type { FileUploadProgressCallback } from './core'
+// Shared with the app's SSR transport (`apiClientSync.ts::ssrFetch`) so the
+// two transports cannot drift again (phibya/comic#502). The SSR bundle imports
+// it from the `./path-substitution` subpath — not from this index — because
+// this index drags in the browser transport (`core.ts`), which the SSR build
+// replaces wholesale.
+export { substitutePathParams } from './path-substitution'
+export type { SubstitutedPath } from './path-substitution'
 export { createSSEHandler } from './sse-types'
 export type {
   SSECallback,

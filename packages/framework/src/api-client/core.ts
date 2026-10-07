@@ -3,6 +3,7 @@ import { createSSEHandler } from './sse-types'
 import { getSyncConnectionId } from '../sync/connection'
 import { netRequestEnd, netRequestStart } from '../net-idle'
 import { bumpFetchEpoch, coalesce, inflightKey } from './inflight'
+import { substitutePathParams } from './path-substitution'
 
 // ─────────────────────── Base-URL resolver (injected) ───────────────────────
 //
@@ -330,33 +331,32 @@ const performCall = async <TResponse = unknown>(
     }
 
     let endpointPath = endpointUrl.replace(/^[A-Z]+\s+/, '').trim()
-    //get {capture} from endpointPath
-    const captureMatches = (endpointPath.match(/{([^}]+)}/g) || []).map(match =>
-      match.slice(1, -1),
-    )
-
-    // For FormData, we need to handle path parameters differently
+    // Substitute `{capture}` path parameters through the ONE shared helper
+    // (also used by the app's SSR transport — see `path-substitution.ts`).
+    // It throws `Missing required parameter: <name>` for a capture whose value
+    // is `undefined` OR `null`: the old `!== undefined`-only guard silently
+    // turned `null` into the literal path segment "null" (phibya/comic#502).
+    let captureMatches: string[]
     if (isFormDataBody) {
-      // Replace {capture} with actual values from FormData entries
-      captureMatches.forEach(capture => {
-        const value = (params as FormData).get(capture.trim())
-        if (value !== null) {
-          endpointPath = endpointPath.replace(`{${capture}}`, value.toString())
-        } else {
-          throw new Error(`Missing required parameter: ${capture}`)
-        }
-      })
+      // FormData carries its values through `.get()` (which returns `null`
+      // for an absent entry), so read only the capture entries into a plain
+      // map — the payload (files) is never copied. Substitution semantics are
+      // otherwise identical to the object branch: absent → throw, `''` → the
+      // empty segment, everything else `String(value)`.
+      const formCaptureValues: Record<string, unknown> = {}
+      const names = (endpointPath.match(/{([^}]+)}/g) || []).map(match =>
+        match.slice(1, -1),
+      )
+      for (const name of names) {
+        formCaptureValues[name.trim()] = (params as FormData).get(name.trim())
+      }
+      const substituted = substitutePathParams(endpointPath, formCaptureValues)
+      endpointPath = substituted.path
+      captureMatches = substituted.captures
     } else {
-      // Replace {capture} with actual values from params object
-      captureMatches.forEach(capture => {
-        let c = capture.trim() as keyof typeof params
-        if (params[c] !== undefined) {
-          //@ts-ignore
-          endpointPath = endpointPath.replace(`{${capture}}`, params[c])
-        } else {
-          throw new Error(`Missing required parameter: ${capture}`)
-        }
-      })
+      const substituted = substitutePathParams(endpointPath, params)
+      endpointPath = substituted.path
+      captureMatches = substituted.captures
     }
 
     if (method === 'GET') {

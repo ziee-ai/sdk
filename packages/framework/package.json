@@ -13,6 +13,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./api-client": "./src/api-client/index.ts",
+    "./api-client/path-substitution": "./src/api-client/path-substitution.ts",
     "./permissions": "./src/permissions/index.ts",
     "./router": "./src/router/index.ts",
     "./*": "./src/*"
