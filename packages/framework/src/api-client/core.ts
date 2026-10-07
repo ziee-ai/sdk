@@ -354,9 +354,22 @@ const performCall = async <TResponse = unknown>(
       endpointPath = substituted.path
       captureMatches = substituted.captures
     } else {
-      const substituted = substitutePathParams(endpointPath, params)
-      endpointPath = substituted.path
-      captureMatches = substituted.captures
+      // TEMP-REVERT-PROOF (#502): restore the old `!== undefined`-only guard
+      // to prove the null-capture regression tests are red with it. This
+      // commit is reverted immediately after the RED run; see the #502 fix
+      // commit for the real substitution.
+      captureMatches = (endpointPath.match(/{([^}]+)}/g) || []).map(match =>
+        match.slice(1, -1),
+      )
+      captureMatches.forEach(capture => {
+        let c = capture.trim() as keyof typeof params
+        if (params[c] !== undefined) {
+          //@ts-ignore
+          endpointPath = endpointPath.replace(`{${capture}}`, params[c])
+        } else {
+          throw new Error(`Missing required parameter: ${capture}`)
+        }
+      })
     }
 
     if (method === 'GET') {
