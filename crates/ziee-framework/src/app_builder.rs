@@ -345,6 +345,128 @@ pub async fn serve(
     .await
 }
 
+/// Env var (Unix only) through which a parent process hands the server an
+/// ALREADY-BOUND, already-listening TCP socket: `ZIEE_LISTEN_FD=<fd>`.
+///
+/// This is the SDK's socket-activation seam. `ziee-test-harness::start` binds
+/// 127.0.0.1:0 itself, keeps the listener open for the whole pick→spawn
+/// window, clears `FD_CLOEXEC` on it, and sets this var in the child's env —
+/// so the port can never be stolen between "the port is free" and "the child
+/// owns it" (`GAP-harness-port-pick-toctou`). The child's `bind_listener` is
+/// the receiver end: when this var is set, it adopts the fd instead of binding
+/// the configured address.
+pub const ZIEE_LISTEN_FD: &str = "ZIEE_LISTEN_FD";
+
+/// Read `ZIEE_LISTEN_FD`, validating it names a *parseable* fd number.
+///
+/// Does NOT validate that the fd is actually open — that is
+/// [`bind_listener`]'s job, where a protocol violation can be reported with
+/// the full context. Returns `Ok(None)` when the var is unset (the normal
+/// path).
+#[cfg(unix)]
+fn inherited_listener_fd() -> std::io::Result<Option<i32>> {
+    let Some(value) = std::env::var_os(ZIEE_LISTEN_FD) else {
+        return Ok(None);
+    };
+    let text = value.to_string_lossy();
+    let fd: i32 = text.trim().parse().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{ZIEE_LISTEN_FD}={text:?} is not a valid file descriptor number — \
+                 refusing to fall back to binding the configured address"
+            ),
+        )
+    })?;
+    if fd < 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{ZIEE_LISTEN_FD}={fd} is negative — refusing to fall back to \
+                 binding the configured address"
+            ),
+        ));
+    }
+    Ok(Some(fd))
+}
+
+/// Bind the HTTP listener the app serves on.
+///
+/// When `ZIEE_LISTEN_FD` is set (Unix only), the listener is the INHERITED one
+/// the parent already bound and kept open, and the configured address is NOT
+/// bound — the caller (e.g. `ziee-test-harness`) owns the port from its pick
+/// until this process owns it, which is what closes the check-then-bind
+/// `EADDRINUSE` race (`GAP-harness-port-pick-toctou`). A set-but-invalid value
+/// is a hard error, never a silent fall back to the configured address: a
+/// parent that intended a handoff must not get an unexpectedly different port.
+///
+/// When unset, this is exactly the previous behaviour:
+/// `tokio::net::TcpListener::bind(config.server_address())`.
+///
+/// The returned listener's `local_addr()` is the REAL bound address (the
+/// inherited one's, when inherited) — callers that need the port for logging
+/// or derived URLs must read it here, not from the config.
+pub async fn bind_listener(config: &ServerConfig) -> std::io::Result<tokio::net::TcpListener> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+
+        if let Some(fd) = inherited_listener_fd()? {
+            // `from_raw_fd` is unsafe precisely because it takes a caller
+            // claimed fd; validate liveness FIRST so an invalid number (e.g. a
+            // stale `ZIEE_LISTEN_FD` from an unrelated parent) is a clean
+            // error instead of a protocol violation.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let std_listener = if flags == -1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "{ZIEE_LISTEN_FD}={fd} is not an open file descriptor: {} — \
+                         refusing to fall back to binding the configured address",
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            } else {
+                // SAFETY: F_GETFD just succeeded, so `fd` is an open descriptor
+                // handed to us by the parent — ownership transfers here.
+                unsafe { std::net::TcpListener::from_raw_fd(fd) }
+            };
+            let addr = std_listener.local_addr().map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{ZIEE_LISTEN_FD}={fd} is not a bound TCP socket: {e} — \
+                         refusing to fall back to binding the configured address"
+                    ),
+                )
+            })?;
+            std_listener.set_nonblocking(true).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("{ZIEE_LISTEN_FD}={fd}: set_nonblocking on inherited listener: {e}"),
+                )
+            })?;
+            let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("{ZIEE_LISTEN_FD}={fd}: register inherited listener with tokio: {e}"),
+                )
+            })?;
+            tracing::info!(
+                "HTTP listener adopted from inherited fd {} — serving on {addr} \
+                 (socket activation, not a fresh bind)",
+                fd
+            );
+            return Ok(listener);
+        }
+    }
+
+    let bind_addr = config.server_address();
+    let listener = tokio::net::TcpListener::bind(bind_addr.as_str()).await?;
+    tracing::info!("HTTP listener bound to {bind_addr}");
+    Ok(listener)
+}
+
 /// Resolve on Ctrl-C or SIGTERM. Graceful-with-warning: a container that strips
 /// signal-handler installation logs + falls back to "never returns" rather than
 /// crashing (mirrors ziee's own `shutdown_signal`).

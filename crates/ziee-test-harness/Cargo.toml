@@ -27,13 +27,20 @@ ziee-build-support = { path = "../ziee-build-support" }
 
 # Runtime-only Postgres: no `macros` feature → no `query!` → build-DB-free.
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "migrate"] }
-tokio = { version = "1.47.1", features = ["rt", "sync", "time"] }
+# `net`/`io-util` are for `src/bin/portrace_probe_server`, the harness's own
+# race-closed e2e helper; `macros` lets its test binary use `#[tokio::test]`.
+tokio = { version = "1.47.1", features = ["rt", "sync", "time", "net", "io-util", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2"] }
 uuid = { version = "1.18", features = ["v4"] }
 url = "2.5"
 tempfile = "3.15"
+# Unix-only: `TestHarness::start` reserves the child's port by BINDING it and
+# keeping the listener (see the `ZIEE_LISTEN_FD` handoff) — the
+# GAP-harness-port-pick-toctou fix. Only the non-Unix fallback still uses this
+# pick-a-free-port-number crate, because fd inheritance is Unix-only.
 portpicker = "0.1"
-# `flock(2)` for the per-test data dir's liveness lock (see `data_dir.rs`).
+# `flock(2)` for the per-test data dir's liveness lock (see `data_dir.rs`) and
+# `fcntl(F_GETFD/F_SETFD)` for the inherited-listener handoff in `start`.
 libc = "0.2"
 
 # --- fixture features only (app-neutral auth/sync test mocks) ----------------

@@ -63,6 +63,11 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 url = "2.5"
 thiserror = "2.0.12"
 once_cell = "1.21.3"
+# Unix-only: `fcntl(F_GETFD)` validates an inherited-listener fd
+# (`ZIEE_LISTEN_FD`, see `app_builder::bind_listener`) BEFORE
+# `TcpListener::from_raw_fd` adopts it — invalid numbers must be a clean error,
+# never a protocol violation. Matches the harness crate's `libc = "0.2"`.
+libc = "0.2"
 # Chunk BG-3: the generic embedded/external Postgres bootstrap (embedded_pg).
 # Runtime-only (no compile-time `query!`), so ziee-framework stays build-DB-free.
 # Version + features mirror the ziee server's [workspace.dependencies] catalog so

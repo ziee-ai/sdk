@@ -8830,6 +8830,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "indexmap 2.14.0",
+ "libc",
  "linkme",
  "once_cell",
  "postgresql_embedded",

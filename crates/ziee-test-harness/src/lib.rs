@@ -4,12 +4,14 @@
 //! spawns a real app binary against a per-test isolated Postgres DB (cloned
 //! from a fully-migrated template so migrations run once per process, not once
 //! per test — the property that makes the suite safe WITHOUT `--test-threads=1`),
-//! allocates a free TCP port, writes a temp config file, health-polls the
-//! server up, and reaps everything on `Drop` — kill child, remove config,
-//! SYNCHRONOUSLY `DROP DATABASE` (see [`SpawnedServer::drop`] for why the word
-//! matters), drop the isolated data-dir + any app keep-alive tempdirs. The exit
-//! paths a destructor cannot reach are covered by [`sweep_stale_test_dbs`] at the
-//! start of the next test process.
+//! RESERVES a TCP port by binding 127.0.0.1:0 and holding the listener (the
+//! child inherits it across `exec` via `ZIEE_LISTEN_FD`), writes a temp config
+//! file, health-polls the server up, and reaps everything on `Drop` — kill
+//! child, remove config, SYNCHRONOUSLY `DROP DATABASE` (see
+//! [`SpawnedServer::drop`] for why the word matters), drop the isolated
+//! data-dir + any app keep-alive tempdirs. The exit paths a destructor cannot
+//! reach are covered by [`sweep_stale_test_dbs`] at the start of the next test
+//! process.
 //!
 //! ## The seam
 //!
@@ -93,7 +95,12 @@ pub struct SpawnFacts<'a> {
     pub db: &'a DbConn,
     /// The generated per-test database name (already cloned from the template).
     pub database_name: &'a str,
-    /// The free port the server must bind.
+    /// The port the spawned server WILL listen on. The harness RESERVES it by
+    /// binding 127.0.0.1:0 and holding the listener; on Unix the child
+    /// inherits that very listener (`ZIEE_LISTEN_FD`), so this is the port the
+    /// server actually serves — not merely a port that was free a moment
+    /// earlier and could have been stolen in between
+    /// (`GAP-harness-port-pick-toctou`).
     pub server_port: u16,
     /// The per-test isolated `data_dir` (mutable state fresh per test; binary
     /// caches symlinked-in shared).
@@ -1029,8 +1036,28 @@ impl<A: HarnessApp> TestHarness<A> {
         let test_id = Uuid::new_v4().to_string();
         let database_name = format!("test_db_{}", test_id.replace('-', "_"));
 
-        // OS-aware free-port reservation (avoids the "Address already in use"
-        // boot-timeout cluster a random pick caused).
+        // Free-port RESERVATION (GAP-harness-port-pick-toctou): bind
+        // 127.0.0.1:0 and KEEP the listener open. The old
+        // `portpicker::pick_unused_port()` bound a probe listener, dropped it,
+        // and returned the NUMBER — leaving a window in which another process
+        // on a busy box could grab the same port before the child's own bind.
+        // Now the port is owned by THIS process from this instant until the
+        // child inherits the fd (the `ZIEE_LISTEN_FD` handoff below), so no
+        // window exists.
+        #[cfg(unix)]
+        let (held_listener, server_port) = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+                .expect("No free TCP port available for TestServer");
+            let port = listener
+                .local_addr()
+                .expect("reserved test-server listener has a local address")
+                .port();
+            (listener, port)
+        };
+        // Non-Unix has no fd-inheritance handoff (the framework's
+        // `ZIEE_LISTEN_FD` support is Unix-only), so the old pick behaviour is
+        // kept there unchanged.
+        #[cfg(not(unix))]
         let server_port =
             portpicker::pick_unused_port().expect("No free TCP port available for TestServer");
 
@@ -1134,7 +1161,39 @@ impl<A: HarnessApp> TestHarness<A> {
         for (k, v) in &plan.extra_env {
             cmd.env(k, v);
         }
+        // Socket activation (GAP-harness-port-pick-toctou): hand the
+        // reserved, already-bound listener to the child. Clear FD_CLOEXEC so
+        // the descriptor survives `exec`, and tell the child which fd to adopt
+        // — `ziee_framework::bind_listener` reads `ZIEE_LISTEN_FD` and serves
+        // on this very listener instead of binding the configured address, so
+        // the port this process reserved is exactly the port the child serves,
+        // with no free window for a third process.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+
+            let fd = held_listener.as_raw_fd();
+            // SAFETY: plain descriptor-number fcntls (F_GETFD/F_SETFD) — no
+            // pointers, exactly the calls allowed in the pre_exec region
+            // (async-signal-safe), though this runs in the parent process.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(
+                flags >= 0,
+                "fcntl(F_GETFD) on the reserved test-server listener failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+            assert_eq!(rc, 0, "fcntl(F_SETFD) on the reserved test-server listener failed");
+            cmd.env("ZIEE_LISTEN_FD", fd.to_string());
+        }
         let child = spawn_harness_child(&mut cmd).expect("Failed to start test server");
+
+        // The child has been `exec`'d and now owns its own copy of the socket;
+        // release ours. The spawn-failure panic path above unwinds with
+        // `held_listener` still alive, so the reserved port is also released
+        // there (by the local's Drop) — a failed spawn never leaks a port.
+        #[cfg(unix)]
+        drop(held_listener);
 
         let base_url = format!("http://127.0.0.1:{}", server_port);
         let test_database_url = format!(
