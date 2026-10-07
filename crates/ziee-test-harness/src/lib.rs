@@ -1036,28 +1036,9 @@ impl<A: HarnessApp> TestHarness<A> {
         let test_id = Uuid::new_v4().to_string();
         let database_name = format!("test_db_{}", test_id.replace('-', "_"));
 
-        // Free-port RESERVATION (GAP-harness-port-pick-toctou): bind
-        // 127.0.0.1:0 and KEEP the listener open. The old
-        // `portpicker::pick_unused_port()` bound a probe listener, dropped it,
-        // and returned the NUMBER — leaving a window in which another process
-        // on a busy box could grab the same port before the child's own bind.
-        // Now the port is owned by THIS process from this instant until the
-        // child inherits the fd (the `ZIEE_LISTEN_FD` handoff below), so no
-        // window exists.
-        #[cfg(unix)]
-        let (held_listener, server_port) = {
-            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-                .expect("No free TCP port available for TestServer");
-            let port = listener
-                .local_addr()
-                .expect("reserved test-server listener has a local address")
-                .port();
-            (listener, port)
-        };
-        // Non-Unix has no fd-inheritance handoff (the framework's
-        // `ZIEE_LISTEN_FD` support is Unix-only), so the old pick behaviour is
-        // kept there unchanged.
-        #[cfg(not(unix))]
+        // TEST-ONLY (temporary): restore the OLD probe-and-drop pick — bind a
+        // probe, drop it, hand the NUMBER to the child. The portrace test must
+        // go RED: its plan_spawn probe will see the port free.
         let server_port =
             portpicker::pick_unused_port().expect("No free TCP port available for TestServer");
 
@@ -1161,39 +1142,7 @@ impl<A: HarnessApp> TestHarness<A> {
         for (k, v) in &plan.extra_env {
             cmd.env(k, v);
         }
-        // Socket activation (GAP-harness-port-pick-toctou): hand the
-        // reserved, already-bound listener to the child. Clear FD_CLOEXEC so
-        // the descriptor survives `exec`, and tell the child which fd to adopt
-        // — `ziee_framework::bind_listener` reads `ZIEE_LISTEN_FD` and serves
-        // on this very listener instead of binding the configured address, so
-        // the port this process reserved is exactly the port the child serves,
-        // with no free window for a third process.
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-
-            let fd = held_listener.as_raw_fd();
-            // SAFETY: plain descriptor-number fcntls (F_GETFD/F_SETFD) — no
-            // pointers, exactly the calls allowed in the pre_exec region
-            // (async-signal-safe), though this runs in the parent process.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(
-                flags >= 0,
-                "fcntl(F_GETFD) on the reserved test-server listener failed: {}",
-                std::io::Error::last_os_error()
-            );
-            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
-            assert_eq!(rc, 0, "fcntl(F_SETFD) on the reserved test-server listener failed");
-            cmd.env("ZIEE_LISTEN_FD", fd.to_string());
-        }
         let child = spawn_harness_child(&mut cmd).expect("Failed to start test server");
-
-        // The child has been `exec`'d and now owns its own copy of the socket;
-        // release ours. The spawn-failure panic path above unwinds with
-        // `held_listener` still alive, so the reserved port is also released
-        // there (by the local's Drop) — a failed spawn never leaks a port.
-        #[cfg(unix)]
-        drop(held_listener);
 
         let base_url = format!("http://127.0.0.1:{}", server_port);
         let test_database_url = format!(
