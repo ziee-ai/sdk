@@ -104,6 +104,19 @@ function DrawerFooter({ className, ...props }: React.ComponentProps<"div">) {
   )
 }
 
+/**
+ * vaul's drag handle. With `<Drawer handleOnly>` ONLY this element starts a
+ * drag — the drawer's content (lists, forms) scrolls and taps freely, which is
+ * what a native bottom sheet does. Rendered as a wide hit strip; style the
+ * visible pill with `className`.
+ */
+function DrawerHandle({
+  className,
+  ...props
+}: React.ComponentProps<typeof DrawerPrimitive.Handle>) {
+  return <DrawerPrimitive.Handle data-slot="drawer-handle" className={className} {...props} />
+}
+
 function DrawerTitle({
   className,
   ...props
@@ -144,4 +157,5 @@ export {
   DrawerFooter,
   DrawerTitle,
   DrawerDescription,
+  DrawerHandle,
 }
