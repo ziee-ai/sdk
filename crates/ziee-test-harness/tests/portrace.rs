@@ -18,6 +18,16 @@
 //!      holds the port (no gap in ownership at any instant);
 //!   4. after Drop, the port is free again — the hold was real, not a leak.
 //!
+//! The second test pins a second-order defect of the same handoff: the
+//! inherited listener's FD_CLOEXEC must be cleared in the CHILD's `pre_exec`
+//! hook, never in this (multi-threaded test) parent — clearing it here would
+//! leak the listener's socket into every unrelated process any other thread
+//! forks while the parent holds it. The test installs the harness's test-only
+//! spawn seam (which runs exactly in that former leak window, while the parent
+//! still holds the listener), spawns an unrelated sibling there, and asserts
+//! the sibling owns no copy of the server's socket (inode-compared via
+//! `/proc/<pid>/fd`).
+//!
 //! Requires the same live Postgres the other harness tests need (`DATABASE_URL`
 //! or the shared-cluster default at 127.0.0.1:54321); the probe app's template
 //! DB carries zero migrations, so nothing app-specific has to exist.
@@ -26,6 +36,7 @@
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ziee_test_harness::{HarnessApp, SpawnFacts, SpawnPlan, TestHarness, Variant};
 
@@ -158,5 +169,124 @@ fn the_picked_port_is_held_by_the_harness_and_then_the_child() {
         rebound.local_addr().expect("rebound local_addr").port(),
         port,
         "the port really was free again"
+    );
+}
+
+/// Every `socket:[inode]` target under `/proc/<pid>/fd`.
+fn socket_inodes(pid: u32) -> Vec<String> {
+    let dir = format!("/proc/{pid}/fd");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {dir}: {e}")) {
+        let entry = entry.unwrap_or_else(|e| panic!("readdir {dir}: {e}"));
+        let target = std::fs::read_link(entry.path())
+            .unwrap_or_else(|e| panic!("readlink {}: {e}", entry.path().display()));
+        let target = target.to_string_lossy().into_owned();
+        if target.starts_with("socket:[") {
+            out.push(target);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Second-order regression of the same handoff: clearing FD_CLOEXEC on the
+/// reserved listener must happen in the CHILD's `pre_exec` hook, after fork —
+/// never in this parent. This process is a multi-threaded libtest test runner;
+/// between a parent-side `F_SETFD` and the parent's spawn+close of the fd, ANY
+/// other thread's `fork`+`exec` (another test's server spawn, any `Command`)
+/// inherits the listener's socket and holds it open for its whole life.
+///
+/// The harness's test-only spawn seam runs exactly inside that window — after
+/// the `ZIEE_LISTEN_FD` handoff setup, before the child spawn, while this
+/// parent still holds the reserved listener (between "bind" and "spawn"). The
+/// seam forks an unrelated `sleep` sibling; the test then compares socket
+/// inodes between the intended server (`/proc/<server-pid>/fd`) and the
+/// sibling (`/proc/<sibling-pid>/fd`) and asserts the sibling owns NO copy of
+/// the server's socket. With the fix the parent never clears FD_CLOEXEC, so
+/// the sibling's `exec` closes the descriptor and it has no sockets at all —
+/// GREEN. With the parent-side clear restored, the sibling inherits the socket
+/// and keeps it open: the inode shows up in its fd table — RED.
+#[test]
+fn unrelated_sibling_in_the_leak_window_does_not_inherit_the_listener_socket() {
+    let temp_dir = tempfile::tempdir().expect("tempdir for the sibling-leak probe");
+    let probe_result = temp_dir.path().join("plan-spawn-probe.txt");
+    let sibling_pid_file = temp_dir.path().join("sibling.pid");
+
+    // The sibling is THIS test's direct child. Kill + reap it on every exit
+    // path (green AND red) so the leak test never leaves a `sleep` behind.
+    struct SiblingReaper(Arc<Mutex<Option<std::process::Child>>>);
+    impl Drop for SiblingReaper {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.lock().expect("sibling cell").take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let sibling_cell: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+    let seam_cell = Arc::clone(&sibling_cell);
+    let seam_pid_file = sibling_pid_file.clone();
+
+    let mut harness = TestHarness::new(
+        PortraceProbeApp { probe_result },
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        Variant::Server,
+    );
+    // THE SEAM — the unrelated sibling is forked at the exact instant the old
+    // parent-side FD_CLOEXEC clear used to leak the listener: after the
+    // handoff setup, before the child spawn, while this parent still holds the
+    // reserved listener.
+    harness.set_spawn_seam(move || {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn the unrelated sibling in the leak window");
+        std::fs::write(&seam_pid_file, child.id().to_string())
+            .expect("write the unrelated-sibling pid");
+        *seam_cell.lock().expect("sibling cell") = Some(child);
+    });
+
+    let server = runtime().block_on(harness.start(()));
+    let _reaper = SiblingReaper(Arc::clone(&sibling_cell));
+
+    // The seam ran synchronously inside `start`, before the server was
+    // spawned; its sibling is alive and its pid is recorded.
+    let sibling_pid: u32 = std::fs::read_to_string(&sibling_pid_file)
+        .expect("the seam must have written the sibling pid")
+        .trim()
+        .parse()
+        .expect("parse the sibling pid");
+    let server_pid = server.process_id();
+    assert_ne!(
+        server_pid, sibling_pid,
+        "the sibling must be an unrelated process, not the server"
+    );
+
+    // The socket inodes the INTENDED server owns right now: its inherited
+    // listener (plus any transient accepted connection).
+    let server_sockets = socket_inodes(server_pid);
+    assert!(
+        !server_sockets.is_empty(),
+        "the harness-spawned server {server_pid} must own the inherited listener \
+         socket — it was handed the port"
+    );
+
+    // The unrelated sibling must hold NO fd pointing at any of those inodes.
+    let sibling_sockets = socket_inodes(sibling_pid);
+    for s in &sibling_sockets {
+        assert!(
+            !server_sockets.contains(s),
+            "unrelated sibling {sibling_pid} holds the intended server's socket \
+             {s} — the parent-side FD_CLOEXEC clear leaked the reserved listener \
+             into an unrelated child, which now keeps the port open for its \
+             whole life"
+        );
+    }
+    // A plain `sleep` sibling holds no sockets at all.
+    assert!(
+        sibling_sockets.is_empty(),
+        "unrelated sibling {sibling_pid} holds sockets it was never given: \
+         {sibling_sockets:?}"
     );
 }

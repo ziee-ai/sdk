@@ -40,7 +40,9 @@ tempfile = "3.15"
 # pick-a-free-port-number crate, because fd inheritance is Unix-only.
 portpicker = "0.1"
 # `flock(2)` for the per-test data dir's liveness lock (see `data_dir.rs`) and
-# `fcntl(F_GETFD/F_SETFD)` for the inherited-listener handoff in `start`.
+# `fcntl(F_GETFD/F_SETFD)` for the inherited-listener handoff — called in the
+# CHILD's `pre_exec` hook (see `arm_child_pre_exec_guarantees`), never in the
+# parent, so no other thread's fork/exec can leak the listener socket.
 libc = "0.2"
 
 # --- fixture features only (app-neutral auth/sync test mocks) ----------------

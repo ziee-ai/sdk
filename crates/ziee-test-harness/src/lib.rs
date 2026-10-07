@@ -5,7 +5,9 @@
 //! from a fully-migrated template so migrations run once per process, not once
 //! per test — the property that makes the suite safe WITHOUT `--test-threads=1`),
 //! RESERVES a TCP port by binding 127.0.0.1:0 and holding the listener (the
-//! child inherits it across `exec` via `ZIEE_LISTEN_FD`), writes a temp config
+//! child inherits it across `exec` via `ZIEE_LISTEN_FD`; FD_CLOEXEC is cleared
+//! in the CHILD's `pre_exec` hook, never in this parent — see
+//! [`arm_child_pre_exec_guarantees`]), writes a temp config
 //! file, health-polls the server up, and reaps everything on `Drop` — kill
 //! child, remove config, SYNCHRONOUSLY `DROP DATABASE` (see
 //! [`SpawnedServer::drop`] for why the word matters), drop the isolated
@@ -750,6 +752,13 @@ impl SpawnedServer {
     pub fn data_dir(&self) -> &Path {
         self._data_tempdir.path()
     }
+
+    /// The spawned server process's pid — needed by tests that inspect the
+    /// live child from the outside (e.g. `/proc/<pid>/fd` on Linux, as the
+    /// inherited-listener leak regression does).
+    pub fn process_id(&self) -> u32 {
+        self.process.id()
+    }
 }
 
 /// Drop the per-test database, synchronously. Errors are RETURNED, never
@@ -915,37 +924,66 @@ impl Drop for SpawnedServer {
     }
 }
 
-/// The harness's single spawn path for a child process: apply the
-/// death-with-parent guarantee, then spawn. `TestHarness::start` and the
-/// pdeathsig integration test both go through this one function, so the
-/// guarantee can never be present in one and absent from the other.
-fn spawn_harness_child(cmd: &mut Command) -> std::io::Result<Child> {
-    #[cfg(target_os = "linux")]
-    arm_child_pdeathsig(cmd);
+/// The harness's single spawn path for a child process: apply the child-side
+/// `pre_exec` guarantees (inherited-listener handoff, and death-with-parent on
+/// Linux), then spawn. `TestHarness::start` and the pdeathsig integration test
+/// both go through this one function, so the guarantees can never be present
+/// in one and absent from the other.
+///
+/// `listen_fd` is the reserved, already-bound listener's descriptor number
+/// when this spawn is the inherited-listener handoff (Unix), `None` otherwise.
+fn spawn_harness_child(cmd: &mut Command, listen_fd: Option<i32>) -> std::io::Result<Child> {
+    #[cfg(unix)]
+    arm_child_pre_exec_guarantees(cmd, listen_fd);
+    #[cfg(not(unix))]
+    let _ = listen_fd;
     cmd.spawn()
 }
 
-/// Linux: make the about-to-be-spawned child die with this process.
+/// Unix: install the child-side `pre_exec` guarantees for a harness spawn —
+/// the inherited-listener handoff (all Unix) and death-with-parent (Linux).
 ///
-/// Arms `prctl(PR_SET_PDEATHSIG, SIGKILL)` inside a [`CommandExt::pre_exec`]
-/// hook, which runs in the child between `fork()` and `exec()` — before any
-/// app code, so no consumer needs an env-var gate or a startup-line call (the
-/// old app-side workaround `arm_die_with_parent_if_requested` / env var can be
-/// deleted).
+/// A `pre_exec` hook runs in the child between `fork()` and `exec()`, before
+/// any app code, so no consumer needs an env-var gate or a startup-line call.
+///
+/// ## Why the FD_CLOEXEC clear must be HERE, in the child — never in the parent
+///
+/// The reserved listener's descriptor is inherited across `exec` because
+/// `ZIEE_LISTEN_FD` names it, and `exec` closes every descriptor with
+/// FD_CLOEXEC set — so the flag has to be off by the time the child `exec`s.
+/// The tempting place to turn it off is the PARENT, right before
+/// `cmd.spawn()`. That is the defect: this process is a multi-threaded libtest
+/// test runner in which many tests run in parallel, each spawning servers
+/// through this harness. A descriptor that has lost FD_CLOEXEC in the parent
+/// is inherited by EVERY process any other thread `fork`+`exec`s between the
+/// parent's `F_SETFD` and its own spawn+close of the descriptor — another
+/// test's server spawn, any `std::process::Command`. Such an unrelated process
+/// then holds the listener's socket open for its whole life: when the intended
+/// server exits, its port is not refused (new connections queue on the leaked
+/// socket), and every child accumulates other tests' listeners — a new class
+/// of cross-test interference.
+///
+/// After `fork` the child has its OWN descriptor table, so clearing the flag
+/// here affects only this one child: no other thread can fork in between, and
+/// the descriptor number is unchanged, so the `ZIEE_LISTEN_FD=<fd>` env var
+/// stays correct. The parent therefore NEVER clears the flag — there is no
+/// instant at which any other thread's `fork` could observe the listener
+/// without FD_CLOEXEC.
 ///
 /// ## Async-signal-safety caveat
 ///
 /// A `pre_exec` hook may only call async-signal-safe functions: between
 /// `fork` and `exec` the child is a bare heap-allocating-free thread with
 /// only this thread alive — no allocation, no locks, no `eprintln`, no
-/// `std::io`. The hook therefore uses exactly `libc::prctl`, `libc::getppid`
-/// and `libc::_exit` and nothing else. (A `CommandExt::try_pre_exec` hook
-/// returning `Err` would make `spawn()` fail in the parent, but building that
-/// error object allocates — so failures here `_exit(1)` the child instead,
-/// and the harness's readiness poll surfaces the dead child as a boot
-/// timeout.)
+/// `std::io`. The hook therefore uses exactly `libc::fcntl` (F_GETFD/F_SETFD
+/// take a plain descriptor number, no pointers), `libc::prctl`,
+/// `libc::getppid` and `libc::_exit` and nothing else. The `io::Error` the
+/// fcntl-failure path returns is built by `Command`'s own error-reporting
+/// machinery in the parent — not allocated here — and a hook returning `Err`
+/// makes `spawn()` fail LOUDLY in the parent rather than start a server that
+/// silently lost its inherited listener.
 ///
-/// ## The caveat about THREAD vs process, and why it is acceptable
+/// ## The caveat about THREAD vs process, and why it is acceptable (Linux)
 ///
 /// `PR_SET_PDEATHSIG` fires when the THREAD that created the child exits —
 /// not when the whole PROCESS exits. A process whose spawning thread happens
@@ -965,43 +1003,60 @@ fn spawn_harness_child(cmd: &mut Command) -> std::io::Result<Child> {
 /// prevents (orphans reparented to PID 1, holding ports and DB connections
 /// and spinning the box to load 424).
 ///
-/// ## The parent-already-dead race
+/// ## The parent-already-dead race (Linux)
 ///
 /// `prctl` arms a signal for a FUTURE parent death only — a parent that died
 /// between this child's `fork` and the `prctl` call would never deliver it.
 /// The hook therefore captures the parent pid BEFORE spawning, compares
 /// `getppid()` against it before AND after the `prctl` call, and `_exit(1)`s
 /// the child immediately if the parent is already gone.
-#[cfg(target_os = "linux")]
-fn arm_child_pdeathsig(cmd: &mut Command) {
+#[cfg(unix)]
+fn arm_child_pre_exec_guarantees(cmd: &mut Command, listen_fd: Option<i32>) {
     use std::os::unix::process::CommandExt;
     // Captured in THIS process before `fork`: the pid the child's `getppid()`
-    // must equal right after the fork.
+    // must equal right after the fork (Linux pdeathsig arm below).
+    #[cfg(target_os = "linux")]
     let parent_pid = unsafe { libc::getpid() };
     unsafe {
         cmd.pre_exec(move || {
-            if libc::getppid() != parent_pid {
-                libc::_exit(1);
+            // --- inherited-listener handoff (all Unix) — in the CHILD. ---
+            if let Some(fd) = listen_fd {
+                // SAFETY: F_GETFD/F_SETFD take a plain descriptor number (no
+                // pointers) and are async-signal-safe, which is what this
+                // hook may call. This process's fd table is already private
+                // here (post-fork), so the change is scoped to this child.
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let rc = libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
-            // SAFETY: prctl with a plain signal-number argument (no pointers)
-            // is always safe to call.
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
-                libc::_exit(1);
+
+            // --- death-with-parent (Linux). ---
+            #[cfg(target_os = "linux")]
+            {
+                if libc::getppid() != parent_pid {
+                    libc::_exit(1);
+                }
+                // SAFETY: prctl with a plain signal-number argument (no
+                // pointers) is always safe to call.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    libc::_exit(1);
+                }
+                // Parent could have died between the getppid above and this
+                // prctl; a signal armed for a dead parent never arrives.
+                if libc::getppid() != parent_pid {
+                    libc::_exit(1);
+                }
             }
-            // Parent could have died between the getppid above and this
-            // prctl; a signal armed for a dead parent never arrives.
-            if libc::getppid() != parent_pid {
-                libc::_exit(1);
-            }
+
             Ok(())
         });
     }
 }
-
-/// Non-Linux: the guarantee has no portable equivalent, and the harness's own
-/// `SpawnedServer::drop` still reaps the child on every clean exit.
-#[cfg(not(target_os = "linux"))]
-fn arm_child_pdeathsig(_cmd: &mut Command) {}
 
 /// The harness: an installed [`HarnessApp`] impl + the consumer's `manifest_dir`
 /// + the compile-context [`Variant`]. Construct once per test binary (a
@@ -1010,6 +1065,14 @@ pub struct TestHarness<A: HarnessApp> {
     app: A,
     manifest_dir: PathBuf,
     variant: Variant,
+    /// TEST-ONLY seam: invoked in the parent immediately before the child is
+    /// spawned, while this process still owns the reserved listener (and, were
+    /// the removed parent-side FD_CLOEXEC clear back in place, exactly the
+    /// window in which it would leak the listener to unrelated children). See
+    /// [`TestHarness::set_spawn_seam`]. Always `None` in a consumer shim; only
+    /// the harness's own integration tests set it.
+    #[cfg(unix)]
+    spawn_seam: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl<A: HarnessApp> TestHarness<A> {
@@ -1023,7 +1086,26 @@ impl<A: HarnessApp> TestHarness<A> {
             app,
             manifest_dir,
             variant,
+            #[cfg(unix)]
+            spawn_seam: None,
         }
+    }
+
+    /// TEST-ONLY (Unix): install a callback the harness invokes in the parent
+    /// immediately before the child is spawned, while it still holds the
+    /// reserved listener — between the `ZIEE_LISTEN_FD` handoff setup and
+    /// `Command::spawn`.
+    ///
+    /// This is the harness's own deterministic window into the cross-test
+    /// listener-leak defect: a sibling process spawned from the callback
+    /// (e.g. a plain `sleep` via `std::process::Command`) is `fork`ed while
+    /// this process holds the listener, so with the parent-side FD_CLOEXEC
+    /// clear (the removed defect) it inherits the socket and keeps it open
+    /// for its whole life; with the fix the flag is still set and the sibling
+    /// reaches `exec` with the socket already gone. No consumer shim sets it.
+    #[cfg(unix)]
+    pub fn set_spawn_seam(&mut self, seam: impl Fn() + Send + Sync + 'static) {
+        self.spawn_seam = Some(Box::new(seam));
     }
 
     /// Spawn a fresh test server with the given app options.
@@ -1161,32 +1243,43 @@ impl<A: HarnessApp> TestHarness<A> {
         for (k, v) in &plan.extra_env {
             cmd.env(k, v);
         }
-        // Socket activation (GAP-harness-port-pick-toctou): hand the
-        // reserved, already-bound listener to the child. Clear FD_CLOEXEC so
-        // the descriptor survives `exec`, and tell the child which fd to adopt
-        // — `ziee_framework::bind_listener` reads `ZIEE_LISTEN_FD` and serves
-        // on this very listener instead of binding the configured address, so
-        // the port this process reserved is exactly the port the child serves,
+        // Socket activation (GAP-harness-port-pick-toctou): hand the reserved,
+        // already-bound listener to the child by naming its descriptor.
+        // `ziee_framework::bind_listener` reads `ZIEE_LISTEN_FD` and serves on
+        // this very listener instead of binding the configured address, so the
+        // port this process reserved is exactly the port the child serves,
         // with no free window for a third process.
+        //
+        // The descriptor survives `exec` WITHOUT ever clearing FD_CLOEXEC in
+        // THIS process: leaving the flag set is exactly what keeps any OTHER
+        // child this multi-threaded test process forks (another test's server
+        // spawn, any `Command`) from inheriting the listener's socket — see
+        // [`arm_child_pre_exec_guarantees`] for the full reasoning. The flag
+        // is cleared in the CHILD's `pre_exec` hook, after fork, where the
+        // descriptor table is already private to that child.
         #[cfg(unix)]
-        {
+        let listener_fd: Option<i32> = {
             use std::os::fd::AsRawFd;
-
             let fd = held_listener.as_raw_fd();
-            // SAFETY: plain descriptor-number fcntls (F_GETFD/F_SETFD) — no
-            // pointers, exactly the calls allowed in the pre_exec region
-            // (async-signal-safe), though this runs in the parent process.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(
-                flags >= 0,
-                "fcntl(F_GETFD) on the reserved test-server listener failed: {}",
-                std::io::Error::last_os_error()
-            );
-            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
-            assert_eq!(rc, 0, "fcntl(F_SETFD) on the reserved test-server listener failed");
             cmd.env("ZIEE_LISTEN_FD", fd.to_string());
+            Some(fd)
+        };
+        #[cfg(not(unix))]
+        let listener_fd: Option<i32> = None;
+
+        // TEST-ONLY seam (Unix): invoked HERE, between the handoff setup and the
+        // spawn, while this process still holds the listener — the exact window
+        // in which the removed parent-side FD_CLOEXEC clear used to leak the
+        // socket to unrelated children. The harness's own integration tests use
+        // it to make that leak deterministically observable (a sibling forked
+        // here must own no copy of the socket). Consumer shims never install it.
+        #[cfg(unix)]
+        if let Some(seam) = &self.spawn_seam {
+            seam();
         }
-        let child = spawn_harness_child(&mut cmd).expect("Failed to start test server");
+
+        let child =
+            spawn_harness_child(&mut cmd, listener_fd).expect("Failed to start test server");
 
         // The child has been `exec`'d and now owns its own copy of the socket;
         // release ours. The spawn-failure panic path above unwinds with
@@ -1307,8 +1400,8 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg("exec sleep 120");
         // THE HARNESS SPAWN PATH: this is exactly what `TestHarness::start`
-        // calls for a real test server.
-        let child = spawn_harness_child(&mut cmd).expect("spawn long-sleeping child");
+        // calls for a real test server (no inherited listener here).
+        let child = spawn_harness_child(&mut cmd, None).expect("spawn long-sleeping child");
         fs::write(&pid_file, child.id().to_string()).expect("write child pid");
         // Park until the outer test SIGKILLs this process. Unreachable by the
         // outer test except via the kill — deliberately no Drop-guard here:
