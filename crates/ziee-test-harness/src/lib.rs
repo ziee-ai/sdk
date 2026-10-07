@@ -1262,16 +1262,6 @@ impl<A: HarnessApp> TestHarness<A> {
             use std::os::fd::AsRawFd;
             let fd = held_listener.as_raw_fd();
             cmd.env("ZIEE_LISTEN_FD", fd.to_string());
-            // TEMP-REVERT-PROOF: restore the parent-side FD_CLOEXEC clear to
-            // prove the sibling-leak regression test is red with it.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            assert!(
-                flags >= 0,
-                "fcntl(F_GETFD) on the reserved test-server listener failed: {}",
-                std::io::Error::last_os_error()
-            );
-            let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
-            assert_eq!(rc, 0, "fcntl(F_SETFD) on the reserved test-server listener failed");
             Some(fd)
         };
         #[cfg(not(unix))]
