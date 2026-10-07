@@ -23,9 +23,11 @@ test('TEST-PATHSUB-1: undefined capture throws Missing required parameter', () =
   )
 })
 
-test('TEST-PATHSUB-2: null capture throws Missing required parameter (#502 — RED before the fix)', () => {
-  // The regression at the heart of #502: with the old `!== undefined`-only
-  // guard this returned `/api/series/null` instead of throwing.
+test('TEST-PATHSUB-2: null capture throws Missing required parameter (the #502 semantic contract)', () => {
+  // The #502 contract: a null capture is a programming error, never the
+  // literal segment "null". This leg pins the helper's semantics; the
+  // transport-level leg (TEST-PATHSUB-7) is the one that goes RED against the
+  // old `!== undefined`-only guard in core.ts::performCall.
   assert.throws(
     () => substitutePathParams('/api/series/{slug}', { slug: null }),
     /^Error: Missing required parameter: slug$/,
