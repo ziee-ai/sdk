@@ -127,16 +127,32 @@ const AUTH_REFRESH_EXEMPT = new Set<string>([
   // wrong-password attempt doesn't burn a refresh rotation and silently
   // re-submit the mutation.
   'POST /api/auth/password',
-  // The recovery management routes and a username change answer a wrong
-  // CURRENT password with the same 401 INVALID_CREDENTIALS. Retrying after a
-  // silent refresh would submit the wrong password twice and spend two of the
-  // account's few re-authentication attempts on one mistake.
+])
+
+// Endpoints that answer a wrong CURRENT password with 401 INVALID_CREDENTIALS
+// but ALSO answer 401 for a genuinely expired access token (the recovery
+// management routes, and a username change). Retrying the first after a silent
+// refresh would submit the wrong password twice and spend two of the account's
+// few re-authentication attempts on one mistake; skipping the refresh for the
+// second would fail an ordinary edit on an expired token. So these skip the
+// silent refresh ONLY when the 401 body says INVALID_CREDENTIALS.
+const AUTH_REFRESH_EXEMPT_ON_CREDENTIAL_REFUSAL = new Set<string>([
   'POST /api/auth/profile',
   'POST /api/auth/recovery/codes',
   'POST /api/auth/recovery/codes/clear',
   'PUT /api/auth/recovery/questions',
   'POST /api/auth/recovery/questions/clear',
 ])
+
+/** Does this 401 say "wrong current password" (as opposed to "token expired")? */
+const isCredentialRefusal = async (response: Response): Promise<boolean> => {
+  try {
+    const body = (await response.clone().json()) as { error_code?: unknown } | null
+    return body?.error_code === 'INVALID_CREDENTIALS'
+  } catch {
+    return false
+  }
+}
 
 // Token-minting endpoints where a BROWSER client opts in to cookie-mode
 // delivery (`X-Refresh-Cookie: 1` → the refresh token arrives as an
@@ -608,7 +624,11 @@ const performCall = async <TResponse = unknown>(
       if (
         response.status === 401 &&
         onUnauthorized &&
-        !AUTH_REFRESH_EXEMPT.has(endpointUrl)
+        !AUTH_REFRESH_EXEMPT.has(endpointUrl) &&
+        !(
+          AUTH_REFRESH_EXEMPT_ON_CREDENTIAL_REFUSAL.has(endpointUrl) &&
+          (await isCredentialRefusal(response))
+        )
       ) {
         // The handler (Auth.store.refreshSession) is internally guarded,
         // but its navigator.locks.request wrapper can itself reject in

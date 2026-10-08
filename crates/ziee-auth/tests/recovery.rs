@@ -113,7 +113,7 @@ async fn the_sql_counter_matches_the_pure_reference() {
         assert_eq!(allowed, n <= 4, "attempts 1..=4 proceed, the rest do not");
     }
     assert!(
-        !repo.begin_attempt("name", "someone-else-is-fresh-ok", 15, 4).await.is_err(),
+        repo.begin_attempt("name", "someone-else-is-fresh-ok", 15, 4).await.unwrap(),
         "other keys are unaffected"
     );
     assert!(repo.begin_attempt("name", "another", 15, 4).await.unwrap(), "a fresh key proceeds");
@@ -182,5 +182,30 @@ async fn a_reset_ends_every_session_in_the_same_transaction() {
     assert_eq!(live, 0, "no refresh token survives the reset");
     let v: i32 = sqlx::query_scalar("SELECT token_version FROM users WHERE id = $1").bind(u).fetch_one(&pool).await.unwrap();
     assert_eq!(v, 1, "the access-token epoch was bumped by the same transaction");
+    drop_db(&db).await;
+}
+
+/// A key that is LOCKED keeps its lock even when its window start has aged out:
+/// the window restarts only once the lock itself has ended.
+#[tokio::test]
+async fn a_live_lock_outlives_an_aged_window() {
+    let (pool, db) = fresh_db().await;
+    let repo = RecoveryRepository::new(pool.clone());
+    for _ in 0..3 {
+        repo.begin_attempt("name", "locked-one", 15, 3).await.unwrap();
+    }
+    assert!(!repo.begin_attempt("name", "locked-one", 15, 3).await.unwrap(), "over the limit");
+    // The window start ages out, but the lock (set when the limit was reached) is still ahead.
+    sqlx::query("UPDATE auth_recovery_attempts SET window_started_at = NOW() - INTERVAL '30 minutes' WHERE key = 'locked-one'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!repo.begin_attempt("name", "locked-one", 15, 3).await.unwrap(), "a live lock is not escaped by an aged window");
+    // Once the lock itself ends, the window restarts.
+    sqlx::query("UPDATE auth_recovery_attempts SET locked_until = NOW() - INTERVAL '1 minute' WHERE key = 'locked-one'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(repo.begin_attempt("name", "locked-one", 15, 3).await.unwrap(), "lock over, window restarted");
     drop_db(&db).await;
 }
