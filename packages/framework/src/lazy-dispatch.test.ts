@@ -46,12 +46,12 @@ test('TEST-11: two lazy actions on one store run in CALL order, not chunk-load o
       await chunkA
       return { default: () => () => calls.push('a') }
     },
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
   const b = createLazyDispatcher(
     async () => ({ default: () => () => calls.push('b') }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
 
@@ -61,7 +61,7 @@ test('TEST-11: two lazy actions on one store run in CALL order, not chunk-load o
   // `b`'s chunk has LONG resolved by now, but `b`'s impl must NOT have been
   // invoked: `a` was dispatched first and its impl has not started yet.
   await settleTicks()
-  assert.deepEqual(calls, [], 'b must wait for a to START, even though b\'s chunk resolved first')
+  assert.deepEqual(calls, [] as string[], 'b must wait for a to START, even though b\'s chunk resolved first')
 
   releaseA()
   await Promise.all([pa, pb])
@@ -75,14 +75,14 @@ test('TEST-12: an import failure in action a does not block action b on the same
     async () => {
       throw new Error('a chunk gone')
     },
-    m => m.default(),
+    (m: any) => m.default(),
     // Zero the retry backoff: the failure-budget assertions are about ATTEMPTS,
     // not wall clock (the injectable seam lazy-dispatch's failure specs exist for).
     { sequencer, sleep: () => Promise.resolve() },
   )
   const b = createLazyDispatcher(
     async () => ({ default: () => () => calls.push('b') }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
 
@@ -103,12 +103,12 @@ test('TEST-13: a synchronous throw in a\'s impl does not block b on the same sto
         throw new Error('impl boom')
       },
     }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
   const b = createLazyDispatcher(
     async () => ({ default: () => () => calls.push('b') }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
 
@@ -126,7 +126,7 @@ test('TEST-14: re-entrancy — a dispatches b (same store) and awaits it, withou
 
   const b = createLazyDispatcher(
     async () => ({ default: () => () => 'b-ok' }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
   const a = createLazyDispatcher(
@@ -141,7 +141,7 @@ test('TEST-14: re-entrancy — a dispatches b (same store) and awaits it, withou
         calls.push('a-after:' + r)
       },
     }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
 
@@ -161,12 +161,12 @@ test('TEST-15: different stores are not sequenced against each other', { timeout
       await chunkX
       return { default: () => () => calls.push('x') }
     },
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer: sequencerX },
   )
   const y = createLazyDispatcher(
     async () => ({ default: () => () => calls.push('y') }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer: sequencerY },
   )
 
@@ -188,13 +188,13 @@ test('TEST-16: preload() stays non-blocking and unsequenced (never invokes, neve
 
   const a = createLazyDispatcher(
     async () => ({ default: () => () => calls.push('a') }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
 
   // Warm a chunk without invoking: `preload()` resolves and the impl never ran.
   await a.preload()
-  assert.deepEqual(calls, [], 'preload must never invoke the impl')
+  assert.deepEqual(calls, [] as string[], 'preload must never invoke the impl')
 
   // A dispatch in flight must not block ANOTHER action's preload on the same
   // store: `slow` claims the chain and parks on its still-pending chunk;
@@ -206,18 +206,18 @@ test('TEST-16: preload() stays non-blocking and unsequenced (never invokes, neve
       await slowChunk
       return { default: () => () => calls.push('slow') }
     },
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
   const fast = createLazyDispatcher(
     async () => ({ default: () => () => calls.push('fast') }),
-    m => m.default(),
+    (m: any) => m.default(),
     { sequencer },
   )
 
   const p = slow()
   await fast.preload()
-  assert.deepEqual(calls, [], 'preload must not wait for (or occupy) the chain')
+  assert.deepEqual(calls, [] as string[], 'preload must not wait for (or occupy) the chain')
   releaseSlow()
   await p
   assert.deepEqual(calls, ['slow'])

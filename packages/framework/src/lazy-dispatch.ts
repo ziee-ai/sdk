@@ -7,6 +7,40 @@
 // memoized so the download happens once; `preload()` warms them without
 // invoking the action.
 //
+// ── Why this module exists in two parts: dispatcher + sequencer ────────────
+// Each lazy action has its OWN chunk, so with the naive dispatch
+// (`resolveImpl().then(impl => impl(...args))`) two actions called
+// back-to-back on one store ran in the order their chunks happened to resolve.
+// #659 was exactly that, in production: `X.edit(patch); X.save()` could run
+// `save` first and write the PREVIOUS draft. The fix keeps chunk loads
+// parallel and serializes only each impl's INVOCATION, in CALL order, through
+// one `LazyActionSequencer` per STORE (shared via `LazyDispatchOptions`).
+//
+// ── EXACT ORDERING GUARANTEE ───────────────────────────────────────────────
+// On a single store (one sequencer):
+//   1. Lazy-vs-lazy: if `X.a()` is dispatched before `X.b()` on the same
+//      store, `a`'s impl is INVOKED before `b`'s. Always — cold chunks, warm
+//      chunks, failures, everything. "Dispatched" = the call expression ran;
+//      "invoked" = the action body started executing.
+//   2. Call order, not settle order: the chain moves the moment an impl is
+//      invoked (or its dispatch fails). A slow `a` never serializes later
+//      actions behind its network call, and an action may dispatch and AWAIT
+//      another action on its own store without deadlock.
+//   3. Failure does not poison the store: an import failure or a synchronous
+//      throw in one impl releases the chain; later dispatches still run.
+//   4. Different stores have different sequencers — one store's slow chunk
+//      never delays another store's actions.
+//   5. `.preload()` never takes a chain slot (non-blocking, unsequenced).
+// Eager actions (inline `actions:` factories and `{ eager: true }` globs) are
+// built as plain synchronous functions and are NOT sequenced: they run
+// synchronously at their call site. Mixing is therefore deterministic in the
+// only directions that matter — eager-vs-eager runs in call order
+// (synchronous); an eager action called after a lazy action in the same tick
+// still runs before that lazy action's (always-deferred) invocation; and
+// lazy-vs-lazy keeps the guarantee above. A handler needing strict order
+// ACROSS the two kinds must await the lazy call (as before — this is
+// unchanged by the sequencer).
+//
 // ── Why the loader is passed as TWO stages ──────────────────────────────────
 // The two stages fail for completely different reasons and must be recovered
 // from differently:
@@ -204,6 +238,9 @@ export function createLazyDispatcher<M = any>(
   let implPromise: Promise<(...args: any[]) => any> | null = null
   let buildFailures = 0
   const sleep = options.sleep ?? delay
+  // Per-store call-order sequencer (#659). store-kit passes ONE shared
+  // instance per store; a standalone dispatcher sequences its own calls.
+  const sequencer = options.sequencer ?? createLazyActionSequencer()
 
   /** Import with bounded retry + linear backoff. Rejects with the LAST error. */
   const importWithRetry = async (): Promise<M> => {
@@ -270,8 +307,32 @@ export function createLazyDispatcher<M = any>(
     return implPromise
   }
 
-  const dispatch = ((...args: any[]) =>
-    resolveImpl().then(impl => impl(...args))) as LazyActionDispatcher
+  const dispatch = ((...args: any[]) => {
+    // Claim this dispatch's slot in the store's call order BEFORE starting the
+    // chunk load: both happen in the call's tick, so chunk loads stay fully
+    // parallel across actions and only the IMPL INVOCATION is serialized.
+    const { turn, release } = sequencer.claim()
+    const started = resolveImpl()
+    return (async () => {
+      // Wait for every earlier dispatch on the store to have STARTED (or
+      // failed), never for them to settle (#659).
+      await turn
+      let result: any
+      try {
+        const impl = await started
+        // Invoking the impl IS the start: release in `finally` so the chain
+        // moves on the moment this impl is invoked — and ALSO when the import
+        // fails (`await started` rejects) or the impl throws synchronously —
+        // otherwise one failed action would block the store's chain forever.
+        // An async impl's returned promise settles the caller's promise via
+        // the async wrapper below WITHOUT holding the chain.
+        result = impl(...args)
+      } finally {
+        release()
+      }
+      return result
+    })()
+  }) as LazyActionDispatcher
 
   dispatch.preload = () => resolveImpl().then(() => undefined)
   return dispatch

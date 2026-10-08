@@ -14,7 +14,7 @@ import { useEventBusStore } from './events'
 import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
 import { createStoreProxy, type StoreProxy } from './stores'
 import { onNetworkIdle } from './net-idle'
-import { createLazyDispatcher } from './lazy-dispatch'
+import { createLazyActionSequencer, createLazyDispatcher } from './lazy-dispatch'
 import { isStaleBuild } from './chunk-recovery'
 import {
   applyStoreSeed,
@@ -421,11 +421,23 @@ function makeBuilder<State extends object, Actions extends object>(
     // (cached thereafter) and exposes `.preload()` to warm it early.
     const lazyDispatchers: Record<string, any> = {}
     if (config.lazyActions) {
+      // ONE call-order sequencer per store instance, shared by every lazy
+      // action's dispatcher (#659): with per-action chunks, the old
+      // `resolveImpl().then(impl => impl(...args))` ran each impl in
+      // CHUNK-LOAD order, so `X.edit(patch); X.save()` could run `save` before
+      // `edit` and write the previous draft (the production kid-mode bug).
+      // See `LazyActionSequencer` (lazy-dispatch.ts) for the guarantee's
+      // exact wording; in short: on ONE store, lazy impls are INVOKED in
+      // dispatch-call order — by START, never by SETTLE, so slow actions do
+      // not serialize later ones and an action may await another action on
+      // its own store. Different stores never share a sequencer.
+      const sequencer = createLazyActionSequencer()
       for (const key of Object.keys(config.lazyActions)) {
         const loader = (config.lazyActions as LazyActionsConfig<State>)[key]
-        // The dispatcher (chunk memoization, `.preload()`, and the chunk-load
-        // de-dup window that keeps each action's OWN in-flight guard reachable)
-        // lives in ./lazy-dispatch.ts — see the rationale there.
+        // The dispatcher (chunk memoization, `.preload()`, the chunk-load
+        // de-dup window that keeps each action's OWN in-flight guard reachable,
+        // and the per-store call-order sequencer) lives in ./lazy-dispatch.ts —
+        // see the rationale there.
         //
         // The two stages are passed SEPARATELY on purpose: the dispatcher must
         // distinguish a TRANSIENT chunk-download failure (retry, never memoize —
@@ -434,6 +446,7 @@ function makeBuilder<State extends object, Actions extends object>(
         lazyDispatchers[key] = createLazyDispatcher(
           () => loader(),
           m => m.default(set, get),
+          { sequencer },
         )
       }
     }

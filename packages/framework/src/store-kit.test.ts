@@ -69,3 +69,45 @@ test('TEST-9: `$.__destroy__` is reachable hook-free and does NOT trigger store 
   // (the `$` branch short-circuits before the trap's init side-effect).
   assert.equal(initRuns, 0)
 })
+
+test('TEST-17: #659 — mixing eager and lazy actions on one store reorders neither', async () => {
+  // Eager (inline `actions:` factory) = synchronous at the call site; lazy
+  // actions on the same store share ONE per-store sequencer, so they keep
+  // CALL order too. The documented guarantee (lazy-dispatch.ts): eager runs
+  // exactly at its call site; lazy impls are always deferred and, among
+  // themselves, invoked in dispatch order.
+  const executed: string[] = []
+  const h = defineStore('ProbeEagerLazyMix', {
+    state: { n: 0 },
+    actions: (set: any) => ({
+      bump: () => {
+        executed.push('eager-bump')
+        set((s: any) => ({ n: s.n + 1 }))
+      },
+    }),
+    lazyActions: {
+      a: () =>
+        Promise.resolve({
+          default: () => async () => {
+            executed.push('lazy-a')
+          },
+        }),
+      b: () =>
+        Promise.resolve({
+          default: () => async () => {
+            executed.push('lazy-b')
+          },
+        }),
+    },
+  })
+  const p: any = createStoreProxy(h.store as any)
+  p.bump()
+  p.a()
+  p.b()
+  // The eager action ran synchronously at its call site — already observable
+  // before the lazy impls (always deferred) had a chance to run.
+  assert.deepEqual(executed, ['eager-bump'])
+  await new Promise<void>(r => setTimeout(r, 0))
+  assert.deepEqual(executed, ['eager-bump', 'lazy-a', 'lazy-b'])
+  assert.equal(p.$.n, 1)
+})
