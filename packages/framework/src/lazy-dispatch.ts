@@ -21,7 +21,10 @@
 //   1. Lazy-vs-lazy: if `X.a()` is dispatched before `X.b()` on the same
 //      store, `a`'s impl is INVOKED before `b`'s. Always — cold chunks, warm
 //      chunks, failures, everything. "Dispatched" = the call expression ran;
-//      "invoked" = the action body started executing.
+//      "invoked" = the action body started executing. (Same-action calls are
+//      also call-ordered — by the dispatcher's own memoized chunk, whose
+//      callbacks run FIFO — and are additionally kept in the SAME TICK, see
+//      `LazyActionSequencer.claim`.)
 //   2. Call order, not settle order: the chain moves the moment an impl is
 //      invoked (or its dispatch fails). A slow `a` never serializes later
 //      actions behind its network call, and an action may dispatch and AWAIT
@@ -31,9 +34,10 @@
 //   4. Different stores have different sequencers — one store's slow chunk
 //      never delays another store's actions.
 //   5. `.preload()` never takes a chain slot (non-blocking, unsequenced).
-//   6. Warm-path timing: a dispatch with no EARLIER dispatch still pending
-//      (the common case — one action per handler) invokes on the chunk with
-//      the pre-sequencing single-microtask timing; only back-to-back
+//   6. Warm-path timing: a dispatch with no earlier DIFFERENT-ACTION dispatch
+//      still pending (the common case — one action per handler, or a
+//      back-to-back pair of the SAME action) invokes on the chunk with the
+//      pre-sequencing single-microtask timing; only cross-action back-to-back
 //      dispatches pay the extra turn-wait hop, and that hop is the ONLY cost.
 // Eager actions (inline `actions:` factories and `{ eager: true }` globs) are
 // built as plain synchronous functions and are NOT sequenced: they run
@@ -201,43 +205,72 @@ export interface LazyDispatchOptions {
 export interface LazyActionSequencer {
   /**
    * Claim the next dispatch slot in call order. Synchronous — must be called
-   * at dispatch time.
+   * at dispatch time, with the dispatcher's own identity (`owner`).
+   *
+   * `owner` distinguishes ACTIONS, not slots: dispatches of the SAME action are
+   * already call-ordered by the dispatcher's own memoized chunk (callbacks on
+   * one promise run FIFO), so batching them — same-tick invocations, no turn
+   * wait at all — keeps the pre-sequencing timing for back-to-back calls of one
+   * action (the transport's same-tick request coalescer depends on that gap
+   * being zero; measured on the app's peek store). The ordering guarantee
+   * applies across OWNERS, unchanged.
    *
    * @returns `turn` — a never-rejecting promise that resolves when every
-   *   earlier slot's impl has been invoked or its dispatch has failed (i.e.
-   *   when it is this slot's turn); `release` — call EXACTLY ONCE, at the
-   *   moment this slot's impl is invoked or its dispatch gives up, so the next
-   *   slot can proceed; `idle` — true when NO earlier slot is pending, in
-   *   which case `turn` is already resolved and the dispatcher invokes with the
-   *   pre-sequencing single-hop timing (the chain only costs microtasks when it
-   *   actually has something to wait for).
+   *   earlier dispatch of a DIFFERENT action has been invoked or has failed
+   *   (i.e. when it is this dispatch's turn; resolved immediately when only
+   *   same-action dispatches are ahead); `release` — call EXACTLY ONCE, at the
+   *   moment this dispatch's impl is invoked or its dispatch gives up, so later
+   *   dispatches can proceed; `idle` — true when the turn is already resolved
+   *   and the dispatcher may invoke with the pre-sequencing single-hop timing.
    */
-  claim(): { turn: Promise<void>; release: () => void; idle: boolean }
+  claim(owner: object): { turn: Promise<void>; release: () => void; idle: boolean }
 }
 
 /** Build a per-store call-order sequencer (see `LazyActionSequencer`). */
 export function createLazyActionSequencer(): LazyActionSequencer {
-  let tail: Promise<void> = Promise.resolve()
-  // Slots claimed but not yet released. `idle` (no earlier dispatch still
-  // waiting for ITS turn) must count RELEASES against CLAIMS per slot, not a
-  // single busy flag: clearing the flag on the first release would let a third
-  // dispatch skip the wait while a second one is still between its turn and
-  // its invocation.
-  let pending = 0
+  const BASE = Promise.resolve()
+  // One entry per RUN of consecutive dispatches of the same owner that are
+  // still pending (claimed but not yet released). An entry's `latest` is what
+  // the NEXT different-owner dispatch waits for; same-owner batches never wait
+  // on their own entry.
+  const groups: Array<{ owner: object; latest: Promise<void>; releases: number }> = []
   return {
-    claim() {
-      const idle = pending === 0
-      pending++
-      const turn = tail
+    claim(owner) {
+      const last = groups[groups.length - 1]
+      if (last && last.owner === owner) {
+        // Same-action batch: earlier same-action dispatches are already
+        // invoked ahead of us (their chunk-memo callbacks run FIFO), so the
+        // only ordering left is against the previous different action.
+        const turn = groups.length > 1 ? groups[groups.length - 2].latest : BASE
+        let release!: () => void
+        const latest = new Promise<void>(r => (release = r))
+        last.latest = latest
+        last.releases++
+        return {
+          turn,
+          release: () => {
+            last.releases--
+            if (last.releases === 0) groups.splice(groups.indexOf(last), 1)
+            release()
+          },
+          idle: turn === BASE,
+        }
+      }
+      // New action group: dispatched after the pending groups; the previous
+      // group's LAST claim is the barrier.
+      const turn = last ? last.latest : BASE
+      const group = { owner, latest: BASE, releases: 1 }
       let release!: () => void
-      tail = new Promise<void>(r => (release = r))
+      group.latest = new Promise<void>(r => (release = r))
+      groups.push(group)
       return {
         turn,
         release: () => {
-          pending--
+          group.releases--
+          if (group.releases === 0) groups.splice(groups.indexOf(group), 1)
           release()
         },
-        idle,
+        idle: turn === BASE,
       }
     },
   }
@@ -263,6 +296,11 @@ export function createLazyDispatcher<M = any>(
   // Per-store call-order sequencer (#659). store-kit passes ONE shared
   // instance per store; a standalone dispatcher sequences its own calls.
   const sequencer = options.sequencer ?? createLazyActionSequencer()
+  // The sequencer's OWNER identity of THIS action: dispatches of one action
+  // are already call-ordered by the memoized chunk (callback FIFO), so the
+  // chain only needs to order ACROSS actions — and same-action back-to-back
+  // dispatches keep the pre-sequencing same-tick invocation.
+  const owner = {}
 
   /** Import with bounded retry + linear backoff. Rejects with the LAST error. */
   const importWithRetry = async (): Promise<M> => {
@@ -333,7 +371,7 @@ export function createLazyDispatcher<M = any>(
     // Claim this dispatch's slot in the store's call order BEFORE starting the
     // chunk load: both happen in the call's tick, so chunk loads stay fully
     // parallel across actions and only the IMPL INVOCATION is serialized.
-    const { turn, release, idle } = sequencer.claim()
+    const { turn, release, idle } = sequencer.claim(owner)
     const started = resolveImpl()
     if (idle) {
       // No earlier dispatch is pending — invoke on the chunk with the

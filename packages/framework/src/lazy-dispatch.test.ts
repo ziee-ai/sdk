@@ -265,3 +265,62 @@ test('TEST-18: a third action waits for the middle one even when the first relea
   await Promise.all([pa, pb, pc])
   assert.deepEqual(calls, ['a', 'b', 'c'])
 })
+
+test('TEST-19: same-action dispatches batched in one tick, cross-action order still holds', { timeout: 5000 }, async () => {
+  // a(); b(); a() with a's chunk resolving LAST: invocation order must be
+  // a1, b, a2 (dispatch order). The second `a` is a SAME-action dispatch — it
+  // batches with the first rather than occupying a separate chain slot — but
+  // it must STILL wait for the different-action `b` that was dispatched
+  // between them.
+  const calls: string[] = []
+  const sequencer = createLazyActionSequencer()
+
+  let releaseA!: () => void
+  const chunkA = new Promise<void>(r => (releaseA = r))
+  const a = createLazyDispatcher(
+    async () => {
+      await chunkA
+      return { default: () => () => calls.push('a') }
+    },
+    (m: any) => m.default(),
+    { sequencer },
+  )
+  const b = createLazyDispatcher(
+    async () => ({ default: () => () => calls.push('b') }),
+    (m: any) => m.default(),
+    { sequencer },
+  )
+
+  const pa1 = a()
+  const pb = b()
+  const pa2 = a()
+
+  // b's chunk resolved long ago but its impl must wait for a1's start; a2
+  // batches with a1, so nothing has run yet.
+  await settleTicks()
+  assert.deepEqual(calls, [] as string[], 'b waits for a1; a2 batches with a1')
+  releaseA()
+  await Promise.all([pa1, pb, pa2])
+  assert.deepEqual(calls, ['a', 'b', 'a'])
+})
+
+test('TEST-20: same-action back-to-back invocations are NOT gated by settle (one-tick batch)', { timeout: 5000 }, async () => {
+  // The transport's same-tick request coalescer reads a memoized in-flight
+  // window: two dispatches of the SAME action must be invoked in the SAME
+  // microtask drain (no turn-wait between them), or the second invocation sees
+  // the first's window already closed. A first impl that never settles must
+  // not stop the second invocation either (start, not settle).
+  const calls: string[] = []
+  const sequencer = createLazyActionSequencer()
+  const a = createLazyDispatcher(
+    async () => ({ default: () => () => calls.push('a') }),
+    (m: any) => m.default(),
+    { sequencer },
+  )
+
+  const pa1 = a()
+  const pa2 = a()
+  await settleTicks()
+  assert.deepEqual(calls, ['a', 'a'], 'both invocations run in the same tick, in call order')
+  await Promise.all([pa1, pa2])
+})
