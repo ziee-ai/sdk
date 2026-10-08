@@ -888,6 +888,25 @@ pub async fn update_profile<R: IdentityResolver<User = User, Group = Group>>(
         if t.is_empty() { None } else { Some(t) }
     });
 
+    // On an email-less deployment the username is the whole identity, so changing
+    // it needs the current password (and spends the same per-account attempt
+    // budget as the recovery management routes).
+    if let Some(ref u) = username
+        && u != &auth.user.username
+        && !ctx.options().config.email_required
+    {
+        let Some(current) = req.current_password.as_deref() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                AppError::bad_request(
+                    "PASSWORD_REQUIRED",
+                    "Enter your current password to change your username.",
+                ),
+            ));
+        };
+        super::recovery::reauth(&ctx, &auth.user, current).await?;
+    }
+
     // Username uniqueness friendly pre-check: only a *different* user
     // holding the name is a conflict — re-submitting your own current
     // username is a no-op. The DB UNIQUE constraint (mapped to 409 inside

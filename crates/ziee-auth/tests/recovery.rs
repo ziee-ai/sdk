@@ -104,18 +104,42 @@ async fn the_sql_counter_matches_the_pure_reference() {
     let (pool, db) = fresh_db().await;
     let repo = RecoveryRepository::new(pool.clone());
     let mut model: Option<Counter> = None;
-    for n in 1..=6 {
+    for n in 1..=8 {
         let now = chrono::Utc::now();
-        let (next, model_locked) = next_counter(model, now, 15, 4);
+        let (next, model_allowed) = next_counter(model, now, 15, 4);
         model = Some(next);
-        let locked = repo.record_failure("name", "ghost", 15, 4).await.unwrap();
-        assert_eq!(locked, model_locked, "SQL and pure reference agree at failure {n}");
-        assert_eq!(locked, n >= 4, "locks from the 4th failure on");
+        let allowed = repo.begin_attempt("name", "ghost", 15, 4).await.unwrap();
+        assert_eq!(allowed, model_allowed, "SQL and pure reference agree at attempt {n}");
+        assert_eq!(allowed, n <= 4, "attempts 1..=4 proceed, the rest do not");
     }
-    assert!(repo.locked_until("name", "ghost").await.unwrap().is_some());
-    assert!(repo.locked_until("name", "someone-else").await.unwrap().is_none(), "other keys are unaffected");
+    assert!(
+        !repo.begin_attempt("name", "someone-else-is-fresh-ok", 15, 4).await.is_err(),
+        "other keys are unaffected"
+    );
+    assert!(repo.begin_attempt("name", "another", 15, 4).await.unwrap(), "a fresh key proceeds");
     repo.clear_attempts("name", "ghost").await.unwrap();
-    assert!(repo.locked_until("name", "ghost").await.unwrap().is_none());
+    assert!(repo.begin_attempt("name", "ghost", 15, 4).await.unwrap(), "cleared: proceeds again");
+    drop_db(&db).await;
+}
+
+/// The race the audit found: with the count taken BEFORE verification, a burst of
+/// concurrent attempts is admitted exactly `max` times, no matter how many arrive.
+#[tokio::test]
+async fn a_concurrent_burst_is_admitted_exactly_max_times() {
+    let (pool, db) = fresh_db().await;
+    let repo = RecoveryRepository::new(pool.clone());
+    let mut tasks = Vec::new();
+    for _ in 0..40 {
+        let r = repo.clone();
+        tasks.push(tokio::spawn(async move { r.begin_attempt("name", "victim", 15, 5).await.unwrap() }));
+    }
+    let mut admitted = 0;
+    for t in tasks {
+        if t.await.unwrap() {
+            admitted += 1;
+        }
+    }
+    assert_eq!(admitted, 5, "40 simultaneous attempts, 5 admitted");
     drop_db(&db).await;
 }
 
@@ -124,17 +148,39 @@ async fn an_expired_window_restarts_the_count() {
     let (pool, db) = fresh_db().await;
     let repo = RecoveryRepository::new(pool.clone());
     for _ in 0..2 {
-        repo.record_failure("ip", "9.9.9.9", 15, 3).await.unwrap();
+        assert!(repo.begin_attempt("ip", "9.9.9.9", 15, 3).await.unwrap());
     }
     sqlx::query("UPDATE auth_recovery_attempts SET window_started_at = NOW() - INTERVAL '20 minutes'")
         .execute(&pool)
         .await
         .unwrap();
-    assert!(!repo.record_failure("ip", "9.9.9.9", 15, 3).await.unwrap(), "window expired: count restarts at 1");
+    assert!(repo.begin_attempt("ip", "9.9.9.9", 15, 3).await.unwrap(), "window expired: count restarts at 1");
     let f: i32 = sqlx::query_scalar("SELECT failures FROM auth_recovery_attempts WHERE key = '9.9.9.9'")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(f, 1);
+    drop_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_reset_ends_every_session_in_the_same_transaction() {
+    let (pool, db) = fresh_db().await;
+    let u = user(&pool, "u", "").await;
+    sqlx::query("INSERT INTO refresh_tokens (jti, user_id, expires_at) VALUES (gen_random_uuid(), $1, NOW() + INTERVAL '1 day')")
+        .bind(u)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let repo = RecoveryRepository::new(pool.clone());
+    assert!(repo.complete_reset(u, None, "newhash").await.unwrap());
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL")
+        .bind(u)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(live, 0, "no refresh token survives the reset");
+    let v: i32 = sqlx::query_scalar("SELECT token_version FROM users WHERE id = $1").bind(u).fetch_one(&pool).await.unwrap();
+    assert_eq!(v, 1, "the access-token epoch was bumped by the same transaction");
     drop_db(&db).await;
 }

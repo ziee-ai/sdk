@@ -47,14 +47,14 @@ pub enum RecoveryMethod {
 }
 
 /// One answer to one configured question.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Clone, Deserialize, JsonSchema)]
 pub struct QuestionAnswer {
     pub key: String,
     pub answer: String,
 }
 
 /// `POST /auth/recovery/reset` body.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct ResetPasswordRequest {
     pub username: String,
     pub method: RecoveryMethod,
@@ -87,27 +87,27 @@ pub struct RecoveryStatus {
 }
 
 /// A body that only proves the caller still knows the password.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct ReauthRequest {
     pub current_password: String,
 }
 
 /// The freshly generated set. Shown once: nothing returns it again.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Serialize, JsonSchema)]
 pub struct GeneratedCodes {
     pub codes: Vec<String>,
     pub generated_at: DateTime<Utc>,
 }
 
 /// One pick in a security-question set.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct QuestionPick {
     pub key: String,
     pub answer: String,
 }
 
 /// `PUT /auth/recovery/questions` body: the whole set, replacing any previous.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct SetQuestionsRequest {
     pub current_password: String,
     pub questions: Vec<QuestionPick>,

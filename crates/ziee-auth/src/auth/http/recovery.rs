@@ -7,7 +7,7 @@
 //!
 //! Every public failure is the same body. See [`crate::auth::recovery`].
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::OnceLock;
 
 use aide::transform::TransformOperation;
@@ -25,7 +25,6 @@ use crate::auth::recovery::types::*;
 use crate::auth::recovery::{
     self, CODE_BCRYPT_COST, CODES_PER_SET, MAX_QUESTIONS, QUESTIONS, RecoveryRepository,
 };
-use crate::auth::refresh_tokens;
 use crate::user::events::UserEvent;
 use crate::user::permissions::ProfileEdit;
 use crate::user::{Group, User};
@@ -78,21 +77,6 @@ fn not_available() -> Fail {
             "This recovery method is not available on this site",
         ),
     )
-}
-
-/// The caller's address: the peer, or with `trust_forwarded_headers` the
-/// RIGHTMOST `X-Forwarded-For` entry (the one the nearest trusted proxy
-/// appended; earlier entries are client-supplied). `None` when neither is
-/// available, in which case only the per-name limit applies.
-fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
-    if crate::auth::trust_forwarded_headers()
-        && let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
-        && let Some(last) = v.rsplit(',').next()
-        && let Ok(ip) = last.trim().parse::<IpAddr>()
-    {
-        return Some(ip);
-    }
-    peer.map(|p| p.ip())
 }
 
 fn dummy_code_hash() -> &'static str {
@@ -149,16 +133,20 @@ pub async fn lookup_questions(
         return Ok((StatusCode::OK, Json(QuestionsLookupResponse { questions: vec![] })));
     }
     let name = req.username.trim();
+    let repo = RecoveryRepository::new(ctx.pool().clone());
     let real = if name.is_empty() || name.chars().count() > 100 {
         Vec::new()
     } else {
-        match ctx.user().get_by_username(name).await.map_err(db)? {
-            Some(u) if u.is_active && !u.is_admin => RecoveryRepository::new(ctx.pool().clone())
-                .questions(u.id)
-                .await
-                .map_err(db)?,
-            _ => Vec::new(),
-        }
+        // The same two reads whether or not the name exists (a nil id matches no
+        // row), so the path does not differ in shape between a real and a
+        // missing account.
+        let found = ctx.user().get_by_username(name).await.map_err(db)?;
+        let (id, listed) = match found {
+            Some(u) if u.is_active && !u.is_admin => (u.id, true),
+            _ => (Uuid::nil(), false),
+        };
+        let rows = repo.questions(id).await.map_err(db)?;
+        if listed { rows } else { Vec::new() }
     };
     let list: Vec<QuestionPrompt> = if real.is_empty() {
         prompts(recovery::decoy_questions(ctx.options().pepper(), name).into_iter())
@@ -272,15 +260,27 @@ pub async fn reset_password(
 
     let repo = RecoveryRepository::new(ctx.pool().clone());
     let name_key = recovery::name_key(&name);
-    let ip = client_ip(&headers, peer.map(|Extension(ConnectInfo(a))| a)).map(|i| i.to_string());
+    let ip = recovery::client_key(&headers, peer.map(|Extension(ConnectInfo(a))| a.ip()));
 
-    // Locks first: a locked key answers 429 without touching the account.
-    if repo.locked_until(SCOPE_NAME, &name_key).await.map_err(db)?.is_some() {
-        return Err(rate_limited(lim.lockout_minutes));
-    }
-    if let Some(ip) = &ip
-        && repo.locked_until(SCOPE_IP, ip).await.map_err(db)?.is_some()
-    {
+    // RESERVE the attempt before anything is verified: one atomic upsert per key
+    // both counts and reads, so a burst of concurrent requests cannot get past
+    // the limit while an earlier one is still inside bcrypt. A key already over
+    // its limit answers 429 without touching the account. The address counter is
+    // never refunded (a success on one's own account must not launder guesses
+    // at another); the name counter is cleared on success.
+    let name_ok = repo
+        .begin_attempt(SCOPE_NAME, &name_key, window, lim.max_failures_per_name as i32)
+        .await
+        .map_err(db)?;
+    let ip_ok = match &ip {
+        Some(ip) => repo
+            .begin_attempt(SCOPE_IP, ip, window, lim.max_failures_per_ip as i32)
+            .await
+            .map_err(db)?,
+        None => true,
+    };
+    if !(name_ok && ip_ok) {
+        tracing::info!(name_ok, ip_ok, "recovery: attempt refused, key over its limit");
         return Err(rate_limited(lim.lockout_minutes));
     }
 
@@ -314,20 +314,7 @@ pub async fn reset_password(
     let user = match (proven, user) {
         (true, Some(u)) => u,
         _ => {
-            let name_locked = repo
-                .record_failure(SCOPE_NAME, &name_key, window, lim.max_failures_per_name as i32)
-                .await
-                .map_err(db)?;
-            let ip_locked = match &ip {
-                Some(ip) => repo
-                    .record_failure(SCOPE_IP, ip, window, lim.max_failures_per_ip as i32)
-                    .await
-                    .map_err(db)?,
-                None => false,
-            };
-            if name_locked || ip_locked {
-                tracing::info!(name_locked, ip_locked, "recovery: a key was locked out");
-            }
+            // The attempt was already counted when it was reserved above.
             tracing::info!("recovery: reset refused");
             return Err(recovery_failed());
         }
@@ -344,11 +331,8 @@ pub async fn reset_password(
         return Err(recovery_failed());
     }
 
-    // Whoever held the old password is signed out everywhere: refresh tokens
-    // revoked and the access-token epoch bumped in one transaction.
-    refresh_tokens::end_session_atomically(ctx.pool(), user.id)
-        .await
-        .map_err(db)?;
+    // `complete_reset` already ended every session in the SAME transaction as the
+    // password write (refresh tokens revoked, access-token epoch bumped).
     repo.clear_attempts(SCOPE_NAME, &name_key).await.map_err(db)?;
 
     ctx.events.emit_user(UserEvent::Updated { user: ctx.options().scrub_user(user.clone()) });
@@ -392,9 +376,6 @@ pub(crate) async fn reauth(ctx: &AuthContext, user: &User, current_password: &st
     let repo = RecoveryRepository::new(ctx.pool().clone());
     let lim = &ctx.options().config.recovery;
     let key = user.id.to_string();
-    if repo.locked_until(SCOPE_REAUTH, &key).await.map_err(db)?.is_some() {
-        return Err(rate_limited(lim.lockout_minutes));
-    }
     let hash = user.password_hash.clone().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -404,20 +385,25 @@ pub(crate) async fn reauth(ctx: &AuthContext, user: &User, current_password: &st
             ),
         )
     })?;
-    let pw = current_password.to_string();
-    let ok = tokio::task::spawn_blocking(move || password::verify_password(&pw, &hash))
-        .await
-        .map_err(|e| internal("verify password", e))?
-        .map_err(|e| internal("verify password", e))?;
-    if !ok {
-        repo.record_failure(
+    // Reserve the attempt BEFORE the password is checked (see `begin_attempt`).
+    if !repo
+        .begin_attempt(
             SCOPE_REAUTH,
             &key,
             lim.lockout_minutes as i32,
             lim.max_failures_per_account_reauth as i32,
         )
         .await
-        .map_err(db)?;
+        .map_err(db)?
+    {
+        return Err(rate_limited(lim.lockout_minutes));
+    }
+    let pw = current_password.to_string();
+    let ok = tokio::task::spawn_blocking(move || password::verify_password(&pw, &hash))
+        .await
+        .map_err(|e| internal("verify password", e))?
+        .map_err(|e| internal("verify password", e))?;
+    if !ok {
         return Err((
             StatusCode::UNAUTHORIZED,
             AppError::unauthorized("INVALID_CREDENTIALS", "Current password is incorrect"),

@@ -9,15 +9,15 @@ use uuid::Uuid;
 
 use ziee_core::AppError;
 
-/// An unused code's row id and bcrypt hash.
-#[derive(Debug, Clone)]
+/// An unused code's row id and bcrypt hash. (No `Debug`: it carries a hash.)
+#[derive(Clone)]
 pub struct CodeRow {
     pub id: Uuid,
     pub code_hash: String,
 }
 
-/// A configured question as stored.
-#[derive(Debug, Clone)]
+/// A configured question as stored. (No `Debug`: it carries a hash.)
+#[derive(Clone)]
 pub struct QuestionRow {
     pub position: i16,
     pub question_key: String,
@@ -189,10 +189,17 @@ impl RecoveryRepository {
 
     // ───────────── the reset itself ─────────────
 
-    /// Set the new password and, when a code was the credential, consume it,
-    /// in ONE transaction. The consume is a compare-and-set
-    /// (`used_at IS NULL`), so two concurrent resets with the same code cannot
-    /// both win: the loser gets `false` and nothing is written.
+    /// Set the new password, end every session, and, when a code was the
+    /// credential, consume it: ALL in ONE transaction. The consume is a
+    /// compare-and-set (`used_at IS NULL`), so two concurrent resets with the
+    /// same code cannot both win: the loser gets `false` and nothing is written.
+    ///
+    /// Ending the sessions here (the access-token epoch bump and the refresh
+    /// token revocation, the same two statements as
+    /// `refresh_tokens::end_session_atomically`) rather than in a second
+    /// transaction afterwards is deliberate: a failure between the two would
+    /// leave the new password set and the old sessions alive, which is exactly
+    /// the state a reset exists to end.
     pub async fn complete_reset(
         &self,
         user_id: Uuid,
@@ -217,14 +224,31 @@ impl RecoveryRepository {
                 return Ok(false);
             }
         }
-        sqlx::query!(
+        let updated = sqlx::query!(
             r#"
             UPDATE users
-            SET password_hash = $2, password_changed_at = NOW(), updated_at = NOW()
+            SET password_hash = $2,
+                password_changed_at = NOW(),
+                updated_at = NOW(),
+                token_version = token_version + 1
             WHERE id = $1 AND is_active
             "#,
             user_id,
             new_password_hash
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::database_error)?;
+        if updated.rows_affected() != 1 {
+            return Ok(false);
+        }
+        sqlx::query!(
+            r#"
+            UPDATE refresh_tokens
+            SET revoked_at = NOW()
+            WHERE user_id = $1 AND revoked_at IS NULL
+            "#,
+            user_id
         )
         .execute(&mut *tx)
         .await
@@ -235,60 +259,55 @@ impl RecoveryRepository {
 
     // ───────────── attempt counters ─────────────
 
-    /// `Some(until)` while `(scope, key)` is locked.
-    pub async fn locked_until(
-        &self,
-        scope: &str,
-        key: &str,
-    ) -> Result<Option<DateTime<Utc>>, AppError> {
-        let row = sqlx::query_scalar!(
-            r#"
-            SELECT locked_until AS "locked_until: DateTime<Utc>"
-            FROM auth_recovery_attempts
-            WHERE scope = $1 AND key = $2 AND locked_until > NOW()
-            "#,
-            scope,
-            key
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(AppError::database_error)?;
-        Ok(row.flatten())
-    }
-
-    /// Record one failure. One atomic upsert: inside the window the count goes
-    /// up, outside it restarts at 1, and reaching `max_failures` stamps
-    /// `locked_until = now + window`. Returns whether the key is now locked.
+    /// Reserve ONE attempt against `(scope, key)` BEFORE the credential is
+    /// checked, and say whether it may proceed.
+    ///
+    /// Counting first and verifying second is the whole point. Counting after
+    /// (record a failure once the bcrypt check said no) leaves a window of
+    /// about half a second per request in which every request already in
+    /// flight has passed the lock check, so a burst of N concurrent requests
+    /// gets N guesses instead of `max_attempts`. Here one atomic upsert both
+    /// increments and reads the count, so concurrent requests are serialised by
+    /// the row lock and at most `max_attempts` of them see `allowed = true`.
+    ///
+    /// Inside the window the count goes up; outside it (and with no live lock)
+    /// it restarts at 1; reaching `max_attempts` stamps `locked_until = now +
+    /// window`, which also stops the window from restarting early. A SUCCESS
+    /// calls [`Self::clear_attempts`] for the keys that should be forgiven.
     /// (`auth::recovery::next_counter` is the pure mirror of this arithmetic.)
-    pub async fn record_failure(
+    pub async fn begin_attempt(
         &self,
         scope: &str,
         key: &str,
         window_minutes: i32,
-        max_failures: i32,
+        max_attempts: i32,
     ) -> Result<bool, AppError> {
-        let locked = sqlx::query_scalar!(
+        let failures = sqlx::query_scalar!(
             r#"
             INSERT INTO auth_recovery_attempts AS a (scope, key, failures, window_started_at, locked_until)
             VALUES ($1, $2, 1, NOW(), CASE WHEN $4 <= 1 THEN NOW() + make_interval(mins => $3) END)
             ON CONFLICT (scope, key) DO UPDATE SET
                 failures = CASE
-                    WHEN a.window_started_at < NOW() - make_interval(mins => $3) THEN 1
+                    WHEN a.window_started_at < NOW() - make_interval(mins => $3)
+                         AND (a.locked_until IS NULL OR a.locked_until <= NOW()) THEN 1
                     ELSE a.failures + 1 END,
                 window_started_at = CASE
-                    WHEN a.window_started_at < NOW() - make_interval(mins => $3) THEN NOW()
+                    WHEN a.window_started_at < NOW() - make_interval(mins => $3)
+                         AND (a.locked_until IS NULL OR a.locked_until <= NOW()) THEN NOW()
                     ELSE a.window_started_at END,
                 locked_until = CASE
-                    WHEN (CASE WHEN a.window_started_at < NOW() - make_interval(mins => $3)
-                               THEN 1 ELSE a.failures + 1 END) >= $4
-                    THEN NOW() + make_interval(mins => $3)
+                    WHEN a.window_started_at < NOW() - make_interval(mins => $3)
+                         AND (a.locked_until IS NULL OR a.locked_until <= NOW())
+                        THEN CASE WHEN $4 <= 1 THEN NOW() + make_interval(mins => $3) END
+                    WHEN a.locked_until IS NOT NULL AND a.locked_until > NOW() THEN a.locked_until
+                    WHEN a.failures + 1 >= $4 THEN NOW() + make_interval(mins => $3)
                     ELSE NULL END
-            RETURNING (locked_until IS NOT NULL AND locked_until > NOW()) AS "locked!"
+            RETURNING failures AS "failures!"
             "#,
             scope,
             key,
             window_minutes,
-            max_failures
+            max_attempts
         )
         .fetch_one(&self.pool)
         .await
@@ -311,7 +330,7 @@ impl RecoveryRepository {
         .execute(&self.pool)
         .await
         .map_err(AppError::database_error)?;
-        Ok(locked)
+        Ok(failures <= max_attempts)
     }
 
     /// Forget the counter (a successful reset or re-auth).

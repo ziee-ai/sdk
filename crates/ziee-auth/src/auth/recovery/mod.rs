@@ -25,6 +25,9 @@ use sha2::{Digest, Sha256};
 pub mod repository;
 pub mod types;
 
+use std::net::IpAddr;
+use std::sync::{Arc, OnceLock};
+
 pub use repository::RecoveryRepository;
 
 // ───────────────────────────── recovery codes ─────────────────────────────
@@ -173,7 +176,10 @@ pub fn derive_pepper(jwt_secret: &str) -> Vec<u8> {
 pub fn decoy_questions(pepper: &[u8], username: &str) -> Vec<&'static CatalogueQuestion> {
     let mut h = Sha256::new();
     h.update(pepper);
-    h.update(username.trim().to_lowercase().as_bytes());
+    // The EXACT trimmed name, never case-folded: usernames are case-sensitive,
+    // so folding here would give `alice` and `ALICE` the same decoy while only
+    // one of them exists, and the pair would tell the two apart.
+    h.update(username.trim().as_bytes());
     let d = h.finalize();
     let want = MIN_QUESTIONS + (d[0] as usize % (MAX_QUESTIONS - MIN_QUESTIONS + 1));
     let mut picked: Vec<&'static CatalogueQuestion> = Vec::with_capacity(want);
@@ -201,24 +207,65 @@ pub fn decoy_questions(pepper: &[u8], username: &str) -> Vec<&'static CatalogueQ
     picked
 }
 
+// ───────────────────────────── client address ─────────────────────────────
+
+/// How the app wants "who is calling" decided for the per-address limit.
+///
+/// An app that sits behind a CDN and a proxy has its own de-proxying rule (how
+/// many trusted hops to skip, how an IPv6 address collapses to a subject); the
+/// SDK cannot know it. The app installs a resolver once at boot; without one the
+/// SDK uses the rightmost `X-Forwarded-For` entry when
+/// `server.trust_forwarded_headers` is on, else the peer address.
+pub trait ClientAddressResolver: Send + Sync {
+    /// The string a per-address counter is keyed on, or `None` when no address
+    /// is known (the per-address limit is then skipped; the per-name one stays).
+    fn client_key(&self, headers: &http::HeaderMap, peer: Option<IpAddr>) -> Option<String>;
+}
+
+static ADDRESS_RESOLVER: OnceLock<Arc<dyn ClientAddressResolver>> = OnceLock::new();
+
+/// Install the app's client-address rule. Call once at boot; the first install
+/// wins and a second is ignored with a warning.
+pub fn install_client_address_resolver(resolver: Arc<dyn ClientAddressResolver>) {
+    if ADDRESS_RESOLVER.set(resolver).is_err() {
+        tracing::warn!("ziee-auth: a client-address resolver was already installed; the FIRST stands");
+    }
+}
+
+/// The key the per-address counter uses for this request.
+pub(crate) fn client_key(headers: &http::HeaderMap, peer: Option<IpAddr>) -> Option<String> {
+    if let Some(r) = ADDRESS_RESOLVER.get() {
+        return r.client_key(headers, peer);
+    }
+    if crate::auth::trust_forwarded_headers()
+        && let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(last) = v.rsplit(',').next()
+        && let Ok(ip) = last.trim().parse::<IpAddr>()
+    {
+        return Some(ip.to_string());
+    }
+    peer.map(|p| p.to_string())
+}
+
 // ───────────────────────────── limits ─────────────────────────────
 
-/// The outcome of recording one failure against a counter.
+/// A counter as stored: attempts so far in the current window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Counter {
     pub failures: i32,
     pub window_started_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// What recording a failure at `now` does to `prev`: the new failure count, and
-/// whether this failure trips the lock. Pure mirror of the SQL in
-/// [`RecoveryRepository::record_failure`], kept so the arithmetic is asserted
-/// without a database and the SQL has a reference to be tested against.
+/// What reserving one attempt at `now` does to `prev`: the new count, and
+/// whether the attempt may proceed (the count has not passed `max_attempts`).
+/// Pure mirror of the SQL in [`RecoveryRepository::begin_attempt`] for the
+/// within-window and window-expiry arithmetic, kept so it is asserted without a
+/// database and the SQL has a reference to be tested against.
 pub fn next_counter(
     prev: Option<Counter>,
     now: chrono::DateTime<chrono::Utc>,
     window_minutes: i64,
-    max_failures: i32,
+    max_attempts: i32,
 ) -> (Counter, bool) {
     let window = chrono::Duration::minutes(window_minutes);
     let next = match prev {
@@ -228,7 +275,7 @@ pub fn next_counter(
         },
         _ => Counter { failures: 1, window_started_at: now },
     };
-    (next, next.failures >= max_failures)
+    (next, next.failures <= max_attempts)
 }
 
 /// Normalise a username into the key a 'name' counter is stored under.
@@ -305,12 +352,23 @@ mod tests {
     fn decoys_are_stable_per_username_and_vary_across_usernames() {
         let pepper = derive_pepper("0123456789abcdef0123456789abcdef-strong");
         let a1 = decoy_questions(&pepper, "ghost");
-        let a2 = decoy_questions(&pepper, "  GHOST ");
+        let a2 = decoy_questions(&pepper, "  ghost ");
         assert_eq!(
             a1.iter().map(|q| q.key).collect::<Vec<_>>(),
             a2.iter().map(|q| q.key).collect::<Vec<_>>(),
-            "same name, same decoy (case and padding folded)"
+            "same name, same decoy (padding trimmed)"
         );
+        let upper = decoy_questions(&pepper, "GHOST");
+        let upper_keys: Vec<_> = upper.iter().map(|q| q.key).collect();
+        let lower_keys: Vec<_> = a1.iter().map(|q| q.key).collect();
+        // Usernames are case-sensitive, so a decoy must not equate two spellings
+        // (spot check over several names: at least one pair must differ).
+        let differs = ["ghost", "alice", "bob", "carol"].iter().any(|n| {
+            decoy_questions(&pepper, n).iter().map(|q| q.key).collect::<Vec<_>>()
+                != decoy_questions(&pepper, &n.to_uppercase()).iter().map(|q| q.key).collect::<Vec<_>>()
+        });
+        assert!(differs, "case must be part of the decoy's input");
+        let _ = (upper_keys, lower_keys);
         assert!((MIN_QUESTIONS..=MAX_QUESTIONS).contains(&a1.len()));
         let mut distinct = std::collections::HashSet::new();
         for n in 0..40 {
@@ -330,26 +388,26 @@ mod tests {
     }
 
     #[test]
-    fn the_limit_trips_exactly_at_the_configured_count() {
+    fn the_limit_admits_exactly_the_configured_count() {
         let t0 = Utc::now();
         let mut prev = None;
-        for n in 1..=5 {
-            let (c, locked) = next_counter(prev, t0, 15, 5);
+        for n in 1..=8 {
+            let (c, allowed) = next_counter(prev, t0, 15, 5);
             assert_eq!(c.failures, n);
-            assert_eq!(locked, n == 5, "locked only on the fifth failure");
+            assert_eq!(allowed, n <= 5, "attempts 1..=5 proceed, the sixth does not");
             prev = Some(c);
         }
     }
 
     #[test]
-    fn a_failure_after_the_window_starts_a_new_count() {
+    fn an_attempt_after_the_window_starts_a_new_count() {
         let t0 = Utc::now();
         let (c, _) = next_counter(None, t0, 15, 5);
         let (c, _) = next_counter(Some(c), t0 + Duration::minutes(5), 15, 5);
         assert_eq!(c.failures, 2);
-        let (c, locked) = next_counter(Some(c), t0 + Duration::minutes(16), 15, 5);
+        let (c, allowed) = next_counter(Some(c), t0 + Duration::minutes(16), 15, 5);
         assert_eq!(c.failures, 1, "the old window expired");
-        assert!(!locked);
+        assert!(allowed);
     }
 
     #[test]

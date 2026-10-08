@@ -93,10 +93,17 @@ pub struct LinkAccountRequest {
 /// editable (re-verification flow not built; was removed to close an
 /// OAuth account-takeover vector) and `is_active`/`is_admin`/
 /// `permissions` are admin-only and can never be set through this path.
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 pub struct UpdateProfileRequest {
     #[serde(default)]
     pub username: Option<String>,
+    /// Required, and checked, to CHANGE the username on a deployment with
+    /// `auth.email_required: false`: there the username is the only login
+    /// identifier and the only key to account recovery, so a stolen session must
+    /// not be able to rename an account and lock its owner out. Ignored
+    /// otherwise.
+    #[serde(default)]
+    pub current_password: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
 }
