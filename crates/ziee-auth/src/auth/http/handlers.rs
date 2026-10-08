@@ -431,12 +431,18 @@ async fn login_with_provider(
             .attributes
             .display_name
             .unwrap_or_else(|| username.to_string());
-        let email = auth_result.attributes.email;
+        // An email-less deployment stores no email for an account it creates, even
+        // when the directory supplies one.
+        let email = ctx
+            .options()
+            .config
+            .email_required
+            .then_some(auth_result.attributes.email);
 
         let new_user_id = ctx.auth()
             .create_external_user_with_link(
                 username,
-                Some(email),
+                email,
                 &display_name,
                 provider_config.id,
                 &auth_result.external_id,
@@ -1033,13 +1039,23 @@ pub async fn change_password<R: IdentityResolver<User = User, Group = Group>>(
     // requires an active successor). Outstanding access tokens stay valid
     // for their short remaining TTL.
     //
-    // `end_session_atomically` ALSO bumps the access-token epoch, so an access
-    // token the previous password's holder already minted stops validating
-    // now rather than at its natural expiry (DEC-16): a password change is the
-    // moment a stolen session has to die.
-    refresh_tokens::end_session_atomically(ctx.pool(), user.id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // On a deployment that turned the account-model switches on (email-less or
+    // recovery enabled: `AuthOptions::strict_sessions`) the change uses
+    // `end_session_atomically`, which ALSO bumps the access-token epoch, so an
+    // access token the previous password's holder already minted stops
+    // validating now rather than at its natural expiry (DEC-16): a password
+    // change is the moment a stolen session has to die. Everywhere else the
+    // original refresh-token-only revocation is kept (INV-7).
+    if ctx.options().strict_sessions() {
+        refresh_tokens::end_session_atomically(ctx.pool(), user.id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    } else {
+        // The pre-existing behaviour, byte for byte.
+        refresh_tokens::revoke_all_for_user(ctx.pool(), user.id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    }
 
     Ok((StatusCode::NO_CONTENT, ()))
 }
@@ -1498,7 +1514,8 @@ async fn oauth_complete_inner(
 
     // ── 2. Email collision with an existing local account ───────
     //     → First-Broker-Link: do NOT auto-link, require password.
-    if email_verified_from_auth_result(&auth_result) {
+    //     Skipped on an email-less deployment: a stored email is never used.
+    if ctx.options().config.email_required && email_verified_from_auth_result(&auth_result) {
         if let Some(email) = auth_result.external_email.as_deref() {
             if !email.is_empty() {
                 if let Some(target_user_id) = ctx.auth()
@@ -1571,7 +1588,12 @@ async fn oauth_complete_inner(
     // auto-create an account. Reject cleanly here rather than letting a
     // NULL reach the NOT NULL `email` column (which previously surfaced as
     // an opaque 500 from the DB constraint).
+    //
+    // An email-less deployment provisions the account with NO email (and so no
+    // verification verdict) whatever the provider asserted.
+    let email_less = !ctx.options().config.email_required;
     let email = match auth_result.external_email.clone().filter(|e| !e.is_empty()) {
+        _ if email_less => String::new(),
         Some(e) => e,
         None => {
             return Err((
@@ -1596,12 +1618,12 @@ async fn oauth_complete_inner(
     // provision without one — so this is `true` on every reachable path
     // today. Threading the computed value rather than hardcoding `true`
     // keeps the row honest if either guard is ever relaxed.
-    let email_verified = email_verified_from_auth_result(&auth_result);
+    let email_verified = !email_less && email_verified_from_auth_result(&auth_result);
 
     let new_user_id = ctx.auth()
         .provision_external_user_atomic(
             &username,
-            Some(email.as_str()),
+            (!email_less).then_some(email.as_str()),
             email_verified,
             &display_name,
             provider_id,

@@ -127,6 +127,15 @@ const AUTH_REFRESH_EXEMPT = new Set<string>([
   // wrong-password attempt doesn't burn a refresh rotation and silently
   // re-submit the mutation.
   'POST /api/auth/password',
+  // The recovery management routes and a username change answer a wrong
+  // CURRENT password with the same 401 INVALID_CREDENTIALS. Retrying after a
+  // silent refresh would submit the wrong password twice and spend two of the
+  // account's few re-authentication attempts on one mistake.
+  'POST /api/auth/profile',
+  'POST /api/auth/recovery/codes',
+  'POST /api/auth/recovery/codes/clear',
+  'PUT /api/auth/recovery/questions',
+  'POST /api/auth/recovery/questions/clear',
 ])
 
 // Token-minting endpoints where a BROWSER client opts in to cookie-mode

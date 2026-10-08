@@ -453,6 +453,9 @@ pub async fn recovery_status<R: IdentityResolver<User = User, Group = Group>>(
     auth: RequirePermissions<R, (ProfileEdit,)>,
     Extension(ctx): Extension<AuthContext>,
 ) -> ApiResult<Json<RecoveryStatus>> {
+    if !ctx.options().config.recovery_enabled() {
+        return Err(not_available());
+    }
     Ok((StatusCode::OK, Json(status_for(&ctx, &auth.user).await?)))
 }
 
@@ -462,6 +465,7 @@ pub fn recovery_status_docs(op: TransformOperation) -> TransformOperation {
         .id("Auth.recoveryStatus")
         .tag("auth")
         .response::<200, Json<RecoveryStatus>>()
+        .response_with::<404, (), _>(|r| r.description("No recovery capability is enabled"))
 }
 
 /// POST /api/auth/recovery/codes

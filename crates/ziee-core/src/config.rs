@@ -201,8 +201,8 @@ impl Default for AuthConfig {
 }
 
 impl AuthConfig {
-    /// Whether any self-service recovery capability is on (the reset routes
-    /// are mounted only then).
+    /// Whether any self-service recovery capability is on (the recovery
+    /// handlers answer 404 `RECOVERY_NOT_AVAILABLE` otherwise).
     pub fn recovery_enabled(&self) -> bool {
         self.recovery_codes.enabled || self.security_questions.enabled
     }

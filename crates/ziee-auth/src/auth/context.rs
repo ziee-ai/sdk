@@ -127,6 +127,15 @@ impl AuthOptions {
         if self.config.email_required { stored } else { "" }
     }
 
+    /// Whether a password change ends EVERY session including already-issued
+    /// access tokens (the access-token epoch is bumped), not just the refresh
+    /// tokens. On for a deployment that turned the account-model switches on;
+    /// off by default so an app that never wrote the `auth:` block keeps its
+    /// original behaviour.
+    pub fn strict_sessions(&self) -> bool {
+        !self.config.email_required || self.config.recovery_enabled()
+    }
+
     /// `user` with its email scrubbed per [`Self::visible_email`].
     pub fn scrub_user(&self, mut user: crate::user::User) -> crate::user::User {
         if !self.config.email_required {
