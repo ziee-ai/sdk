@@ -142,6 +142,9 @@ pub async fn lookup_questions(
     Json(req): Json<QuestionsLookupRequest>,
 ) -> ApiResult<Json<QuestionsLookupResponse>> {
     let cfg = &ctx.options().config;
+    if !cfg.recovery_enabled() {
+        return Err(not_available());
+    }
     if !cfg.security_questions.enabled {
         return Ok((StatusCode::OK, Json(QuestionsLookupResponse { questions: vec![] })));
     }
@@ -244,6 +247,9 @@ pub async fn reset_password(
     Json(req): Json<ResetPasswordRequest>,
 ) -> ApiResult<()> {
     let cfg = ctx.options().config.clone();
+    if !cfg.recovery_enabled() {
+        return Err(not_available());
+    }
     let lim = cfg.recovery.clone();
     let window = lim.lockout_minutes as i32;
 
@@ -366,12 +372,14 @@ pub fn reset_password_docs(op: TransformOperation) -> TransformOperation {
         "wrong code, wrong answer (never which one), deactivated account\n",
         "- `WEAK_PASSWORD` (400) - the new password fails the strength check\n",
         "- `RECOVERY_RATE_LIMITED` (429) - too many failed attempts for this username or ",
-        "client address; the lock lasts the configured window\n\n",
+        "client address; the lock lasts the configured window\n",
+        "- `RECOVERY_NOT_AVAILABLE` (404) - this site has no recovery capability enabled\n\n",
         "On success every existing session of the account is revoked.",
     ))
     .id("Auth.recoveryReset")
     .tag("auth")
     .response::<204, ()>()
+    .response_with::<404, (), _>(|r| r.description("No recovery capability is enabled"))
     .response_with::<400, (), _>(|r| r.description("Reset refused (generic)"))
     .response_with::<429, (), _>(|r| r.description("Locked out after repeated failures"))
 }

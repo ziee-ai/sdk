@@ -101,11 +101,13 @@ pub fn auth_admin_routes<R: IdentityResolver<User = User, Group = Group>>() -> A
         )
 }
 
-/// Self-service account recovery routes — mounted at `/auth` ONLY when the
-/// deployment enabled a recovery capability (`auth.recovery_codes.enabled` or
-/// `auth.security_questions.enabled`). Otherwise the surface is never mounted:
-/// a permitted user cannot reach a capability the operator turned off, and the
-/// default (legacy) posture has none of these paths.
+/// Self-service account recovery routes — mounted at `/auth`.
+///
+/// The turnkey mounts always include them and every handler refuses with 404
+/// `RECOVERY_NOT_AVAILABLE` while its capability (`auth.recovery_codes.enabled`
+/// / `auth.security_questions.enabled`) is off, so the default (legacy) posture
+/// has no reachable recovery surface while the route set, and therefore the
+/// OpenAPI document, stays independent of the deploy config.
 ///
 /// Two are public by design (the caller has lost their password):
 /// `POST /recovery/questions` and `POST /recovery/reset`, plus the public

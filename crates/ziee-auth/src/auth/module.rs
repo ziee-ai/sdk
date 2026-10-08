@@ -170,13 +170,16 @@ impl AppModule for AuthModule {
         // Mount the SDK routes bundle with the batteries-included resolver.
         // Nested at `/auth` here → `/api/auth/*` once `build_api_router` nests
         // the combined router under `api_prefix`.
-        let mut auth_routes_bundle = auth_routes::<DefaultIdentityResolver>();
-        // Kill switch guards route registration too: with no recovery capability
-        // enabled the recovery surface is never mounted.
-        if ctx.options().config.recovery_enabled() {
-            auth_routes_bundle = auth_routes_bundle
-                .merge(super::http::auth_recovery_routes::<DefaultIdentityResolver>());
-        }
+        // The recovery routes are mounted UNCONDITIONALLY and each handler
+        // refuses (404 `RECOVERY_NOT_AVAILABLE`) when its capability is off.
+        // That is the deliberate shape, not an oversight of the usual "guard
+        // `register_routes` too" rule: the OpenAPI document and the generated
+        // client are committed artifacts, and a route set that depends on the
+        // deploy config would emit a DIFFERENT spec per developer (an app's
+        // regen-parity gate fails on exactly that). The capability switch is
+        // enforced where it cannot be bypassed: in the handlers.
+        let auth_routes_bundle = auth_routes::<DefaultIdentityResolver>()
+            .merge(super::http::auth_recovery_routes::<DefaultIdentityResolver>());
         let auth_router = ApiRouter::new()
             .nest("/auth", auth_routes_bundle)
             .merge(auth_admin_routes::<DefaultIdentityResolver>());
