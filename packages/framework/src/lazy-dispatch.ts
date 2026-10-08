@@ -31,6 +31,10 @@
 //   4. Different stores have different sequencers — one store's slow chunk
 //      never delays another store's actions.
 //   5. `.preload()` never takes a chain slot (non-blocking, unsequenced).
+//   6. Warm-path timing: a dispatch with no EARLIER dispatch still pending
+//      (the common case — one action per handler) invokes on the chunk with
+//      the pre-sequencing single-microtask timing; only back-to-back
+//      dispatches pay the extra turn-wait hop, and that hop is the ONLY cost.
 // Eager actions (inline `actions:` factories and `{ eager: true }` globs) are
 // built as plain synchronous functions and are NOT sequenced: they run
 // synchronously at their call site. Mixing is therefore deterministic in the
@@ -203,20 +207,38 @@ export interface LazyActionSequencer {
    *   earlier slot's impl has been invoked or its dispatch has failed (i.e.
    *   when it is this slot's turn); `release` — call EXACTLY ONCE, at the
    *   moment this slot's impl is invoked or its dispatch gives up, so the next
-   *   slot can proceed.
+   *   slot can proceed; `idle` — true when NO earlier slot is pending, in
+   *   which case `turn` is already resolved and the dispatcher invokes with the
+   *   pre-sequencing single-hop timing (the chain only costs microtasks when it
+   *   actually has something to wait for).
    */
-  claim(): { turn: Promise<void>; release: () => void }
+  claim(): { turn: Promise<void>; release: () => void; idle: boolean }
 }
 
 /** Build a per-store call-order sequencer (see `LazyActionSequencer`). */
 export function createLazyActionSequencer(): LazyActionSequencer {
   let tail: Promise<void> = Promise.resolve()
+  // Slots claimed but not yet released. `idle` (no earlier dispatch still
+  // waiting for ITS turn) must count RELEASES against CLAIMS per slot, not a
+  // single busy flag: clearing the flag on the first release would let a third
+  // dispatch skip the wait while a second one is still between its turn and
+  // its invocation.
+  let pending = 0
   return {
     claim() {
+      const idle = pending === 0
+      pending++
       const turn = tail
       let release!: () => void
       tail = new Promise<void>(r => (release = r))
-      return { turn, release }
+      return {
+        turn,
+        release: () => {
+          pending--
+          release()
+        },
+        idle,
+      }
     },
   }
 }
@@ -311,8 +333,27 @@ export function createLazyDispatcher<M = any>(
     // Claim this dispatch's slot in the store's call order BEFORE starting the
     // chunk load: both happen in the call's tick, so chunk loads stay fully
     // parallel across actions and only the IMPL INVOCATION is serialized.
-    const { turn, release } = sequencer.claim()
+    const { turn, release, idle } = sequencer.claim()
     const started = resolveImpl()
+    if (idle) {
+      // No earlier dispatch is pending — invoke on the chunk with the
+      // pre-sequencing single-hop timing. `release` (in `finally`, and in the
+      // rejection arm) still fires so a later domino of back-to-back dispatches
+      // remains correctly ordered from HERE on.
+      return started.then(
+        impl => {
+          try {
+            return impl(...args)
+          } finally {
+            release()
+          }
+        },
+        (err: unknown) => {
+          release()
+          throw err
+        },
+      )
+    }
     return (async () => {
       // Wait for every earlier dispatch on the store to have STARTED (or
       // failed), never for them to settle (#659).

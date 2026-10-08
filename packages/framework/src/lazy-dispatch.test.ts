@@ -222,3 +222,46 @@ test('TEST-16: preload() stays non-blocking and unsequenced (never invokes, neve
   await p
   assert.deepEqual(calls, ['slow'])
 })
+
+test('TEST-18: a third action waits for the middle one even when the first released early (no idle fast-path hole)', { timeout: 5000 }, async () => {
+  // Regresses the sequencer's OWN idle bookkeeping: `a` (idle) releases the
+  // moment its impl is invoked; `b` is then the only PENDING slot (waiting on
+  // its slow chunk); `c` — warm, chunk already resolved — must still wait for
+  // `b`'s start. A single "busy" flag cleared by `a`'s release would let `c`
+  // run before `b`; the counter (pending claims minus releases) must not.
+  const calls: string[] = []
+  const sequencer = createLazyActionSequencer()
+
+  const a = createLazyDispatcher(
+    async () => ({ default: () => () => calls.push('a') }),
+    (m: any) => m.default(),
+    { sequencer },
+  )
+  let releaseB!: () => void
+  const chunkB = new Promise<void>(r => (releaseB = r))
+  const b = createLazyDispatcher(
+    async () => {
+      await chunkB
+      return { default: () => () => calls.push('b') }
+    },
+    (m: any) => m.default(),
+    { sequencer },
+  )
+  const c = createLazyDispatcher(
+    async () => ({ default: () => () => calls.push('c') }),
+    (m: any) => m.default(),
+    { sequencer },
+  )
+
+  const pa = a()
+  const pb = b()
+  const pc = c()
+
+  // a is invoked (and released); c's chunk is already there — but b is still
+  // parked on its chunk, and b was dispatched BEFORE c.
+  await settleTicks()
+  assert.deepEqual(calls, ['a'], 'c must not run before b\'s impl started')
+  releaseB()
+  await Promise.all([pa, pb, pc])
+  assert.deepEqual(calls, ['a', 'b', 'c'])
+})
