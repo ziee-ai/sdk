@@ -278,9 +278,14 @@ pub fn next_counter(
     (next, next.failures <= max_attempts)
 }
 
-/// Normalise a username into the key a 'name' counter is stored under.
+/// The key a 'name' counter is stored under: the EXACT trimmed name.
+///
+/// Never case-folded. Usernames are case-sensitive (`alice` and `Alice` are two
+/// accounts), so folding would give two accounts one counter, and a SUCCESS on
+/// the attacker's own `Alice` (which clears the counter) would launder attempts
+/// against the victim's `alice`.
 pub fn name_key(username: &str) -> String {
-    username.trim().to_lowercase()
+    username.trim().to_string()
 }
 
 #[cfg(test)]
@@ -411,7 +416,8 @@ mod tests {
     }
 
     #[test]
-    fn the_name_key_folds_case_and_padding() {
-        assert_eq!(name_key("  Alice "), "alice");
+    fn the_name_key_is_the_exact_trimmed_name() {
+        assert_eq!(name_key("  Alice "), "Alice");
+        assert_ne!(name_key("alice"), name_key("Alice"), "two accounts, two counters");
     }
 }

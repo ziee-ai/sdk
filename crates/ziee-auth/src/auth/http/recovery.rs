@@ -268,19 +268,26 @@ pub async fn reset_password(
     // its limit answers 429 without touching the account. The address counter is
     // never refunded (a success on one's own account must not launder guesses
     // at another); the name counter is cleared on success.
-    let name_ok = repo
-        .begin_attempt(SCOPE_NAME, &name_key, window, lim.max_failures_per_name as i32)
-        .await
-        .map_err(db)?;
-    let ip_ok = match &ip {
-        Some(ip) => repo
+    // The ADDRESS is reserved FIRST and a refusal here returns before the name
+    // counter is touched. Otherwise one address that is already over its limit
+    // could keep adding attempts to every username it names (each then 429ed),
+    // locking the whole site's resets one name at a time; with this order the
+    // address limit caps how many names one client can burn.
+    if let Some(ip) = &ip
+        && !repo
             .begin_attempt(SCOPE_IP, ip, window, lim.max_failures_per_ip as i32)
             .await
-            .map_err(db)?,
-        None => true,
-    };
-    if !(name_ok && ip_ok) {
-        tracing::info!(name_ok, ip_ok, "recovery: attempt refused, key over its limit");
+            .map_err(db)?
+    {
+        tracing::info!("recovery: attempt refused, address over its limit");
+        return Err(rate_limited(lim.lockout_minutes));
+    }
+    if !repo
+        .begin_attempt(SCOPE_NAME, &name_key, window, lim.max_failures_per_name as i32)
+        .await
+        .map_err(db)?
+    {
+        tracing::info!("recovery: attempt refused, name over its limit");
         return Err(rate_limited(lim.lockout_minutes));
     }
 
