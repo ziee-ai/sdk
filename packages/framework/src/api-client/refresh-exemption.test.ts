@@ -31,17 +31,22 @@ const unauthorized = (error_code: string) =>
     headers: { 'Content-Type': 'application/json' },
   })
 
-function setup(refresh: () => Promise<boolean>) {
+function setup(refresh: () => Promise<boolean>): () => void {
   setAuthTokenProvider(() => 'test-token')
   setBaseUrlResolver(async () => 'http://stub.invalid')
   setUnauthorizedHandler(refresh)
   __resetInflightForTests()
+  // Restores everything this file installed (module-level transport state).
+  return () => {
+    setUnauthorizedHandler(null)
+    setAuthTokenProvider(() => null)
+  }
 }
 
 test('REFRESH-1: a wrong current password on a re-auth route is NOT retried after a refresh', async () => {
   let refreshes = 0
   let fetches = 0
-  setup(async () => {
+  const restoreSetup = setup(async () => {
     refreshes += 1
     return true
   })
@@ -64,21 +69,21 @@ test('REFRESH-1: a wrong current password on a re-auth route is NOT retried afte
     assert.equal(fetches, 5, 'each request was sent exactly once')
   } finally {
     restore()
-    setUnauthorizedHandler(null)
+    restoreSetup()
   }
 })
 
 test('REFRESH-2: an EXPIRED token on the same routes still refreshes and retries once', async () => {
   let refreshes = 0
   let fetches = 0
-  setup(async () => {
+  const restoreSetup = setup(async () => {
     refreshes += 1
     return true
   })
   const restore = stubFetch(async () => {
     fetches += 1
     return fetches === 1
-      ? unauthorized('TOKEN_EXPIRED')
+      ? unauthorized('INVALID_TOKEN')
       : new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
   })
   try {
@@ -87,22 +92,22 @@ test('REFRESH-2: an EXPIRED token on the same routes still refreshes and retries
     assert.equal(fetches, 2, 'and the request retried once with the fresh token')
   } finally {
     restore()
-    setUnauthorizedHandler(null)
+    restoreSetup()
   }
 })
 
 test('REFRESH-3: change-password stays exempt whatever the 401 says', async () => {
   let refreshes = 0
-  setup(async () => {
+  const restoreSetup = setup(async () => {
     refreshes += 1
     return true
   })
-  const restore = stubFetch(async () => unauthorized('TOKEN_EXPIRED'))
+  const restore = stubFetch(async () => unauthorized('INVALID_TOKEN'))
   try {
     await assert.rejects(callAsync('POST /api/auth/password', { current_password: 'x', new_password: 'y' }))
     assert.equal(refreshes, 0)
   } finally {
     restore()
-    setUnauthorizedHandler(null)
+    restoreSetup()
   }
 })
