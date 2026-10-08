@@ -307,32 +307,10 @@ export function createLazyDispatcher<M = any>(
     return implPromise
   }
 
-  const dispatch = ((...args: any[]) => {
-    // Claim this dispatch's slot in the store's call order BEFORE starting the
-    // chunk load: both happen in the call's tick, so chunk loads stay fully
-    // parallel across actions and only the IMPL INVOCATION is serialized.
-    const { turn, release } = sequencer.claim()
-    const started = resolveImpl()
-    return (async () => {
-      // Wait for every earlier dispatch on the store to have STARTED (or
-      // failed), never for them to settle (#659).
-      await turn
-      let result: any
-      try {
-        const impl = await started
-        // Invoking the impl IS the start: release in `finally` so the chain
-        // moves on the moment this impl is invoked — and ALSO when the import
-        // fails (`await started` rejects) or the impl throws synchronously —
-        // otherwise one failed action would block the store's chain forever.
-        // An async impl's returned promise settles the caller's promise via
-        // the async wrapper below WITHOUT holding the chain.
-        result = impl(...args)
-      } finally {
-        release()
-      }
-      return result
-    })()
-  }) as LazyActionDispatcher
+  const dispatch = ((...args: any[]) =>
+    // TEMP-REVERT-PROOF (#659): the pre-fix dispatch — impls run in
+    // chunk-load order, ignoring the sequencer entirely.
+    resolveImpl().then(impl => impl(...args))) as LazyActionDispatcher
 
   dispatch.preload = () => resolveImpl().then(() => undefined)
   return dispatch
