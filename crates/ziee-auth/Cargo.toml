@@ -64,6 +64,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 axum-login = "0.18.0"
 # Auth-provider + token deps (versions from src-app/server/Cargo.toml).
 bcrypt = "0.17.1"
+sha2 = "0.10"
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 oauth2 = "5.0.0"

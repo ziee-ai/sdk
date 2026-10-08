@@ -111,7 +111,14 @@ pub async fn register(
     let username = req.username.trim().to_string();
     crate::auth::username::validate_username(&username).map_err(AppError::to_api_error)?;
     req.username = username;
-    if req.email.trim().is_empty() {
+    // `auth.email_required: false` — a username-and-password-only deployment.
+    // Whatever the client sent as `email` is dropped: it is never stored, so it
+    // can neither be used nor shown.
+    let email_required = ctx.options().config.email_required;
+    if !email_required {
+        req.email = String::new();
+    }
+    if email_required && req.email.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             AppError::bad_request("INVALID_EMAIL", "Email cannot be empty"),
@@ -136,11 +143,12 @@ pub async fn register(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
         .is_some();
-    let email_taken = ctx.user()
-        .get_by_email(&req.email)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .is_some();
+    let email_taken = email_required
+        && ctx.user()
+            .get_by_email(&req.email)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .is_some();
     if username_taken || email_taken {
         if username_taken {
             tracing::info!("Register conflict on username (logged for ops; client sees generic)");
@@ -184,12 +192,12 @@ pub async fn register(
     ctx.events.emit_user(UserEvent::Created { user: user.clone() });
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, ctx.options().visible_email(&user.email), user.is_admin)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(token_response(&headers, StatusCode::CREATED, minted, |tokens| {
-        AuthResponse { user, tokens }
+        AuthResponse { user: ctx.options().scrub_user(user), tokens }
     }))
 }
 
@@ -265,10 +273,14 @@ pub async fn login(
             .expect("bcrypt dummy hash")
     });
 
-    let user_opt = ctx.user()
-        .get_by_username_or_email(&req.username)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Email-less deployments match the username only: a stored email is never
+    // a credential there.
+    let user_opt = if ctx.options().config.email_required {
+        ctx.user().get_by_username_or_email(&req.username).await
+    } else {
+        ctx.user().get_by_username(&req.username).await
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Pick the hash to verify: real user hash, dummy when missing or
     // no-password. Both code paths run bcrypt to keep timing flat.
@@ -313,12 +325,12 @@ pub async fn login(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, ctx.options().visible_email(&user.email), user.is_admin)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(token_response(&headers, StatusCode::OK, minted, |tokens| {
-        AuthResponse { user, tokens }
+        AuthResponse { user: ctx.options().scrub_user(user), tokens }
     }))
 }
 
@@ -460,12 +472,12 @@ async fn login_with_provider(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, ctx.options().visible_email(&user.email), user.is_admin)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(token_response(headers, StatusCode::OK, minted, |tokens| {
-        AuthResponse { user, tokens }
+        AuthResponse { user: ctx.options().scrub_user(user), tokens }
     }))
 }
 
@@ -603,7 +615,7 @@ pub async fn refresh(
             .generate_tokens_with_jti_expiry(
                 user.id,
                 &user.username,
-                &user.email,
+                ctx.options().visible_email(&user.email),
                 user.is_admin,
                 access_hours,
                 refresh_days,
@@ -636,7 +648,7 @@ pub async fn refresh(
                         .reissue_tokens_for_jti(
                             user.id,
                             &user.username,
-                            &user.email,
+                            ctx.options().visible_email(&user.email),
                             user.is_admin,
                             access_hours,
                             succ_jti,
@@ -664,7 +676,7 @@ pub async fn refresh(
             &jwt_service,
             user.id,
             &user.username,
-            &user.email,
+            ctx.options().visible_email(&user.email),
             user.is_admin,
         )
         .await
@@ -828,7 +840,7 @@ pub async fn me(
     Ok((
         StatusCode::OK,
         Json(MeResponse {
-            user,
+            user: ctx.options().scrub_user(user),
             permissions,
             has_password,
         }),
@@ -911,7 +923,7 @@ pub async fn update_profile<R: IdentityResolver<User = User, Group = Group>>(
         origin.0,
     );
 
-    Ok((StatusCode::OK, Json(updated_user)))
+    Ok((StatusCode::OK, Json(ctx.options().scrub_user(updated_user))))
 }
 
 /// Documentation for update_profile endpoint
@@ -993,7 +1005,12 @@ pub async fn change_password<R: IdentityResolver<User = User, Group = Group>>(
     // closes the rotation-grace window (`rotation_grace_successor`
     // requires an active successor). Outstanding access tokens stay valid
     // for their short remaining TTL.
-    refresh_tokens::revoke_all_for_user(ctx.pool(), user.id)
+    //
+    // `end_session_atomically` ALSO bumps the access-token epoch, so an access
+    // token the previous password's holder already minted stops validating
+    // now rather than at its natural expiry (DEC-16): a password change is the
+    // moment a stolen session has to die.
+    refresh_tokens::end_session_atomically(ctx.pool(), user.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1445,7 +1462,7 @@ async fn oauth_complete_inner(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
         let minted =
-            mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+            mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, ctx.options().visible_email(&user.email), user.is_admin)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1579,7 +1596,7 @@ async fn oauth_complete_inner(
         })?;
 
     let minted =
-        mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+        mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, ctx.options().visible_email(&user.email), user.is_admin)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1892,7 +1909,7 @@ pub async fn link_account(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Mint + whitelist the session tokens (admin-configured lifetimes).
-    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, &user.email, user.is_admin)
+    let minted = mint_session_tokens(ctx.pool(), &jwt_service, user.id, &user.username, ctx.options().visible_email(&user.email), user.is_admin)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -1910,7 +1927,7 @@ pub async fn link_account(
     }
 
     Ok(token_response(&headers, StatusCode::OK, minted, |tokens| {
-        AuthResponse { user, tokens }
+        AuthResponse { user: ctx.options().scrub_user(user), tokens }
     }))
 }
 

@@ -17,6 +17,7 @@ pub mod jwt;
 pub mod password;
 pub mod permissions;
 pub mod providers;
+pub mod recovery;
 pub mod refresh_tokens;
 pub mod registration;
 pub mod repository;
@@ -46,7 +47,7 @@ pub mod turnkey;
 pub mod module;
 
 #[cfg(feature = "routes")]
-pub use http::{auth_admin_routes, auth_routes};
+pub use http::{auth_admin_routes, auth_recovery_routes, auth_routes};
 
 #[cfg(feature = "routes")]
 pub use turnkey::{mount_auth, AuthMountOptions, DefaultIdentityResolver};
@@ -65,7 +66,7 @@ pub use registration::{
 
 // Re-exports (mirror the app auth module's public surface).
 pub use context::{
-    AuthContext, AuthEventSink, AuthSyncAction, AuthSyncEntity, AuthSyncNotDeclared, AuthSyncSink,
+    AuthContext, AuthOptions, AuthEventSink, AuthSyncAction, AuthSyncEntity, AuthSyncNotDeclared, AuthSyncSink,
     AuthSyncWiring, NoopAuthEventSink, NoopAuthSyncSink, declare_auth_sync,
     declare_auth_sync_inert, declared_auth_sync, install_auth_sync_sink, resolve_auth_sync,
 };

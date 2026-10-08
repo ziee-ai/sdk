@@ -51,6 +51,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub logging: Option<LoggingConfig>,
     pub jwt: JwtConfig,
+    /// Account-model switches for the auth crate (`auth:` block). Every field
+    /// defaults to the historical behaviour (email required, no recovery
+    /// capability), so a config without the block is unchanged.
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl ServerConfig {
@@ -104,6 +109,7 @@ impl ServerConfig {
         let config: ServerConfig = serde_norway::from_str(&content)
             .map_err(|e| format!("failed to parse config file '{}': {}", path.display(), e))?;
         config.validate_jwt_secret()?;
+        config.auth.validate()?;
         Ok(config)
     }
 
@@ -157,6 +163,115 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
+
+/// The `auth:` config block — account-model switches for `ziee-auth`.
+///
+/// Defaults reproduce the pre-existing behaviour, so an app that never writes
+/// the block (ziee) is unchanged. A "trustless" deployment (username and
+/// password only, no email, optional self-service recovery) sets
+/// `email_required: false` and turns on the recovery capabilities it wants.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct AuthConfig {
+    /// `true` (default): sign-up demands an email and sign-in also accepts it.
+    /// `false`: sign-up takes none, sign-in matches the username only, and no
+    /// response or token ever carries a stored email.
+    #[serde(default = "default_true")]
+    pub email_required: bool,
+    /// One-time recovery codes the user can generate to reset a lost password.
+    #[serde(default)]
+    pub recovery_codes: RecoveryCapabilityConfig,
+    /// Security questions the user can set to reset a lost password.
+    #[serde(default)]
+    pub security_questions: RecoveryCapabilityConfig,
+    /// Rate limits and lockouts for the reset and re-authentication endpoints.
+    #[serde(default)]
+    pub recovery: RecoveryLimitsConfig,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            email_required: true,
+            recovery_codes: RecoveryCapabilityConfig::default(),
+            security_questions: RecoveryCapabilityConfig::default(),
+            recovery: RecoveryLimitsConfig::default(),
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Whether any self-service recovery capability is on (the reset routes
+    /// are mounted only then).
+    pub fn recovery_enabled(&self) -> bool {
+        self.recovery_codes.enabled || self.security_questions.enabled
+    }
+
+    /// Refuse a limit an operator could use to footgun the server: zero
+    /// disables the protection, and absurd values are a typo.
+    pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let r = &self.recovery;
+        for (name, v, lo, hi) in [
+            ("auth.recovery.max_failures_per_name", r.max_failures_per_name, 1, 100),
+            ("auth.recovery.max_failures_per_ip", r.max_failures_per_ip, 1, 1000),
+            ("auth.recovery.max_failures_per_account_reauth", r.max_failures_per_account_reauth, 1, 100),
+            ("auth.recovery.lockout_minutes", r.lockout_minutes, 1, 1440),
+        ] {
+            if !(lo..=hi).contains(&v) {
+                return Err(format!("{name} is {v}; it must be between {lo} and {hi}").into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One self-service recovery capability's switch. Off by default.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryCapabilityConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Attempt limits shared by the reset and re-authentication endpoints. The
+/// counters live in the database, so they survive restarts and span instances.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct RecoveryLimitsConfig {
+    /// Failed resets per submitted username (existing or not) per window.
+    #[serde(default = "default_max_per_name")]
+    pub max_failures_per_name: u32,
+    /// Failed resets per client IP per window.
+    #[serde(default = "default_max_per_ip")]
+    pub max_failures_per_ip: u32,
+    /// Failed current-password checks on the management endpoints per account.
+    #[serde(default = "default_max_per_name")]
+    pub max_failures_per_account_reauth: u32,
+    /// The window, and how long a key stays locked once it trips.
+    #[serde(default = "default_lockout_minutes")]
+    pub lockout_minutes: u32,
+}
+
+impl Default for RecoveryLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_failures_per_name: default_max_per_name(),
+            max_failures_per_ip: default_max_per_ip(),
+            max_failures_per_account_reauth: default_max_per_name(),
+            lockout_minutes: default_lockout_minutes(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_max_per_name() -> u32 {
+    5
+}
+fn default_max_per_ip() -> u32 {
+    20
+}
+fn default_lockout_minutes() -> u32 {
+    15
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -523,5 +638,48 @@ mod max_file_upload_tests {
         let yaml = "host: 127.0.0.1\nport: 3000\napi_prefix: /api\nmax_file_upload_mb: 256\n";
         let cfg: HttpServerConfig = serde_norway::from_str(yaml).expect("parse HttpServerConfig");
         assert_eq!(cfg.max_file_upload_mb, 256);
+    }
+}
+
+#[cfg(test)]
+mod auth_config_tests {
+    use super::AuthConfig;
+
+    /// A config with no `auth:` block must reproduce the historical behaviour.
+    #[test]
+    fn absent_block_is_the_legacy_posture() {
+        let cfg: AuthConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.email_required);
+        assert!(!cfg.recovery_codes.enabled);
+        assert!(!cfg.security_questions.enabled);
+        assert!(!cfg.recovery_enabled());
+        assert_eq!(cfg, AuthConfig::default());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn trustless_block_parses() {
+        let cfg: AuthConfig = serde_json::from_str(
+            r#"{"email_required":false,"recovery_codes":{"enabled":true},"security_questions":{"enabled":true},"recovery":{"lockout_minutes":30}}"#,
+        )
+        .unwrap();
+        assert!(!cfg.email_required);
+        assert!(cfg.recovery_enabled());
+        assert_eq!(cfg.recovery.lockout_minutes, 30);
+        assert_eq!(cfg.recovery.max_failures_per_name, 5);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn out_of_bounds_limits_are_refused() {
+        for body in [
+            r#"{"recovery":{"max_failures_per_name":0}}"#,
+            r#"{"recovery":{"max_failures_per_ip":100000}}"#,
+            r#"{"recovery":{"lockout_minutes":0}}"#,
+            r#"{"recovery":{"max_failures_per_account_reauth":101}}"#,
+        ] {
+            let cfg: AuthConfig = serde_json::from_str(body).unwrap();
+            assert!(cfg.validate().is_err(), "{body} must be refused");
+        }
     }
 }

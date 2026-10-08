@@ -13,6 +13,9 @@ use crate::user::User;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RegisterRequest {
     pub username: String,
+    /// Required unless the deployment sets `auth.email_required: false`, in
+    /// which case it is ignored (never stored).
+    #[serde(default)]
     pub email: String,
     pub password: String,
     pub display_name: Option<String>,

@@ -201,8 +201,12 @@ where
     }
 
     // (4) mount the routes bundle (same paths + order as ziee).
+    let mut auth_routes_bundle = auth_routes::<R>();
+    if ctx.options().config.recovery_enabled() {
+        auth_routes_bundle = auth_routes_bundle.merge(super::http::auth_recovery_routes::<R>());
+    }
     let auth_router = aide::axum::ApiRouter::new()
-        .nest("/auth", auth_routes::<R>())
+        .nest("/auth", auth_routes_bundle)
         .merge(auth_admin_routes::<R>());
 
     // (1) install the extension layers + merge the routes.

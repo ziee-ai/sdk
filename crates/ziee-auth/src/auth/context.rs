@@ -21,6 +21,7 @@
 use std::sync::{Arc, OnceLock};
 
 use sqlx::PgPool;
+use ziee_core::AuthConfig;
 use uuid::Uuid;
 use ziee_framework::sync::Audience;
 
@@ -82,6 +83,59 @@ pub trait AuthSyncSink: Send + Sync {
     fn publish_session_to_users(&self, user_ids: &[Uuid], origin: Option<Uuid>);
 }
 
+/// The account-model options one process runs with: the `auth:` config block
+/// plus the keyed secret the decoy-question derivation uses.
+///
+/// `Default` is the pre-existing behaviour (email required, no recovery), so a
+/// context built without [`AuthContext::with_options`] behaves exactly as it
+/// always did.
+#[derive(Clone, Debug)]
+pub struct AuthOptions {
+    pub config: AuthConfig,
+    /// Key material for [`crate::auth::recovery::decoy_questions`]. Derived from
+    /// the JWT secret so it is stable across restarts and instances without a
+    /// new secret to manage, and never leaves the process.
+    pepper: Vec<u8>,
+}
+
+impl Default for AuthOptions {
+    fn default() -> Self {
+        Self {
+            config: AuthConfig::default(),
+            pepper: Vec::new(),
+        }
+    }
+}
+
+impl AuthOptions {
+    /// Build from the loaded config block and the JWT secret.
+    pub fn new(config: AuthConfig, jwt_secret: &str) -> Self {
+        Self {
+            config,
+            pepper: crate::auth::recovery::derive_pepper(jwt_secret),
+        }
+    }
+
+    pub fn pepper(&self) -> &[u8] {
+        &self.pepper
+    }
+
+    /// The email a response or token may carry for `stored`. In email-less mode
+    /// (`email_required: false`) that is always empty, even for an account that
+    /// has a stored email: MANGWA-style deployments never use or show it.
+    pub fn visible_email<'a>(&self, stored: &'a str) -> &'a str {
+        if self.config.email_required { stored } else { "" }
+    }
+
+    /// `user` with its email scrubbed per [`Self::visible_email`].
+    pub fn scrub_user(&self, mut user: crate::user::User) -> crate::user::User {
+        if !self.config.email_required {
+            user.email = String::new();
+        }
+        user
+    }
+}
+
 /// Per-request dependency handle the auth + user handlers pull from
 /// `Extension<AuthContext>` instead of reaching app globals. Cheaply
 /// cloneable (everything behind `Arc`).
@@ -95,6 +149,8 @@ pub struct AuthContext {
     pub events: Arc<dyn AuthEventSink>,
     /// Cross-device sync sink (app installs a `sync::publish`-backed impl).
     pub sync: Arc<dyn AuthSyncSink>,
+    /// Account-model options (`auth:` config block). Legacy defaults.
+    options: Arc<AuthOptions>,
 }
 
 impl AuthContext {
@@ -111,7 +167,20 @@ impl AuthContext {
             secret_key,
             events,
             sync,
+            options: Arc::new(AuthOptions::default()),
         }
+    }
+
+    /// Replace the account-model options (the turnkey module calls this with the
+    /// loaded `auth:` block).
+    pub fn with_options(mut self, options: AuthOptions) -> Self {
+        self.options = Arc::new(options);
+        self
+    }
+
+    /// The account-model options this process runs with.
+    pub fn options(&self) -> &AuthOptions {
+        &self.options
     }
 
     /// The shared connection pool (replaces `Repos.pool()`).

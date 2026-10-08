@@ -16,6 +16,9 @@ use uuid::Uuid;
 pub struct User {
     pub id: Uuid,
     pub username: String,
+    /// Empty when the account has no email (trustless sign-up), and then
+    /// omitted from JSON.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub email: String,
     pub email_verified: bool,
     #[serde(skip_serializing)]

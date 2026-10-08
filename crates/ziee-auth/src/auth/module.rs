@@ -45,7 +45,7 @@ use linkme::distributed_slice;
 use ziee_framework::module_api::{AppModule, ModuleContext, ModuleEntry, MODULE_ENTRIES};
 
 use super::context::{
-    AuthContext, AuthSyncWiring, NoopAuthEventSink, declared_auth_sync, resolve_auth_sync,
+    AuthContext, AuthOptions, AuthSyncWiring, NoopAuthEventSink, declared_auth_sync, resolve_auth_sync,
 };
 use super::http::{auth_admin_routes, auth_routes};
 use super::jwt::JwtService;
@@ -133,7 +133,8 @@ impl AppModule for AuthModule {
         // bus to route them to. Unlike sync, that is not an invisible drop —
         // `AuthEventSink` has no cross-device half whose absence is silent.
         let auth_ctx =
-            AuthContext::new(ctx.db_pool.clone(), None, Arc::new(NoopAuthEventSink), sync);
+            AuthContext::new(ctx.db_pool.clone(), None, Arc::new(NoopAuthEventSink), sync)
+                .with_options(AuthOptions::new(ctx.config.auth.clone(), &ctx.config.jwt.secret));
 
         // Reverse-proxy trust flag (idempotent OnceLock set), mirroring ziee.
         super::set_trust_forwarded_headers(ctx.config.server.trust_forwarded_headers);
@@ -169,8 +170,15 @@ impl AppModule for AuthModule {
         // Mount the SDK routes bundle with the batteries-included resolver.
         // Nested at `/auth` here → `/api/auth/*` once `build_api_router` nests
         // the combined router under `api_prefix`.
+        let mut auth_routes_bundle = auth_routes::<DefaultIdentityResolver>();
+        // Kill switch guards route registration too: with no recovery capability
+        // enabled the recovery surface is never mounted.
+        if ctx.options().config.recovery_enabled() {
+            auth_routes_bundle = auth_routes_bundle
+                .merge(super::http::auth_recovery_routes::<DefaultIdentityResolver>());
+        }
         let auth_router = ApiRouter::new()
-            .nest("/auth", auth_routes::<DefaultIdentityResolver>())
+            .nest("/auth", auth_routes_bundle)
             .merge(auth_admin_routes::<DefaultIdentityResolver>());
 
         // Merge the auth routes into the combined router, then install the

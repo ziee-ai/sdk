@@ -52,8 +52,8 @@ impl AuthRepository {
             User,
             r#"
             INSERT INTO users (username, email, password_hash, display_name, permissions)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, username, email, email_verified, password_hash, display_name,
+            VALUES ($1, NULLIF($2, ''), $3, $4, $5)
+            RETURNING id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                       avatar_url, is_active, is_admin, permissions,
                       created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             "#,

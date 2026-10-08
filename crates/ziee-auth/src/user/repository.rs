@@ -65,7 +65,7 @@ impl UserRepository {
         let row = sqlx::query_as!(
             UserWithTokenVersion,
             r#"
-            SELECT id, username, email, email_verified, password_hash, display_name,
+            SELECT id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _",
                    token_version
@@ -116,7 +116,7 @@ impl UserRepository {
         sqlx::query_as!(
             User,
             r#"
-            SELECT id, username, email, email_verified, password_hash, display_name,
+            SELECT id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
@@ -134,7 +134,7 @@ impl UserRepository {
         sqlx::query_as!(
             User,
             r#"
-            SELECT id, username, email, email_verified, password_hash, display_name,
+            SELECT id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
@@ -152,7 +152,7 @@ impl UserRepository {
         sqlx::query_as!(
             User,
             r#"
-            SELECT id, username, email, email_verified, password_hash, display_name,
+            SELECT id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
@@ -173,7 +173,7 @@ impl UserRepository {
         sqlx::query_as!(
             User,
             r#"
-            SELECT id, username, email, email_verified, password_hash, display_name,
+            SELECT id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
@@ -200,7 +200,7 @@ impl UserRepository {
         let users = sqlx::query_as!(
             User,
             r#"
-            SELECT id, username, email, email_verified, password_hash, display_name,
+            SELECT id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                    avatar_url, is_active, is_admin, permissions,
                    created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             FROM users
@@ -230,8 +230,8 @@ impl UserRepository {
             User,
             r#"
             INSERT INTO users (username, email, password_hash, display_name, permissions)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, username, email, email_verified, password_hash, display_name,
+            VALUES ($1, NULLIF($2, ''), $3, $4, $5)
+            RETURNING id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                       avatar_url, is_active, is_admin, permissions,
                       created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             "#,
@@ -285,7 +285,7 @@ impl UserRepository {
                 permissions = COALESCE($5, permissions),
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING id, username, email, email_verified, password_hash, display_name,
+            RETURNING id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                       avatar_url, is_active, is_admin, permissions,
                       created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             "#,
@@ -330,7 +330,7 @@ impl UserRepository {
                 display_name = CASE WHEN $3 THEN $4 ELSE display_name END,
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING id, username, email, email_verified, password_hash, display_name,
+            RETURNING id, username, COALESCE(email, '') AS "email!", email_verified, password_hash, display_name,
                       avatar_url, is_active, is_admin, permissions,
                       created_at as "created_at: _", updated_at as "updated_at: _", last_login_at as "last_login_at: _", password_changed_at as "password_changed_at: _"
             "#,
@@ -702,7 +702,7 @@ impl GroupRepository {
         let users = sqlx::query_as!(
             User,
             r#"
-            SELECT u.id, u.username, u.email, u.email_verified, u.password_hash,
+            SELECT u.id, u.username, COALESCE(u.email, '') AS "email!", u.email_verified, u.password_hash,
                    u.display_name, u.avatar_url, u.is_active, u.is_admin,
                    ARRAY[]::TEXT[] as "permissions!",
                    u.created_at as "created_at: _", u.updated_at as "updated_at: _",

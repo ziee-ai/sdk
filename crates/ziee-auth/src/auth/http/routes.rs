@@ -17,6 +17,7 @@ use axum::routing::get;
 use ziee_framework::permissions::IdentityResolver;
 
 use super::handlers::*;
+use super::recovery::*;
 use super::session_settings::{
     get_session_settings, get_session_settings_docs, update_session_settings,
     update_session_settings_docs,
@@ -98,4 +99,25 @@ pub fn auth_admin_routes<R: IdentityResolver<User = User, Group = Group>>() -> A
             "/admin/auth-providers/test-config",
             post_with(admin_test_provider_config::<R>, admin_test_provider_config_docs),
         )
+}
+
+/// Self-service account recovery routes — mounted at `/auth` ONLY when the
+/// deployment enabled a recovery capability (`auth.recovery_codes.enabled` or
+/// `auth.security_questions.enabled`). Otherwise the surface is never mounted:
+/// a permitted user cannot reach a capability the operator turned off, and the
+/// default (legacy) posture has none of these paths.
+///
+/// Two are public by design (the caller has lost their password):
+/// `POST /recovery/questions` and `POST /recovery/reset`, plus the public
+/// capability probe. The rest are signed-in and gated on `profile::edit`.
+pub fn auth_recovery_routes<R: IdentityResolver<User = User, Group = Group>>() -> ApiRouter {
+    ApiRouter::new()
+        .api_route("/recovery/capabilities", get_with(capabilities, capabilities_docs))
+        .api_route("/recovery/questions", post_with(lookup_questions, lookup_questions_docs)
+            .put_with(set_questions::<R>, set_questions_docs))
+        .api_route("/recovery/reset", post_with(reset_password, reset_password_docs))
+        .api_route("/recovery", get_with(recovery_status::<R>, recovery_status_docs))
+        .api_route("/recovery/codes", post_with(generate_codes::<R>, generate_codes_docs))
+        .api_route("/recovery/codes/clear", post_with(clear_codes::<R>, clear_codes_docs))
+        .api_route("/recovery/questions/clear", post_with(clear_questions::<R>, clear_questions_docs))
 }

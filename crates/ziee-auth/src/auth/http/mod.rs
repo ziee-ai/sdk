@@ -11,7 +11,8 @@
 
 pub mod handlers;
 pub mod jwt_extractor;
+pub mod recovery;
 pub mod routes;
 pub mod session_settings;
 
-pub use routes::{auth_admin_routes, auth_routes};
+pub use routes::{auth_admin_routes, auth_recovery_routes, auth_routes};
