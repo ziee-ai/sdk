@@ -130,6 +130,61 @@ export interface LazyDispatchOptions {
    * clock (~0.9-1.4s each) while asserting nothing about the timing.
    */
   sleep?: (ms: number) => Promise<void>
+  /**
+   * The store's call-order sequencer — ONE per store, shared by every lazy
+   * action's dispatcher. See `createLazyActionSequencer` / `LazyDispatchOptions`.
+   *
+   * When omitted, the dispatcher sequences only ITS OWN calls (each dispatcher
+   * gets a private sequencer); two dispatchers on the same store must share the
+   * SAME sequencer for their invocations to be ordered against each other —
+   * store-kit does exactly that (`store-kit.ts`'s `makeBuilder`).
+   */
+  sequencer?: LazyActionSequencer
+}
+
+/**
+ * Per-store call-order sequencer for lazy actions (#659).
+ *
+ * Without it, each lazy action's impl runs in CHUNK-LOAD order — its own
+ * chunk, its own `resolveImpl()` — so two actions called back-to-back on one
+ * store (`X.edit(patch); X.save()`) race: with cold chunks `save` can run
+ * before `edit` and write the previous draft. This was a real production bug
+ * (the admin kid-mode switch saved ON after being clicked OFF).
+ *
+ * One sequencer instance is shared by EVERY lazy action of one store; dispatch
+ * claims a chain slot in CALL order, and each slot's impl is not invoked until
+ * every EARLIER slot's impl has been invoked (or that earlier dispatch has
+ * failed). The guarantee is start order, NOT settle order: a slot releases the
+ * chain the moment its impl is invoked (or its invocation failed), so a slow
+ * action never serializes later ones behind its network call, and an action
+ * that dispatches + awaits another action on its own store does not deadlock
+ * (the awaited action's start does not wait for the caller's settle).
+ */
+export interface LazyActionSequencer {
+  /**
+   * Claim the next dispatch slot in call order. Synchronous — must be called
+   * at dispatch time.
+   *
+   * @returns `turn` — a never-rejecting promise that resolves when every
+   *   earlier slot's impl has been invoked or its dispatch has failed (i.e.
+   *   when it is this slot's turn); `release` — call EXACTLY ONCE, at the
+   *   moment this slot's impl is invoked or its dispatch gives up, so the next
+   *   slot can proceed.
+   */
+  claim(): { turn: Promise<void>; release: () => void }
+}
+
+/** Build a per-store call-order sequencer (see `LazyActionSequencer`). */
+export function createLazyActionSequencer(): LazyActionSequencer {
+  let tail: Promise<void> = Promise.resolve()
+  return {
+    claim() {
+      const turn = tail
+      let release!: () => void
+      tail = new Promise<void>(r => (release = r))
+      return { turn, release }
+    },
+  }
 }
 
 /**
