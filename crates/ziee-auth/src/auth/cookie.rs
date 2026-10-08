@@ -15,8 +15,10 @@
 
 use http::{HeaderMap, HeaderValue, header};
 
-/// Cookie name. `ziee_` prefix so it's obviously ours in devtools.
-pub const REFRESH_COOKIE_NAME: &str = "ziee_refresh";
+/// The DEFAULT cookie name. The name actually used at runtime is the
+/// configurable `auth.refresh_cookie_name` (`super::refresh_cookie_name()`);
+/// this constant is only that setting's default.
+pub const REFRESH_COOKIE_NAME: &str = ziee_core::config::DEFAULT_REFRESH_COOKIE_NAME;
 
 /// Path scope: the refresh token is only ever needed by `/api/auth/*`
 /// (refresh + logout), so the browser never attaches it to any other
@@ -35,8 +37,17 @@ pub const REFRESH_COOKIE_OPTIN_HEADER: &str = "x-refresh-cookie";
 /// `is_secure_request(...)` so https deployments (behind a trusted
 /// proxy) get it while plain-http localhost/LAN self-hosts still work.
 pub fn build_refresh_cookie(token: &str, max_age_secs: i64, secure: bool) -> HeaderValue {
+    build_refresh_cookie_named(super::refresh_cookie_name(), token, max_age_secs, secure)
+}
+
+pub(crate) fn build_refresh_cookie_named(
+    name: &str,
+    token: &str,
+    max_age_secs: i64,
+    secure: bool,
+) -> HeaderValue {
     let mut cookie = format!(
-        "{REFRESH_COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path={COOKIE_PATH}; Max-Age={max_age_secs}"
+        "{name}={token}; HttpOnly; SameSite=Strict; Path={COOKIE_PATH}; Max-Age={max_age_secs}"
     );
     if secure {
         cookie.push_str("; Secure");
@@ -50,8 +61,12 @@ pub fn build_refresh_cookie(token: &str, max_age_secs: i64, secure: bool) -> Hea
 /// Build the clearing `Set-Cookie` value (empty value, `Max-Age=0`).
 /// Attributes must match the setter's for the browser to replace it.
 pub fn clear_refresh_cookie(secure: bool) -> HeaderValue {
+    clear_refresh_cookie_named(super::refresh_cookie_name(), secure)
+}
+
+pub(crate) fn clear_refresh_cookie_named(name: &str, secure: bool) -> HeaderValue {
     let mut cookie = format!(
-        "{REFRESH_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path={COOKIE_PATH}; Max-Age=0"
+        "{name}=; HttpOnly; SameSite=Strict; Path={COOKIE_PATH}; Max-Age=0"
     );
     if secure {
         cookie.push_str("; Secure");
@@ -62,11 +77,15 @@ pub fn clear_refresh_cookie(secure: bool) -> HeaderValue {
 /// Extract the refresh token from the request's `Cookie` header(s).
 /// Returns `None` when absent or empty.
 pub fn read_refresh_cookie(headers: &HeaderMap) -> Option<String> {
+    read_refresh_cookie_named(super::refresh_cookie_name(), headers)
+}
+
+pub(crate) fn read_refresh_cookie_named(name: &str, headers: &HeaderMap) -> Option<String> {
     for value in headers.get_all(header::COOKIE) {
         let Ok(s) = value.to_str() else { continue };
         for pair in s.split(';') {
             let pair = pair.trim();
-            if let Some(token) = pair.strip_prefix(REFRESH_COOKIE_NAME)
+            if let Some(token) = pair.strip_prefix(name)
                 && let Some(token) = token.strip_prefix('=')
                 && !token.is_empty()
             {
@@ -173,5 +192,30 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
         assert!(!is_secure_request(&headers));
+    }
+
+    #[test]
+    fn custom_name_is_used_for_set_read_and_clear() {
+        let name = "mangwa_refresh";
+        let set = build_refresh_cookie_named(name, "tok.en.x", 60, false);
+        assert!(set.to_str().unwrap().starts_with("mangwa_refresh=tok.en.x;"));
+        let clear = clear_refresh_cookie_named(name, false);
+        assert!(clear.to_str().unwrap().starts_with("mangwa_refresh=;"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("ziee_refresh=old; mangwa_refresh=tok.en.x"),
+        );
+        assert_eq!(read_refresh_cookie_named(name, &headers).as_deref(), Some("tok.en.x"));
+        // The default name is NOT read when a custom one is configured.
+        let mut old = HeaderMap::new();
+        old.insert(header::COOKIE, HeaderValue::from_static("ziee_refresh=old"));
+        assert_eq!(read_refresh_cookie_named(name, &old), None);
+    }
+
+    #[test]
+    fn default_name_is_unchanged_when_unconfigured() {
+        assert_eq!(super::super::refresh_cookie_name(), "ziee_refresh");
+        assert_eq!(REFRESH_COOKIE_NAME, "ziee_refresh");
     }
 }

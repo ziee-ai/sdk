@@ -187,6 +187,19 @@ pub struct AuthConfig {
     /// Rate limits and lockouts for the reset and re-authentication endpoints.
     #[serde(default)]
     pub recovery: RecoveryLimitsConfig,
+    /// Name of the httpOnly refresh-token cookie. Default `ziee_refresh`, so an
+    /// app that never writes the key is unchanged; an app picks its own brand
+    /// (e.g. `mangwa_refresh`). Changing it signs everyone out once: the old
+    /// cookie is no longer read. Must be a cookie token (`[A-Za-z0-9_-]`).
+    #[serde(default = "default_refresh_cookie_name")]
+    pub refresh_cookie_name: String,
+}
+
+/// The historical cookie name; the serde default of `refresh_cookie_name`.
+pub const DEFAULT_REFRESH_COOKIE_NAME: &str = "ziee_refresh";
+
+fn default_refresh_cookie_name() -> String {
+    DEFAULT_REFRESH_COOKIE_NAME.to_string()
 }
 
 impl Default for AuthConfig {
@@ -196,6 +209,7 @@ impl Default for AuthConfig {
             recovery_codes: RecoveryCapabilityConfig::default(),
             security_questions: RecoveryCapabilityConfig::default(),
             recovery: RecoveryLimitsConfig::default(),
+            refresh_cookie_name: default_refresh_cookie_name(),
         }
     }
 }
@@ -210,6 +224,15 @@ impl AuthConfig {
     /// Refuse a limit an operator could use to footgun the server: zero
     /// disables the protection, and absurd values are a typo.
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let n = &self.refresh_cookie_name;
+        if n.is_empty()
+            || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(format!(
+                "auth.refresh_cookie_name is {n:?}; it must be non-empty and use only [A-Za-z0-9_-]"
+            )
+            .into());
+        }
         let r = &self.recovery;
         for (name, v, lo, hi) in [
             ("auth.recovery.max_failures_per_name", r.max_failures_per_name, 1, 100),
@@ -668,6 +691,21 @@ mod auth_config_tests {
         assert_eq!(cfg.recovery.lockout_minutes, 30);
         assert_eq!(cfg.recovery.max_failures_per_name, 5);
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn refresh_cookie_name_defaults_and_is_configurable() {
+        let cfg: AuthConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.refresh_cookie_name, "ziee_refresh");
+        let cfg: AuthConfig =
+            serde_json::from_str(r#"{"refresh_cookie_name":"mangwa_refresh"}"#).unwrap();
+        assert_eq!(cfg.refresh_cookie_name, "mangwa_refresh");
+        cfg.validate().unwrap();
+        for bad in ["", "a b", "a;b", "a=b"] {
+            let cfg: AuthConfig =
+                serde_json::from_str(&format!(r#"{{"refresh_cookie_name":"{bad}"}}"#)).unwrap();
+            assert!(cfg.validate().is_err(), "{bad:?} must be refused");
+        }
     }
 
     #[test]

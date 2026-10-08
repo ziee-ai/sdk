@@ -188,6 +188,7 @@ where
 {
     // (2) reverse-proxy trust flag.
     super::set_trust_forwarded_headers(opts.trust_forwarded_headers);
+    super::set_refresh_cookie_name(&ctx.options().config.refresh_cookie_name);
 
     // (3) one-time session-settings seed (spawned; failure is non-fatal — mint
     // falls back to the config values whenever the DB read fails).

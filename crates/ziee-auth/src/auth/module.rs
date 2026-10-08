@@ -138,6 +138,7 @@ impl AppModule for AuthModule {
 
         // Reverse-proxy trust flag (idempotent OnceLock set), mirroring ziee.
         super::set_trust_forwarded_headers(ctx.config.server.trust_forwarded_headers);
+        super::set_refresh_cookie_name(&ctx.config.auth.refresh_cookie_name);
 
         // One-time session-settings config seed (migration 129): copy the YAML
         // jwt lifetimes into the singleton only while it hasn't been seeded, so

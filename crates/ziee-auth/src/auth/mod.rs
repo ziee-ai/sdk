@@ -99,6 +99,26 @@ pub fn trust_forwarded_headers() -> bool {
     TRUST_FORWARDED_HEADERS.get().copied().unwrap_or(false)
 }
 
+/// Set once at module init from `auth.refresh_cookie_name`.
+static REFRESH_COOKIE_NAME: OnceLock<String> = OnceLock::new();
+
+/// Install the configured refresh-cookie name (called once at boot by
+/// `AuthModule::init` / `mount_auth`). Idempotent — first call wins.
+pub fn set_refresh_cookie_name(name: &str) {
+    let _ = REFRESH_COOKIE_NAME.set(name.to_string());
+}
+
+/// The refresh-cookie name this process sets, reads and clears: the configured
+/// `auth.refresh_cookie_name`, or `ziee_refresh` when none was installed (an
+/// app that never writes the key, or a unit test bypassing the module loader).
+/// The app's own server code reads this too, never a second literal.
+pub fn refresh_cookie_name() -> &'static str {
+    REFRESH_COOKIE_NAME
+        .get()
+        .map(String::as_str)
+        .unwrap_or(ziee_core::config::DEFAULT_REFRESH_COOKIE_NAME)
+}
+
 /// Set once at module init from the operator-configured public origin (see
 /// `set_configured_public_origin`). Holds the https-validated origin, or
 /// `None` to fall back to request-header derivation.
