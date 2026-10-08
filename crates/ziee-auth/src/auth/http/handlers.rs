@@ -961,18 +961,26 @@ pub async fn change_password<R: IdentityResolver<User = User, Group = Group>>(
         )
     })?;
 
-    // Verify the current password as proof.
-    let ok = password::verify_password(&req.current_password, current_hash).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            AppError::internal_with_id(format!("verify password: {e}")),
-        )
-    })?;
-    if !ok {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            AppError::unauthorized("INVALID_CREDENTIALS", "Current password is incorrect"),
-        ));
+    // Verify the current password as proof. Where the account-recovery
+    // capabilities are on, the proof is rate-limited per account like the
+    // recovery management endpoints (a thief holding a stolen session must not
+    // get unlimited guesses at the current password). With them off this is the
+    // original check, byte for byte.
+    if ctx.options().config.recovery_enabled() {
+        super::recovery::reauth(&ctx, &user, &req.current_password).await?;
+    } else {
+        let ok = password::verify_password(&req.current_password, current_hash).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AppError::internal_with_id(format!("verify password: {e}")),
+            )
+        })?;
+        if !ok {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                AppError::unauthorized("INVALID_CREDENTIALS", "Current password is incorrect"),
+            ));
+        }
     }
 
     // Validate the new password's strength.

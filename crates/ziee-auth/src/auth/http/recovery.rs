@@ -388,7 +388,7 @@ pub fn reset_password_docs(op: TransformOperation) -> TransformOperation {
 
 /// Re-authenticate the caller with their current password, with a per-account
 /// failure limit. Returns the verified user's id.
-async fn reauth(ctx: &AuthContext, user: &User, current_password: &str) -> Result<(), Fail> {
+pub(crate) async fn reauth(ctx: &AuthContext, user: &User, current_password: &str) -> Result<(), Fail> {
     let repo = RecoveryRepository::new(ctx.pool().clone());
     let lim = &ctx.options().config.recovery;
     let key = user.id.to_string();
