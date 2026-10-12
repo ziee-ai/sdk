@@ -195,6 +195,14 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
         refTracker.destroyTimeoutId = null
       }
 
+      // Clear initialization state so the store re-initialises on the next
+      // access. This was unconditional on every direct destroy, and a page
+      // that comes back after teardown must re-run `init` on its FIRST render
+      // (before any `addRef`/`reset`), so it happens even when the destroy
+      // hook itself is not re-run below.
+      propInitCheck.clear()
+      storeInitialized = false
+
       // Idempotent against a destroy already run (the pending timer fired
       // first, or there was no `__destroy__` to run): a second teardown must
       // not run the destroy hook again on a store that is already gone.
@@ -225,12 +233,8 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
           })
         }
 
-        // Mark as destroyed and clear initialization state immediately
+        // Mark as destroyed
         refTracker.destroyed = true
-
-        // Clear initialization state so store can be re-initialized if accessed again
-        propInitCheck.clear()
-        storeInitialized = false
 
         if (IS_DEV) {
           console.log('✅ Store destroyed successfully')

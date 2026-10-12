@@ -94,10 +94,17 @@ test('TEST-11: executeDestroy cancels its OWN pending destroy timer — __destro
 
 test('TEST-12: executeDestroy is idempotent against a destroy already run', t => {
   let destroyRuns = 0
+  let initRuns = 0
   const store = create<any>(() => ({
     n: 0,
     __destroy__: () => {
       destroyRuns++
+    },
+    // The proxy's init latch: runs in the get trap on `storeInitialized === false`.
+    __init__: {
+      __store__: () => {
+        initRuns++
+      },
     },
   }))
   const p: any = createStoreProxy(store as any)
@@ -111,8 +118,19 @@ test('TEST-12: executeDestroy is idempotent against a destroy already run', t =>
   assert.equal(destroyRuns, 1)
   assert.equal(rt.destroyed, true)
 
+  // A LIVE lifetime: one read runs `init` (and then throws the render-only
+  // hook error, which is how the read is counted without a component).
+  assert.throws(() => p.n)
+  assert.equal(initRuns, 1)
+
   // A second, DIRECT teardown after that (module teardown racing the timer)
-  // must not run the destroy hook again.
+  // must not run the destroy hook again…
   rt.executeDestroy()
   assert.equal(destroyRuns, 1)
+
+  // …but it MUST still re-arm the init latch — a store a page comes back to
+  // re-runs `init` on the next read, on the FIRST access, before any
+  // `addRef`/`reset` can fire.
+  assert.throws(() => p.n)
+  assert.equal(initRuns, 2)
 })
