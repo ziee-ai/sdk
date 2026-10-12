@@ -8,6 +8,19 @@ import { useEventBusStore } from './events'
 // Store Proxy - Creates typed store accessors with IntelliSense
 // ============================================================================
 
+// `import.meta.env` is injected by the bundler and is UNDEFINED under a plain
+// node runtime (the SDK unit-test resolver) — read it defensively so the
+// destroy lifecycle (`scheduleDestroy` / `executeDestroy`) is exercisable
+// under `node --test`; a dev-only diagnostic must never be the thing that
+// throws. Same guard as `module-system/store.ts::isDev()`.
+const IS_DEV = ((): boolean => {
+  try {
+    return Boolean((import.meta as { env?: { DEV?: boolean } }).env?.DEV)
+  } catch {
+    return false
+  }
+})()
+
 // Default delay before destroying a store (5 seconds)
 const DEFAULT_DESTROY_DELAY_MS = 5000
 
@@ -102,7 +115,7 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
     addRef: (prop: string | symbol) => {
       // If destruction is pending, cancel it (user is accessing again!)
       if (refTracker.destroyTimeoutId !== null) {
-        if (import.meta.env.DEV) {
+        if (IS_DEV) {
           console.log('🔄 Cancelling destruction - store accessed again')
         }
         refTracker.cancelDestroy()
@@ -110,7 +123,7 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
 
       // If store was destroyed, reset for re-initialization
       if (refTracker.destroyed) {
-        if (import.meta.env.DEV) {
+        if (IS_DEV) {
           console.log('🔄 Re-initializing previously destroyed store')
         }
         refTracker.reset()
@@ -152,7 +165,7 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
       // Get custom delay from store or use default
       const delay = (state as any).__destroyDelay__ || DEFAULT_DESTROY_DELAY_MS
 
-      if (import.meta.env.DEV) {
+      if (IS_DEV) {
         console.log(
           `⏳ Scheduling store destruction in ${delay}ms (no active references)`,
         )
@@ -171,6 +184,24 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
     },
 
     executeDestroy: () => {
+      // `executeDestroy` is called directly (module teardown, tests) while a
+      // destroy timer armed by `scheduleDestroy` may still be pending.
+      // `cancelDestroy` was the only thing that cleared the timer; this call
+      // used to null the handle WITHOUT clearing it, so the stale timeout
+      // later fired and ran the destroy hook AGAIN on a store a live page was
+      // using. Clear any pending timer first, always.
+      if (refTracker.destroyTimeoutId !== null) {
+        clearTimeout(refTracker.destroyTimeoutId)
+        refTracker.destroyTimeoutId = null
+      }
+
+      // Idempotent against a destroy already run (the pending timer fired
+      // first, or there was no `__destroy__` to run): a second teardown must
+      // not run the destroy hook again on a store that is already gone.
+      if (refTracker.destroyed) {
+        return
+      }
+
       const state = useStore.getState()
 
       // The store may have been disposed between scheduling and this timeout
@@ -178,11 +209,10 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
       // `getState()` undefined — nothing left to destroy.
       if (!state || typeof (state as any).__destroy__ !== 'function') {
         refTracker.destroyed = true
-        refTracker.destroyTimeoutId = null
         return
       }
 
-      if (import.meta.env.DEV) {
+      if (IS_DEV) {
         console.log('🗑️ Executing store destruction (delay expired)')
       }
 
@@ -197,13 +227,12 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
 
         // Mark as destroyed and clear initialization state immediately
         refTracker.destroyed = true
-        refTracker.destroyTimeoutId = null
 
         // Clear initialization state so store can be re-initialized if accessed again
         propInitCheck.clear()
         storeInitialized = false
 
-        if (import.meta.env.DEV) {
+        if (IS_DEV) {
           console.log('✅ Store destroyed successfully')
         }
       } catch (err) {
@@ -219,7 +248,7 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
       refTracker.totalCount = 0
       refTracker.counts.clear()
 
-      if (import.meta.env.DEV) {
+      if (IS_DEV) {
         console.log('🔄 Store tracker reset for re-initialization')
       }
     },

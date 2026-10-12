@@ -12,6 +12,10 @@ import { createStoreProxy } from './stores.ts'
 
 const mkProxy = (state: any) => createStoreProxy(create<any>(() => state) as any) as any
 
+// `DEFAULT_DESTROY_DELAY_MS` in `stores.ts` is not exported; pin the default
+// here so this suite moves with it (TEST-11/TEST-12 guard its destroy timer).
+const DEFAULT_DESTROY_DELAY_MS = 5000
+
 test('TEST-1: an action is callable hook-free OUTSIDE any render and mutates state', () => {
   const store = create<any>(set => ({
     count: 0,
@@ -54,4 +58,61 @@ test('TEST-4/TEST-10: `.__state` is no longer a hook-free special; only `$` is',
   // Sibling internals are unaffected (not swept, not banned).
   assert.doesNotThrow(() => p.__setState)
   assert.equal(typeof p.__setState, 'function')
+})
+
+test('TEST-11: executeDestroy cancels its OWN pending destroy timer — __destroy__ runs exactly once', t => {
+  let destroyRuns = 0
+  const store = create<any>(() => ({
+    n: 0,
+    __destroy__: () => {
+      destroyRuns++
+    },
+  }))
+  const p: any = createStoreProxy(store as any)
+  const rt = p.__refTracker
+
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+
+  // Arm the 5s destroy timer the real way: dropping the last ref.
+  rt.addRef('n')
+  assert.equal(rt.destroyTimeoutId, null)
+  rt.removeRef('n')
+  assert.notEqual(rt.destroyTimeoutId, null)
+
+  // Direct teardown while the timer is pending (module teardown / tests).
+  // executeDestroy must clear the pending timer itself AND run the destroy
+  // hook once, now — the stale timeout must not destroy the store again.
+  rt.executeDestroy()
+  assert.equal(destroyRuns, 1)
+  assert.equal(rt.destroyed, true)
+  assert.equal(rt.destroyTimeoutId, null)
+
+  // The timer was cancelled: advancing past the delay runs nothing more.
+  t.mock.timers.tick(DEFAULT_DESTROY_DELAY_MS + 1000)
+  assert.equal(destroyRuns, 1)
+})
+
+test('TEST-12: executeDestroy is idempotent against a destroy already run', t => {
+  let destroyRuns = 0
+  const store = create<any>(() => ({
+    n: 0,
+    __destroy__: () => {
+      destroyRuns++
+    },
+  }))
+  const p: any = createStoreProxy(store as any)
+  const rt = p.__refTracker
+
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+
+  // Let the scheduled timer fire first — the destroy already ran once.
+  rt.scheduleDestroy()
+  t.mock.timers.tick(DEFAULT_DESTROY_DELAY_MS)
+  assert.equal(destroyRuns, 1)
+  assert.equal(rt.destroyed, true)
+
+  // A second, DIRECT teardown after that (module teardown racing the timer)
+  // must not run the destroy hook again.
+  rt.executeDestroy()
+  assert.equal(destroyRuns, 1)
 })
