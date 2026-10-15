@@ -30,7 +30,7 @@ use std::any::Any;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
@@ -157,6 +157,17 @@ pub trait HarnessApp: Send + Sync + 'static {
     /// initialise an at-rest secret key in the test process, install a Windows
     /// helper service). Default: no-op.
     fn before_spawn(&self, _opts: &Self::Options) {}
+
+    /// Whether the spawned server's stdout+stderr are captured to
+    /// `<data_dir>/server.log` instead of discarded (the default).
+    ///
+    /// A test that must assert on the SERVER's OWN log — #704's shutdown
+    /// sequence, a boot warning, a loop's "stopped (cancelled)" line — opts in
+    /// and reads [`SpawnedServer::log_path`]. Off by default: it keeps the
+    /// historical stdio-discarded behaviour for every existing test.
+    fn capture_child_log(&self, _opts: &Self::Options) -> bool {
+        false
+    }
 
     /// Render the config + decide the launch plan for this spawn.
     fn plan_spawn(&self, opts: &Self::Options, facts: &SpawnFacts) -> SpawnPlan;
@@ -731,6 +742,9 @@ pub struct SpawnedServer {
     pub database_name: String,
     pub database_url: String,
     temp_config_path: PathBuf,
+    /// Where the child's stdout+stderr went when [`HarnessApp::capture_child_log`]
+    /// returned true (`<data_dir>/server.log`); `None` when discarded.
+    log_path: Option<PathBuf>,
     /// Declared AFTER `process`/`temp_config_path` so it drops after them: the
     /// child's Postgres sessions are gone before the reap asks for the database.
     _db: PerTestDb,
@@ -758,6 +772,12 @@ impl SpawnedServer {
     /// inherited-listener leak regression does).
     pub fn process_id(&self) -> u32 {
         self.process.id()
+    }
+
+    /// The captured server log (`<data_dir>/server.log`) — `Some` exactly when
+    /// [`HarnessApp::capture_child_log`] returned true for this spawn.
+    pub fn log_path(&self) -> Option<&Path> {
+        self.log_path.as_deref()
     }
 }
 
@@ -1174,6 +1194,20 @@ impl<A: HarnessApp> TestHarness<A> {
         let temp_config_path = std::env::temp_dir().join(format!("testharness-{test_id}.yaml"));
         fs::write(&temp_config_path, &plan.config_yaml).expect("Failed to write temporary config");
 
+        // #704: an opt-in capture of the child's stdout+stderr, so a test can
+        // assert on the SERVER's OWN log (boot lines, the shutdown sequence).
+        // The file lives in the per-test data dir, which is reaped with the
+        // server. The parent opens it once; the child inherits the descriptor.
+        let log_path = if self.app.capture_child_log(&opts) {
+            let path = data_dir_path.join("server.log");
+            fs::File::create(&path)
+                .map_err(|e| format!("create server.log {}: {e}", path.display()))
+                .expect("open server log capture");
+            Some(path)
+        } else {
+            None
+        };
+
         // Ensure the fully-migrated template exists (built once per process,
         // cross-process-coordinated), then clone the per-test DB from it — no
         // migrations run per test. The name embeds the migration-content hash,
@@ -1267,6 +1301,18 @@ impl<A: HarnessApp> TestHarness<A> {
         #[cfg(not(unix))]
         let listener_fd: Option<i32> = None;
 
+        // Redirect the child's stdout+stderr into the capture file when
+        // requested; opening the file here (parent side, before spawn) means
+        // the descriptor is inherited across exec like the listener.
+        let capture_file = log_path
+            .as_ref()
+            .map(|p| std::fs::OpenOptions::new().append(true).open(p))
+            .map(|r| r.expect("reopen server log for the child"));
+        if let Some(file) = &capture_file {
+            cmd.stdout(Stdio::from(file.try_clone().expect("clone stdout capture")))
+                .stderr(Stdio::from(file.try_clone().expect("clone stderr capture")));
+        }
+
         // TEST-ONLY seam (Unix): invoked HERE, between the handoff setup and the
         // spawn, while this process still holds the listener — the exact window
         // in which the removed parent-side FD_CLOEXEC clear used to leak the
@@ -1322,6 +1368,7 @@ impl<A: HarnessApp> TestHarness<A> {
             database_name,
             database_url: test_database_url,
             temp_config_path,
+            log_path,
             _db: db_guard,
             _data_tempdir: data_tempdir,
             _keep_alive: plan.keep_alive,
