@@ -33,6 +33,7 @@ use axum::{
     http::{StatusCode, request::Parts},
     response::sse::{Event, KeepAlive, Sse},
 };
+use axum::Extension;
 use futures_util::stream::Stream;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -41,6 +42,7 @@ use uuid::Uuid;
 use ziee_core::ApiResult;
 use ziee_identity::{PermissionList, Principal};
 
+use crate::app_builder::ShutdownSignal;
 use crate::permissions::{IdentityResolver, RequirePermissions, with_permission};
 
 use super::registry::{ClientConn, SyncRegistry, SYNC_CHANNEL_CAPACITY};
@@ -162,12 +164,19 @@ impl<R: IdentityResolver> FromRequestParts<()> for AccessTokenBounds<R> {
 async fn subscribe_sync<R, S>(
     auth: RequirePermissions<R, S::BaselinePerms>,
     bounds: AccessTokenBounds<R>,
+    shutdown: Option<Extension<ShutdownSignal>>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, axum::Error>>>>
 where
     R: IdentityResolver,
     S: SyncSurface,
     S::Principal: From<(R::User, Vec<R::Group>)>,
 {
+    // The server's shutdown signal, installed by `ziee_framework::serve`
+    // (absent when the app serves the router some other way); when it fires,
+    // this stream must END — graceful shutdown is bounded, but a stream that
+    // cooperates ends the connection immediately instead of waiting out the
+    // drain deadline (#704).
+    let mut shutdown_signal: Option<ShutdownSignal> = shutdown.map(|Extension(s)| s);
     // Bound the stream by the access token's expiry: when it lapses the
     // client reconnects with a fresh token, which re-runs the auth
     // extractor (re-checking is_active + permissions from scratch).
@@ -233,6 +242,13 @@ where
         let sleep = tokio::time::sleep_until(deadline);
         tokio::pin!(sleep);
 
+        // Shutdown BEFORE the loop: a subscribe that got accepted in the
+        // instant between the signal and the accept loop stopping must end
+        // immediately, not open a fresh long-lived body.
+        if shutdown_signal.as_ref().is_some_and(|s| s.has_started()) {
+            return;
+        }
+
         loop {
             tokio::select! {
                 maybe = rx.recv() => {
@@ -260,6 +276,20 @@ where
                     }
                 }
                 _ = &mut sleep => break,
+                _ = async {
+                    // Server shutdown began → end the stream (never resolves
+                    // when the app serves without a ShutdownSignal).
+                    match shutdown_signal.as_mut() {
+                        Some(sig) => sig.wait().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    tracing::debug!(
+                        conn_id = %conn_id,
+                        "sync connection ended on server shutdown"
+                    );
+                    break;
+                }
             }
         }
     };

@@ -67,7 +67,10 @@ pub mod secret;
 pub mod secrets;
 pub mod url_validator;
 
-pub use app_builder::{bind_listener, serve, ZIEE_LISTEN_FD};
+pub use app_builder::{
+    DEFAULT_SHUTDOWN_DRAIN, ShutdownSignal, bind_listener, serve, serve_with_shutdown_drain,
+    ZIEE_LISTEN_FD,
+};
 pub use entity_extension::{
     auto_register as auto_register_extensions, ExtensionEntry, ExtensionRegistry,
     ExtensionRegistrySingleton,

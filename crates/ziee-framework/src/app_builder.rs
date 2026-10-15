@@ -337,12 +337,143 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     router: axum::Router,
 ) -> std::io::Result<()> {
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
+    serve_with_shutdown_drain(listener, router, DEFAULT_SHUTDOWN_DRAIN).await
+}
+
+/// Default `drain` budget in [`serve_with_shutdown_drain`]: how long after the
+/// shutdown signal the server waits for in-flight connections to end before it
+/// stops waiting. A few seconds is plenty for a normal request (and for a
+/// long-lived stream, which ends as soon as it observes the shutdown signal);
+/// it bounds the pathological cases (a stalled download, a handler that never
+/// observes the signal).
+pub const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// [`serve`] with a caller-chosen drain budget (#704).
+///
+/// `drain` bounds graceful shutdown: after the Ctrl-C/SIGTERM signal, the
+/// server waits at most `drain` for in-flight connections to complete, then
+/// gives up and returns — so a long-lived stream can never hold the process
+/// up past the deadline, and whatever the app does after this future resolves
+/// (cancel background tasks, close the database pool, stop embedded Postgres)
+/// always runs. Long-lived handlers that cooperate ([`ShutdownSignal`]) end
+/// their bodies immediately, so the drain normally finishes after one
+/// connection close, not after the full deadline.
+pub async fn serve_with_shutdown_drain(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    drain: Duration,
+) -> std::io::Result<()> {
+    serve_until_signal(listener, router, shutdown_signal(), drain).await
+}
+
+/// The serve core with an injectable shutdown-signal future: the test seam the
+/// drain tests drive with a `Notify` instead of a real Ctrl-C/SIGTERM.
+async fn serve_until_signal(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: Duration,
+) -> std::io::Result<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Layered HERE so every route the app served through this function can
+    // observe the signal — the SSE subscribe handler ends its stream, a file
+    // stream ends its body, and the in-flight connection then completes and
+    // closes (hyper closes it on graceful shutdown), letting the drain below
+    // actually finish instead of waiting on a stream that never ends (the
+    // #704 hang).
+    let router = router.layer(axum::Extension(ShutdownSignal {
+        rx: shutdown_rx.clone(),
+    }));
+
+    // The graceful-shutdown future: wait for the OS signal, then fire the
+    // shutdown signal so streams end, which is what lets axum finish the
+    // drain of existing connections.
+    let graceful = async move {
+        signal.await;
+        let _ = shutdown_tx.send(true);
+    };
+
+    let server = async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(graceful)
+        .await
+    };
+    tokio::pin!(server);
+
+    // THE #704 backstop: axum's graceful shutdown has no deadline of its own —
+    // it waits for EVERY open connection to finish, and a stream that did not
+    // observe the signal would keep it waiting forever. Bound the wait:
+    // `drain` after the signal, then return (the caller proceeds to cancel its
+    // background tasks, close the DB pool and stop embedded Postgres; any
+    // still-open connection tasks die with the runtime at process exit).
+    let deadline = async move {
+        let mut rx = shutdown_rx;
+        loop {
+            if *rx.borrow() {
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break; // sender dropped ⇒ the serve future already ended
+            }
+            if *rx.borrow() {
+                break;
+            }
+        }
+        tokio::time::sleep(drain).await;
+    };
+
+    tokio::select! {
+        res = &mut server => res,
+        _ = deadline => {
+            tracing::warn!(
+                "graceful shutdown: {drain:?} drain elapsed after the shutdown signal — \
+                 stopping to wait for in-flight connections; they are abandoned"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// A long-lived handler's view of the server's shutdown signal.
+///
+/// Installed on the router as `axum::Extension<ShutdownSignal>` by
+/// [`serve`]/[`serve_with_shutdown_drain`], so a streaming handler (SSE, a
+/// chunked `Body::from_stream`) can OBSERVE the signal and end its body —
+/// which is what turns graceful shutdown from "wait forever while a stream
+/// stays open" (#704) into "end the streams, drain the connections, and
+/// normally return within milliseconds of the signal". A handler that does
+/// not observe it does not make shutdown hang: `drain` in
+/// [`serve_with_shutdown_drain`] bounds the wait anyway.
+#[derive(Clone)]
+pub struct ShutdownSignal {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ShutdownSignal {
+    /// Whether shutdown has begun (the server received Ctrl-C/SIGTERM).
+    ///
+    /// Useful for the snapshot check at stream start: a request that got
+    /// accepted in the instant between the signal and the accept loop stopping
+    /// must end immediately rather than open a fresh long-lived body.
+    pub fn has_started(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    /// Resolve once shutdown has begun; a no-op when it already has.
+    ///
+    /// Polled by a streaming body inside its loop (`tokio::select!` arm), so
+    /// the body ends when the server begins to shut down instead of living to
+    /// its own deadline. Never resolves when no shutdown is signalled.
+    pub async fn wait(&mut self) {
+        if self.has_started() {
+            return;
+        }
+        let _ = self.rx.changed().await;
+    }
 }
 
 /// Env var (Unix only) through which a parent process hands the server an
@@ -684,5 +815,208 @@ mod rate_limit_tests {
             "after 100 ms (2 × 50 ms at 20/s) the next request must be 200, \
              not 429 — per_second is requests-per-second, not a seconds interval"
         );
+    }
+}
+
+/// The #704 shutdown-drain tests: stream-completion-on-signal + the bounded
+/// drain deadline, driven through [`serve_until_signal`] with an injected
+/// signal future (no real Ctrl-C/SIGTERM, no real app).
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use axum::{
+        Extension,
+        body::Body,
+        response::sse::{Event, Sse},
+        routing::get,
+    };
+    use futures_util::stream::Stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
+
+    /// The mirror of the sync subscribe handler's loop shape: a stream that
+    /// observes `Extension<ShutdownSignal>` and ends when it fires.
+    fn cooperative_sse_router() -> axum::Router {
+        async fn handler(
+            signal: Option<Extension<ShutdownSignal>>,
+        ) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+            let mut signal: Option<ShutdownSignal> = signal.map(|Extension(s)| s);
+            let stream = async_stream::stream! {
+                // One frame so the stream's element type is pinned; the frame
+                // also proves the body is LIVE (the handler ran).
+                yield Ok(Event::default().event("ping").data("x"));
+                if signal.as_ref().is_some_and(|s| s.has_started()) {
+                    return;
+                }
+                loop {
+                    tokio::select! {
+                        _ = async {
+                            match signal.as_mut() {
+                                Some(sig) => sig.wait().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => break,
+                        _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+                    }
+                }
+            };
+            Sse::new(stream)
+        }
+        axum::Router::new().route("/sse", get(handler))
+    }
+
+    /// An SSE stream that NEVER observes the shutdown signal: the uncooperative
+    /// case the drain deadline must bound.
+    fn uncooperative_sse_router() -> axum::Router {
+        async fn handler() -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+            let stream = async_stream::stream! {
+                // One frame so the element type is pinned; the body then
+                // never ends (no shutdown observation, no deadline of its own).
+                yield Ok(Event::default().event("ping").data("x"));
+                std::future::pending::<()>().await;
+            };
+            Sse::new(stream)
+        }
+        axum::Router::new().route("/sse", get(handler))
+    }
+
+    /// Bind, send a GET to `/sse` over raw TCP, and return the connected
+    /// stream + the serve task. The client is held (not read) so the
+    /// connection stays in-flight — reading is not the point, the connection
+    /// being OPEN when the signal fires is.
+    async fn start_server_with_client(
+        router: axum::Router,
+        signal: std::sync::Arc<Notify>,
+        drain: Duration,
+    ) -> (tokio::net::TcpStream, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serve = tokio::spawn(async move {
+            serve_until_signal(listener, router, async move { signal.notified().await }, drain).await
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET /sse HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\nConnection: keep-alive\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        // Give hyper a moment to accept the request so the connection is
+        // DEFINITELY in-flight (status line received) before the signal fires.
+        let mut buf = [0u8; 512];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("read status line within 5s")
+            .expect("status line read ok");
+        let head = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "sse handshake must answer 200, got {head:?}"
+        );
+        (client, serve)
+    }
+
+    /// THE #704 regression: a cooperative stream ENDS when the shutdown signal
+    /// fires, so the serve future returns well BEFORE the drain deadline — the
+    /// exact case that used to hang the process forever (open SSE + SIGTERM).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cooperative_stream_ends_on_signal_and_serve_returns_before_the_drain() {
+        let signal = std::sync::Arc::new(Notify::new());
+        let (_client, serve) =
+            start_server_with_client(cooperative_sse_router(), signal.clone(), Duration::from_secs(60))
+                .await;
+
+        // The stream is open and nothing ends it on its own; only the signal can.
+        signal.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve must return within 5s after the signal (drain is 60s)")
+            .expect("serve ok")
+            .expect("serve io ok");
+    }
+
+    /// The bounded backstop: a stream that does NOT observe the shutdown signal
+    /// cannot hold the process beyond the drain budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uncooperative_stream_cannot_hold_serve_beyond_the_drain() {
+        let signal = std::sync::Arc::new(Notify::new());
+        let drain = Duration::from_millis(800);
+        let (_client, serve) =
+            start_server_with_client(uncooperative_sse_router(), signal.clone(), drain).await;
+
+        let started = std::time::Instant::now();
+        signal.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(10), serve)
+            .await
+            .expect("serve must return within 10s (drain is <1s)")
+            .expect("serve ok")
+            .expect("serve io ok");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= drain - Duration::from_millis(150),
+            "serve must NOT return before the drain elapsed (it has a live \
+             connection still open): {elapsed:?} vs drain {drain:?}"
+        );
+        assert!(
+            elapsed < drain * 3,
+            "serve must return close to the drain deadline, not much later: {elapsed:?}"
+        );
+    }
+
+    /// The fast path: with no open connection, the signal drains immediately —
+    /// shutting down does not wait out the (long) drain budget pointlessly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_open_connection_returns_immediately_on_signal() {
+        let signal = std::sync::Arc::new(Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let router: axum::Router = axum::Router::new().route("/", get(|| async { Body::empty() }));
+        let task_signal = signal.clone();
+        let serve = tokio::spawn(async move {
+            serve_until_signal(
+                listener,
+                router,
+                async move { task_signal.notified().await },
+                Duration::from_secs(60),
+            )
+            .await
+        });
+        // Let the server actually start serving before we signal.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        signal.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve returns immediately with no open connections")
+            .expect("serve ok")
+            .expect("serve io ok");
+    }
+
+    /// `ShutdownSignal::wait` never fires on its own (the pending case a
+    /// stream must not mistake for shutdown), completes on the channel's send,
+    /// and a clone observes an already-fired signal immediately — the
+    /// two-state contract, in isolation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_signal_only_fires_when_signalled() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut sig = ShutdownSignal { rx };
+        assert!(!sig.has_started());
+        // No send: wait must NOT resolve within a short window.
+        tokio::time::timeout(Duration::from_millis(300), sig.wait())
+            .await
+            .expect_err("wait must not resolve without a signal");
+        // A clone held by another handler sees the same state.
+        let mut clone = sig.clone();
+        assert!(!clone.has_started());
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sig.wait())
+            .await
+            .expect("wait resolves once the signal fires");
+        assert!(sig.has_started());
+        assert!(clone.has_started());
+        // `wait` on an already-fired signal is an immediate no-op.
+        tokio::time::timeout(Duration::from_secs(2), clone.wait())
+            .await
+            .expect("wait on a fired signal resolves immediately");
     }
 }
