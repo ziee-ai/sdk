@@ -253,6 +253,17 @@ async fn valid_token_opens_sse_with_connected_handshake() {
         ct.starts_with("text/event-stream"),
         "SSE content-type, got {ct:?}"
     );
+    // C0 (ITEM-2): the 200 carries `X-Accel-Buffering: no` — the one
+    // response-level header on the long-lived stream, so a buffering reverse
+    // proxy (nginx) does not hold the frames. Wire-level (the unit-level
+    // builder test in routes.rs pins the value; this pins the RESPONSE).
+    assert_eq!(
+        res.headers()
+            .get("x-accel-buffering")
+            .and_then(|v| v.to_str().ok()),
+        Some("no"),
+        "the subscribe 200 carries X-Accel-Buffering: no"
+    );
 
     // Read the FIRST SSE frame; it must be the `connected` handshake.
     let mut body = res.into_body();

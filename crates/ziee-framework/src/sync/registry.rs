@@ -72,6 +72,30 @@ impl Default for SyncRegistryConfig {
     }
 }
 
+impl SyncRegistryConfig {
+    /// Refuse the cap values that silently disable the surface instead of
+    /// sizing it: a `0` on either slot makes `register` refuse EVERY
+    /// connection (`len >= 0`), i.e. realtime sync dead site-wide with no
+    /// error anywhere — the exact footgun the app's config validation exists
+    /// to prevent (C0, chat epic). `per_user > global` is NOT refused:
+    /// the cap-check ORDER contract (global first) means the global arm
+    /// answers once the pool saturates and the per-user arm is only dead
+    /// weight. Debug-only assertion: a constructor precondition, not a
+    /// runtime condition — `new_with_config` is the one construction site and
+    /// its caller is an app developer, so a panic-in-tests (debug) surfaces
+    /// the misconfiguration where it can be seen, while release keeps the
+    /// plain constructor (the app's own config load is the fail-loud boundary
+    /// there).
+    pub fn validate(&self) {
+        debug_assert!(
+            self.global_max_connections > 0 && self.per_user_max_connections > 0,
+            "SyncRegistryConfig: a zero cap would refuse every connection \
+             (sync dead site-wide, silently) — set a positive cap or omit the \
+             config (Default)"
+        );
+    }
+}
+
 /// One live SSE connection's server-side state. `principal` is the permission
 /// snapshot captured at connect (refreshed by the handler's periodic re-check)
 /// and consulted when routing `Perm`-audience events.
@@ -111,8 +135,12 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
     /// Construct an empty registry with the given caps. The intended source is
     /// the app's deploy config (comic: `AppConfig.sync.max_connections`); an
     /// app that never calls this behaves exactly as before, per the config's
-    /// `Default`.
+    /// `Default`. A zero cap on either slot is a programming error (it would
+    /// refuse every connection, silently) — refused by
+    /// [`SyncRegistryConfig::validate`] in debug, and the caller's own config
+    /// load is the release boundary.
     pub fn new_with_config(config: SyncRegistryConfig) -> Self {
+        config.validate();
         SyncRegistry {
             inner: Mutex::new(RegistryInner {
                 clients: HashMap::new(),
@@ -1145,14 +1173,26 @@ mod tests {
         }
     }
 
+    /// A zero cap (either slot) is a programming error — it would refuse
+    /// every connection. `SyncRegistryConfig::validate` is a debug-only
+    /// constructor assertion (F-A2 round-1 fix), so this test only runs in
+    /// debug builds, which is the entire point.
+    #[test]
+    #[should_panic(expected = "a zero cap")]
+    fn zero_cap_is_refused_to_build() {
+        let _ = SyncRegistry::<TestPrincipal>::new_with_config(SyncRegistryConfig {
+            global_max_connections: 0,
+            per_user_max_connections: 12,
+        });
+    }
+
     /// TEST-2 [acceptance INV-3] — the CONFIGURED cap is the one enforced: a
     /// registry built with `{global: 7, per_user: 3}` refuses the 8th global
     /// and the 4th per-user connection with the UNCHANGED 429 vocabulary
     /// (INV-3), and the sweep-then-refuse arms still free a slot after
     /// `unregister`.
     #[test]
-    fn configured_caps_are_the_enforced_caps() {
-        let cfg = SyncRegistryConfig {
+    fn configured_caps_are_the_enforced_caps() {        let cfg = SyncRegistryConfig {
             global_max_connections: 7,
             per_user_max_connections: 3,
         };
@@ -1283,9 +1323,15 @@ mod tests {
         }
         runs.sort();
         let p50 = runs[49]; // 100 samples → the 50th
+        // Observed margin is recorded at run time (a loaded shared box makes a
+        // hardcoded "25× headroom" claim stale; the debug profile is 5-15×
+        // slower than the probe's release measurement, so the true debug
+        // margin is a few multiples, not 25 — still far above the bound).
+        eprintln!("sync fan-out: 100 × Everyone delivers at 10k — p50 {p50:?} (bound 25 ms)");
         assert!(
             p50 <= std::time::Duration::from_millis(25),
-            "the stated bound: p50 ≤ 25 ms (measured 0.99 ms on this host) — got {p50:?}"
+            "the stated bound: p50 ≤ 25 ms (measured ~1 ms p50 in release by the \
+             C0 probe; debug is slower) — got {p50:?}"
         );
 
         // Every connection's queue received the event (none lost, none pruned).
