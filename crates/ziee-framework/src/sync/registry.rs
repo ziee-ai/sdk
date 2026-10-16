@@ -1192,7 +1192,8 @@ mod tests {
     /// (INV-3), and the sweep-then-refuse arms still free a slot after
     /// `unregister`.
     #[test]
-    fn configured_caps_are_the_enforced_caps() {        let cfg = SyncRegistryConfig {
+    fn configured_caps_are_the_enforced_caps() {
+        let cfg = SyncRegistryConfig {
             global_max_connections: 7,
             per_user_max_connections: 3,
         };
@@ -1297,9 +1298,12 @@ mod tests {
 
     /// TEST-4 [acceptance INV-4] — the measured-frontier bound holds: a
     /// registry built at the measured 10 000-connection limit keeps the stated
-    /// fan-out bound (p50 ≤ 25 ms per `Audience::Everyone` publish; the probe
-    /// measured 0.99 ms p50 on this host — 25× headroom, so the bound is
-    /// non-flaky) and every live connection's queue received the event.
+    /// fan-out bound (p50 ≤ 25 ms per `Audience::Everyone` publish). The probe
+    /// measured 0.99 ms p50 in RELEASE (C0/evidence/MEASUREMENTS.md); `cargo
+    /// test` compiles the debug profile, ~5-15× slower — the observed debug
+    /// p50 is printed at run time (this round: 4.58 ms, ~5.5× margin), so the
+    /// "25× headroom" number is a release-mode fact, never a debug claim.
+    /// Every live connection's queue must have received the event.
     #[test]
     fn fan_out_to_ten_thousand_connections_meets_the_stated_bound() {
         let cfg = SyncRegistryConfig {
