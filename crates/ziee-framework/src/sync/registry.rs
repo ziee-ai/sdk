@@ -1306,9 +1306,9 @@ mod tests {
     /// fan-out bound (p50 ≤ 25 ms per `Audience::Everyone` publish). The probe
     /// measured 0.99 ms p50 in RELEASE (C0/evidence/MEASUREMENTS.md); `cargo
     /// test` compiles the debug profile, ~5-15× slower — the observed debug
-    /// p50 is printed at run time (observations so far: 3.7-5.3 ms, ~5-7×
-    /// under the bound), so the "25× headroom" number is a release-mode fact,
-    /// never a debug claim.
+    /// p50 is printed at run time (this test's own `eprintln!` is the source
+    /// of truth; a committed number ages out on the next loaded-box run), so
+    /// the "25× headroom" number is a release-mode fact, never a debug claim.
     /// Every live connection's queue must have received the event.
     #[test]
     fn fan_out_to_ten_thousand_connections_meets_the_stated_bound() {
