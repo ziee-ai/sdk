@@ -29,11 +29,18 @@ use ziee_identity::Principal;
 use super::audience::{Audience, PermRule};
 use super::SyncEntityKind;
 
-/// Global cap on concurrent sync SSE connections across all users.
-const GLOBAL_MAX_CONNECTIONS: usize = 512;
-/// Per-user cap (multiple tabs/devices). Bounds a single account from
-/// exhausting the global pool.
-const PER_USER_MAX_CONNECTIONS: usize = 12;
+/// Shipped default for the site-wide cap on concurrent sync SSE connections
+/// across all users (C0, chat epic): 8× the pre-C0 constant (512), 3.4× the
+/// chat boards' drawn "1 204 here" scale, with the measured 10 000-connection
+/// frontier ~2.5× farther away (C0 evidence: p50 0.99 ms / p99 4.85 ms per
+/// `Audience::Everyone` publish at 10k, ~1.3 KiB idle per connection, no cliff
+/// in the measured range).
+pub const DEFAULT_GLOBAL_MAX_CONNECTIONS: usize = 4096;
+/// Shipped default for the per-user cap (multiple tabs/devices). Bounds a
+/// single account from exhausting the global pool. Kept at the pre-C0 value
+/// 12: C0's measurement subject is the global pool, and no evidence names a
+/// problem with the tab/multi-device multiplier bound.
+pub const DEFAULT_PER_USER_MAX_CONNECTIONS: usize = 12;
 /// Bounded per-connection queue depth. A reader that falls this far behind is
 /// treated as stalled: the connection is dropped (so the client reconnects +
 /// resyncs) rather than buffering unbounded memory. Sized generously so a
@@ -41,6 +48,29 @@ const PER_USER_MAX_CONNECTIONS: usize = 12;
 pub const SYNC_CHANNEL_CAPACITY: usize = 1024;
 
 type ConnId = Uuid;
+
+/// The registry's connection caps, per deployment. The whole-site cap is a
+/// deploy-config value (comic: `AppConfig.sync.max_connections`, pushed into
+/// [`SyncRegistry::new_with_config`]); [`Default`] is the evidence-sized
+/// site-wide default. The per-user cap is deliberately part of the config
+/// object — the registry is the thing that enforces it — but apps expose only
+/// the global knob (C0 DEC-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncRegistryConfig {
+    /// Site-wide cap on concurrent sync SSE connections across ALL users.
+    pub global_max_connections: usize,
+    /// Cap per user (multiple tabs/devices).
+    pub per_user_max_connections: usize,
+}
+
+impl Default for SyncRegistryConfig {
+    fn default() -> Self {
+        Self {
+            global_max_connections: DEFAULT_GLOBAL_MAX_CONNECTIONS,
+            per_user_max_connections: DEFAULT_PER_USER_MAX_CONNECTIONS,
+        }
+    }
+}
 
 /// One live SSE connection's server-side state. `principal` is the permission
 /// snapshot captured at connect (refreshed by the handler's periodic re-check)
@@ -58,6 +88,7 @@ struct RegistryInner<P: Principal> {
 
 pub struct SyncRegistry<P: Principal> {
     inner: Mutex<RegistryInner<P>>,
+    config: SyncRegistryConfig,
 }
 
 impl<P: Principal + Send + 'static> Default for SyncRegistry<P> {
@@ -67,16 +98,34 @@ impl<P: Principal + Send + 'static> Default for SyncRegistry<P> {
 }
 
 impl<P: Principal + Send + 'static> SyncRegistry<P> {
-    /// Construct an empty registry. The app wraps ONE of these in a
-    /// process-wide singleton (ziee: a `lazy_static`) keyed to its concrete
-    /// principal type.
+    /// Construct an empty registry with the shipped-default caps. The app wraps
+    /// ONE of these in a process-wide singleton (ziee: a `lazy_static`) keyed
+    /// to its concrete principal type. Keeps its no-arg signature — a consumer
+    /// that never configures the registry compiles unchanged against a pin
+    /// bump; the only semantic difference is the default's VALUE (an increase
+    /// in the site-wide cap, never a narrowing).
     pub fn new() -> Self {
+        Self::new_with_config(SyncRegistryConfig::default())
+    }
+
+    /// Construct an empty registry with the given caps. The intended source is
+    /// the app's deploy config (comic: `AppConfig.sync.max_connections`); an
+    /// app that never calls this behaves exactly as before, per the config's
+    /// `Default`.
+    pub fn new_with_config(config: SyncRegistryConfig) -> Self {
         SyncRegistry {
             inner: Mutex::new(RegistryInner {
                 clients: HashMap::new(),
                 by_user: HashMap::new(),
             }),
+            config,
         }
+    }
+
+    /// The caps this registry enforces (test/diagnostic helper).
+    #[cfg(test)]
+    pub fn config(&self) -> SyncRegistryConfig {
+        self.config
     }
 
     /// Register a new connection. Returns a 429 `AppError` when a global
@@ -103,13 +152,18 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
     /// per-account problem) for a user who happens to also be at their own cap.
     /// Each cap sweeps its own scope only when it would otherwise trip, so the
     /// common path does no extra work at all.
+    ///
+    /// The caps are the registry's stored [`SyncRegistryConfig`] (the
+    /// deploy-config values), never package constants — the whole point of the
+    /// config is that `register`'s only behavior change is WHERE the cap count
+    /// comes from.
     pub fn register(&self, conn_id: ConnId, conn: ClientConn<P>) -> Result<(), AppError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        if inner.clients.len() >= GLOBAL_MAX_CONNECTIONS {
+        if inner.clients.len() >= self.config.global_max_connections {
             prune_closed_locked(&mut inner);
         }
-        if inner.clients.len() >= GLOBAL_MAX_CONNECTIONS {
+        if inner.clients.len() >= self.config.global_max_connections {
             return Err(AppError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "SYNC_GLOBAL_LIMIT",
@@ -118,11 +172,11 @@ impl<P: Principal + Send + 'static> SyncRegistry<P> {
         }
 
         let mut user_count = inner.by_user.get(&conn.user_id).map_or(0, |s| s.len());
-        if user_count >= PER_USER_MAX_CONNECTIONS {
+        if user_count >= self.config.per_user_max_connections {
             prune_closed_for_user_locked(&mut inner, conn.user_id);
             user_count = inner.by_user.get(&conn.user_id).map_or(0, |s| s.len());
         }
-        if user_count >= PER_USER_MAX_CONNECTIONS {
+        if user_count >= self.config.per_user_max_connections {
             return Err(AppError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "SYNC_USER_LIMIT",
@@ -622,8 +676,11 @@ mod tests {
         // only, so a per-iteration `_rx` binding (dropped at the end of each
         // iteration) would register connections whose streams are already gone
         // and `register`'s sweep would rightly reclaim them.
+        // The caps are `SyncRegistryConfig::default()` — `new()` builds the
+        // default, and the default is what these regression tests pin.
+        let per_user = SyncRegistryConfig::default().per_user_max_connections;
         let mut alive = Vec::new();
-        for _ in 0..PER_USER_MAX_CONNECTIONS {
+        for _ in 0..per_user {
             let (c, rx) = conn(uid, principal(false, vec![]));
             reg.register(Uuid::new_v4(), c).unwrap();
             alive.push(rx);
@@ -664,25 +721,28 @@ mod tests {
 
     #[test]
     fn global_cap_rejects_excess_connections_across_users() {
-        // Fill the registry to GLOBAL_MAX_CONNECTIONS with one connection per
+        // Fill the registry to the DEFAULT global cap with one connection per
         // distinct user, so the GLOBAL cap (not the per-user cap) is what trips.
+        // `new()` builds `SyncRegistryConfig::default()`; the default is what
+        // this regression pins.
+        let global = SyncRegistryConfig::default().global_max_connections;
         let reg = empty_registry();
         // Receivers HELD — see `per_user_cap_rejects_excess_connections`: the
         // cap counts live connections only.
         let mut alive = Vec::new();
-        for _ in 0..GLOBAL_MAX_CONNECTIONS {
+        for _ in 0..global {
             let (c, rx) = conn(Uuid::new_v4(), principal(false, vec![]));
             reg.register(Uuid::new_v4(), c).unwrap();
             alive.push(rx);
         }
-        assert_eq!(reg.connection_count(), GLOBAL_MAX_CONNECTIONS);
+        assert_eq!(reg.connection_count(), global);
 
         // The (global cap + 1)th connection — a brand-new user well under the
         // per-user cap — must be refused with a 429.
         let (overflow, _rx) = conn(Uuid::new_v4(), principal(false, vec![]));
         let err = reg
             .register(Uuid::new_v4(), overflow)
-            .expect_err("global cap must reject the 513th connection");
+            .expect_err("global cap must reject the (cap+1)th connection");
         assert_eq!(err.status_code(), 429, "global cap must surface 429");
         drop(alive);
     }
@@ -853,10 +913,11 @@ mod tests {
     fn per_user_cap_counts_live_connections_only() {
         // (a) cap value unchanged: with every receiver ALIVE the (cap+1)th
         //     registration is still refused with 429.
+        let per_user = SyncRegistryConfig::default().per_user_max_connections;
         let reg = empty_registry();
         let uid = Uuid::new_v4();
         let mut alive = Vec::new();
-        for _ in 0..PER_USER_MAX_CONNECTIONS {
+        for _ in 0..per_user {
             let (c, rx) = conn(uid, principal(false, vec![]));
             reg.register(Uuid::new_v4(), c).unwrap();
             alive.push(rx); // hold the stream open
@@ -866,7 +927,7 @@ mod tests {
             .register(Uuid::new_v4(), overflow)
             .expect_err("the cap must still refuse a (cap+1)th LIVE connection");
         assert_eq!(err.status_code(), 429, "the per-user cap still surfaces 429");
-        assert_eq!(reg.connection_count(), PER_USER_MAX_CONNECTIONS);
+        assert_eq!(reg.connection_count(), per_user);
 
         // (b) the same user's streams all go away → the next registration
         //     succeeds, and the registry holds exactly the one new connection.
@@ -877,7 +938,7 @@ mod tests {
         assert_eq!(
             reg.connection_count(),
             1,
-            "all {PER_USER_MAX_CONNECTIONS} dead slots must be reclaimed, leaving only the new one",
+            "all {per_user} dead slots must be reclaimed, leaving only the new one",
         );
     }
 
@@ -886,9 +947,10 @@ mod tests {
     /// whole deployment out, while a full registry of LIVE ones still 429s.
     #[test]
     fn global_cap_counts_live_connections_only() {
+        let global = SyncRegistryConfig::default().global_max_connections;
         let reg = empty_registry();
         let mut alive = Vec::new();
-        for _ in 0..GLOBAL_MAX_CONNECTIONS {
+        for _ in 0..global {
             let (c, rx) = conn(Uuid::new_v4(), principal(false, vec![]));
             reg.register(Uuid::new_v4(), c).unwrap();
             alive.push(rx);
@@ -1031,5 +1093,212 @@ mod tests {
             &["users::*".to_string()],
             "users::read"
         ));
+    }
+
+    // ---- C0: configurable caps (chat epic; the whole-site SSE cap becomes a
+    // ---- deploy-config value) ---------------------------------------------
+
+    /// TEST-1 [acceptance INV-2/INV-4/INV-5] — the shipped defaults, the
+    /// config object's storage, and `new()` ≡ `new_with_config(Default)`.
+    #[test]
+    fn defaults_and_new_with_config_are_equivalent() {
+        let d = SyncRegistryConfig::default();
+        assert_eq!(
+            d.global_max_connections,
+            4096,
+            "INV-4: the default is the evidence-sized 4096 (measured limit 10 \
+             000 — C0/evidence/MEASUREMENTS.md; 8× the pre-C0 512, 3.4× the \
+             chat boards' drawn '1 204 here')"
+        );
+        assert_eq!(
+            d.per_user_max_connections,
+            12,
+            "INV-2: the per-user default stays 12 (C0's evidence names no \
+             problem with the tab/multi-device bound)"
+        );
+
+        // INV-5: the no-arg ctor keeps its signature (ziee/cytoanalyst compile
+        // unchanged against a pin bump) and builds the default; the config is
+        // stored and readable.
+        let reg_new = empty_registry(); // SyncRegistry::new()
+        assert_eq!(reg_new.config(), d, "new() builds the config's Default");
+        let reg_cfg = SyncRegistry::<TestPrincipal>::new_with_config(d);
+        assert_eq!(reg_cfg.config(), d, "new_with_config stores the config");
+
+        // ...and both enforce identically at the default per-user cap.
+        for reg in [&reg_new, &reg_cfg] {
+            let uid = Uuid::new_v4();
+            let mut alive = Vec::new();
+            for _ in 0..d.per_user_max_connections {
+                let (c, rx) = conn(uid, principal(false, vec![]));
+                reg.register(Uuid::new_v4(), c).unwrap();
+                alive.push(rx);
+            }
+            let (overflow, _rx) = conn(uid, principal(false, vec![]));
+            let err = reg.register(Uuid::new_v4(), overflow).unwrap_err();
+            assert_eq!(
+                err.error_code(),
+                "SYNC_USER_LIMIT",
+                "new() and new_with_config(Default) enforce identically"
+            );
+            drop(alive);
+        }
+    }
+
+    /// TEST-2 [acceptance INV-3] — the CONFIGURED cap is the one enforced: a
+    /// registry built with `{global: 7, per_user: 3}` refuses the 8th global
+    /// and the 4th per-user connection with the UNCHANGED 429 vocabulary
+    /// (INV-3), and the sweep-then-refuse arms still free a slot after
+    /// `unregister`.
+    #[test]
+    fn configured_caps_are_the_enforced_caps() {
+        let cfg = SyncRegistryConfig {
+            global_max_connections: 7,
+            per_user_max_connections: 3,
+        };
+
+        // Global arm: 7 distinct users fill the pool; the 8th is refused with
+        // the unchanged SYNC_GLOBAL_LIMIT code.
+        let reg = SyncRegistry::<TestPrincipal>::new_with_config(cfg);
+        let mut alive = Vec::new();
+        for _ in 0..cfg.global_max_connections {
+            let (c, rx) = conn(Uuid::new_v4(), principal(false, vec![]));
+            reg.register(Uuid::new_v4(), c).unwrap();
+            alive.push(rx);
+        }
+        let (overflow, _rx) = conn(Uuid::new_v4(), principal(false, vec![]));
+        let err = reg.register(Uuid::new_v4(), overflow).unwrap_err();
+        assert_eq!(err.status_code(), 429, "the configured cap surfaces 429");
+        assert_eq!(
+            err.error_code(),
+            "SYNC_GLOBAL_LIMIT",
+            "the configured cap refuses with the unchanged vocabulary (INV-3)"
+        );
+
+        // Per-user arm in a fresh registry (global not saturated): one user's
+        // (cap+1)th is refused with the unchanged SYNC_USER_LIMIT code.
+        let reg2 = SyncRegistry::<TestPrincipal>::new_with_config(cfg);
+        let uid = Uuid::new_v4();
+        let mut alive2 = Vec::new();
+        let mut ids = Vec::new();
+        for _ in 0..cfg.per_user_max_connections {
+            let (c, rx) = conn(uid, principal(false, vec![]));
+            let id = Uuid::new_v4();
+            reg2.register(id, c).unwrap();
+            ids.push(id);
+            alive2.push(rx);
+        }
+        let (overflow2, _rx) = conn(uid, principal(false, vec![]));
+        let err2 = reg2.register(Uuid::new_v4(), overflow2).unwrap_err();
+        assert_eq!(err2.status_code(), 429);
+        assert_eq!(
+            err2.error_code(),
+            "SYNC_USER_LIMIT",
+            "the configured per-user cap refuses with the unchanged vocabulary (INV-3)"
+        );
+
+        // The sweep-then-refuse arms still run: an unregistered slot is free.
+        reg2.unregister(ids[0]);
+        let (fresh, fresh_rx) = conn(uid, principal(false, vec![]));
+        reg2.register(Uuid::new_v4(), fresh)
+            .expect("a slot freed by unregister is reusable under the configured cap");
+        drop((alive, alive2, fresh_rx));
+    }
+
+    /// TEST-3 [acceptance INV-1] — the cap-check ORDER contract: global first,
+    /// so a user at BOTH caps is refused with `SYNC_GLOBAL_LIMIT` (the
+    /// saturated-deployment code), never `SYNC_USER_LIMIT`; and the per-user
+    /// arm is reachable only while the global pool is not saturated.
+    #[test]
+    fn cap_check_order_is_global_first_then_per_user() {
+        let cfg = SyncRegistryConfig {
+            global_max_connections: 3,
+            per_user_max_connections: 2,
+        };
+        let reg = SyncRegistry::<TestPrincipal>::new_with_config(cfg);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        // A holds 2 (at THEIR cap); B holds 1 → the GLOBAL pool is full (3).
+        let mut alive = Vec::new();
+        for uid in [a, a, b] {
+            let (c, rx) = conn(uid, principal(false, vec![]));
+            reg.register(Uuid::new_v4(), c).unwrap();
+            alive.push(rx);
+        }
+
+        // A's 3rd: BOTH caps would refuse it — the global one must win.
+        let (overflow, _rx) = conn(a, principal(false, vec![]));
+        let err = reg.register(Uuid::new_v4(), overflow).unwrap_err();
+        assert_eq!(
+            err.error_code(),
+            "SYNC_GLOBAL_LIMIT",
+            "a saturated deployment reports SYNC_GLOBAL_LIMIT even for a user \
+             at their own cap (INV-1: order contract, registry.rs register)"
+        );
+
+        // The per-user arm is reachable when the global pool is NOT saturated.
+        let reg2 = SyncRegistry::<TestPrincipal>::new_with_config(cfg);
+        let mut alive2 = Vec::new();
+        for _ in 0..cfg.per_user_max_connections {
+            let (c, rx) = conn(a, principal(false, vec![]));
+            reg2.register(Uuid::new_v4(), c).unwrap();
+            alive2.push(rx);
+        }
+        let (overflow2, _rx) = conn(a, principal(false, vec![]));
+        let err2 = reg2.register(Uuid::new_v4(), overflow2).unwrap_err();
+        assert_eq!(
+            err2.error_code(),
+            "SYNC_USER_LIMIT",
+            "the per-user arm is reachable only when the global pool has room"
+        );
+        drop((alive, alive2));
+    }
+
+    /// TEST-4 [acceptance INV-4] — the measured-frontier bound holds: a
+    /// registry built at the measured 10 000-connection limit keeps the stated
+    /// fan-out bound (p50 ≤ 25 ms per `Audience::Everyone` publish; the probe
+    /// measured 0.99 ms p50 on this host — 25× headroom, so the bound is
+    /// non-flaky) and every live connection's queue received the event.
+    #[test]
+    fn fan_out_to_ten_thousand_connections_meets_the_stated_bound() {
+        let cfg = SyncRegistryConfig {
+            global_max_connections: 10_000,
+            per_user_max_connections: 10_000,
+        };
+        let reg = SyncRegistry::<TestPrincipal>::new_with_config(cfg);
+        let mut rxs = Vec::new();
+        for _ in 0..cfg.global_max_connections {
+            let (c, rx) = conn(Uuid::new_v4(), principal(false, vec![]));
+            reg.register(Uuid::new_v4(), c).unwrap();
+            rxs.push(rx);
+        }
+        assert_eq!(reg.connection_count(), 10_000);
+
+        let mut runs = Vec::new();
+        for _ in 0..100 {
+            let t0 = std::time::Instant::now();
+            reg.deliver(Audience::Everyone, dummy_event(), None);
+            runs.push(t0.elapsed());
+        }
+        runs.sort();
+        let p50 = runs[49]; // 100 samples → the 50th
+        assert!(
+            p50 <= std::time::Duration::from_millis(25),
+            "the stated bound: p50 ≤ 25 ms (measured 0.99 ms on this host) — got {p50:?}"
+        );
+
+        // Every connection's queue received the event (none lost, none pruned).
+        let mut received = 0;
+        for rx in &mut rxs {
+            if got(rx) {
+                received += 1;
+            }
+        }
+        assert_eq!(
+            received,
+            10_000,
+            "every live connection's queue received the fan-out event"
+        );
     }
 }

@@ -30,7 +30,7 @@ use aide::transform::TransformOperation;
 use axum::{
     Json,
     extract::FromRequestParts,
-    http::{StatusCode, request::Parts},
+    http::{StatusCode, header, request::Parts},
     response::sse::{Event, KeepAlive, Sse},
 };
 use axum::Extension;
@@ -51,6 +51,19 @@ use super::registry::{ClientConn, SyncRegistry, SYNC_CHANNEL_CAPACITY};
 /// is open, so a deactivation / permission change is picked up within the
 /// window (bounded staleness) without a per-event DB hit.
 const RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The subscribe 200 response's one response-level header:
+/// `X-Accel-Buffering: no` — nginx's own opt-out for a long-lived stream, so a
+/// buffering reverse proxy does not hold the SSE frames on a deploy whose
+/// nginx location carries no SSE handling. (The deploy runbook still lists the
+/// location's `proxy_buffering off` as belt-and-braces for a proxy that
+/// ignores the header.)
+fn no_buffering_headers() -> [(header::HeaderName, header::HeaderValue); 1] {
+    [(
+        header::HeaderName::from_static("x-accel-buffering"),
+        header::HeaderValue::from_static("no"),
+    )]
+}
 
 /// Resolve the re-check interval. A debug-only env override
 /// (`SYNC_RECHECK_TICK_MS`, compiled out of release builds via
@@ -159,13 +172,17 @@ impl<R: IdentityResolver> FromRequestParts<()> for AccessTokenBounds<R> {
     }
 }
 
+/// The subscribe 200's body half: the no-buffering header plus the SSE stream,
+/// so the response tuple stays `(StatusCode, [headers+stream])`.
+type SubscribeResponse<S> = ([(header::HeaderName, header::HeaderValue); 1], Sse<S>);
+
 /// `GET /api/sync/subscribe` — per-user realtime change stream, generic over the
 /// app's resolver `R` and sync surface `S`.
 async fn subscribe_sync<R, S>(
     auth: RequirePermissions<R, S::BaselinePerms>,
     bounds: AccessTokenBounds<R>,
     shutdown: Option<Extension<ShutdownSignal>>,
-) -> ApiResult<Sse<impl Stream<Item = Result<Event, axum::Error>>>>
+) -> ApiResult<SubscribeResponse<impl Stream<Item = Result<Event, axum::Error>>>>
 where
     R: IdentityResolver,
     S: SyncSurface,
@@ -296,7 +313,10 @@ where
 
     Ok((
         StatusCode::OK,
-        Sse::new(stream).keep_alive(KeepAlive::default()),
+        (
+            no_buffering_headers(),
+            Sse::new(stream).keep_alive(KeepAlive::default()),
+        ),
     ))
 }
 
@@ -342,4 +362,22 @@ where
         "/sync/subscribe",
         get_with(subscribe_sync::<R, S>, subscribe_sync_docs::<S>),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TEST-4's header half (ITEM-2): the subscribe 200 carries
+    /// `X-Accel-Buffering: no` — the only response-level header on the SSE
+    /// stream, so a buffering reverse proxy does not hold the long-lived
+    /// frames. (The wire-level assertion — the header actually ON the subscribe
+    /// response of a booted app — is the app integration suite's job.)
+    #[test]
+    fn subscribe_response_carries_the_no_buffering_header() {
+        let headers = no_buffering_headers();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0.as_str(), "x-accel-buffering");
+        assert_eq!(headers[0].1, "no");
+    }
 }
