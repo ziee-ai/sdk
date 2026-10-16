@@ -1175,8 +1175,13 @@ mod tests {
 
     /// A zero cap (either slot) is a programming error — it would refuse
     /// every connection. `SyncRegistryConfig::validate` is a debug-only
-    /// constructor assertion (F-A2 round-1 fix), so this test only runs in
-    /// debug builds, which is the entire point.
+    /// constructor assertion (F-A2 round-1 fix), so this test is
+    /// `#[cfg(debug_assertions)]`-gated: it exists only where the assertion
+    /// exists. Under `cargo test --release` there is nothing to assert (the
+    /// release constructor is the plain one; the app's load-time refusal is
+    /// the release boundary) — an ungated test would invert there
+    /// (should_panic with no panic), which is why the gate is required.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "a zero cap")]
     fn zero_cap_is_refused_to_build() {
@@ -1301,8 +1306,9 @@ mod tests {
     /// fan-out bound (p50 ≤ 25 ms per `Audience::Everyone` publish). The probe
     /// measured 0.99 ms p50 in RELEASE (C0/evidence/MEASUREMENTS.md); `cargo
     /// test` compiles the debug profile, ~5-15× slower — the observed debug
-    /// p50 is printed at run time (this round: 4.58 ms, ~5.5× margin), so the
-    /// "25× headroom" number is a release-mode fact, never a debug claim.
+    /// p50 is printed at run time (observations so far: 3.7-5.3 ms, ~5-7×
+    /// under the bound), so the "25× headroom" number is a release-mode fact,
+    /// never a debug claim.
     /// Every live connection's queue must have received the event.
     #[test]
     fn fan_out_to_ten_thousand_connections_meets_the_stated_bound() {
