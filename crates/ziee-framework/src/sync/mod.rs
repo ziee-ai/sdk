@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 pub use audience::{Audience, PermRule};
 pub use extractor::{SyncOrigin, SYNC_CONNECTION_HEADER};
-pub use registry::{ClientConn, SyncRegistry, SYNC_CHANNEL_CAPACITY};
+pub use registry::{ClientConn, SyncRegistry, SyncRegistryConfig, SYNC_CHANNEL_CAPACITY};
 pub use routes::{RecheckOutcome, SyncSurface, sync_routes};
 
 /// The app's sync-entity vocabulary, abstracted to exactly what the framework
