@@ -28,6 +28,44 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
+/// Ports handed to a live [`SpawnedServer`] by THIS process (2026-10-18, dental): `portpicker::pick_unused_port` reserves
+/// nothing — it probes, releases, and the server binds seconds later — so two tests on parallel threads could be handed the
+/// SAME port. The second server then failed to bind while its health poll was answered by the FIRST test's server: the test
+/// registered a user over HTTP in the other test's database and its own direct-DB insert hit `user_groups_user_id_fkey`
+/// (seen in ~8 merge gates). A port stays in this set from pick until the server is dropped.
+fn reserved_ports() -> &'static Mutex<HashSet<u16>> {
+    static RESERVED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    RESERVED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// A port reserved for one server's lifetime; released on drop.
+struct PortReservation(u16);
+
+impl PortReservation {
+    fn pick() -> Self {
+        Self::pick_with(|| portpicker::pick_unused_port().expect("No free TCP port available for TestServer"))
+    }
+
+    /// `pick` with an injectable picker (the unit test feeds it duplicate ports).
+    fn pick_with(mut next: impl FnMut() -> u16) -> Self {
+        for _ in 0..256 {
+            let p = next();
+            if reserved_ports().lock().unwrap_or_else(|e| e.into_inner()).insert(p) {
+                return PortReservation(p);
+            }
+        }
+        panic!("TestServer: no unreserved free TCP port after 256 picks");
+    }
+}
+
+impl Drop for PortReservation {
+    fn drop(&mut self) {
+        reserved_ports().lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+    }
+}
 
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
@@ -616,6 +654,8 @@ pub struct SpawnedServer {
     /// App-supplied handles (workspace/hub/sandbox-cache tempdirs) held for the
     /// server's lifetime; dropped at test end.
     _keep_alive: Vec<Box<dyn Any + Send + Sync>>,
+    /// Released AFTER the body of [`SpawnedServer::drop`] killed the child, so the port is free before another test may take it.
+    _port: PortReservation,
 }
 
 impl SpawnedServer {
@@ -851,8 +891,8 @@ impl<A: HarnessApp> TestHarness<A> {
 
         // OS-aware free-port reservation (avoids the "Address already in use"
         // boot-timeout cluster a random pick caused).
-        let server_port =
-            portpicker::pick_unused_port().expect("No free TCP port available for TestServer");
+        let port_reservation = PortReservation::pick();
+        let server_port = port_reservation.0;
 
         // Parse DATABASE_URL into connection parts.
         let db_url = admin_database_url();
@@ -953,7 +993,7 @@ impl<A: HarnessApp> TestHarness<A> {
         for (k, v) in &plan.extra_env {
             cmd.env(k, v);
         }
-        let child = cmd.spawn().expect("Failed to start test server");
+        let mut child = cmd.spawn().expect("Failed to start test server");
 
         let base_url = format!("http://127.0.0.1:{}", server_port);
         let test_database_url = format!(
@@ -982,8 +1022,18 @@ impl<A: HarnessApp> TestHarness<A> {
                 base_url
             );
         }
+        // Something answered the health poll — make sure it was OUR child, not another process that already held the port
+        // (the reservation above covers this process's tests; this catches a collision with any other process).
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "TestServer at {} answered health but its own process already exited ({status}) — the port is held by another \
+                 process; this test would talk to a foreign server",
+                base_url
+            );
+        }
 
         SpawnedServer {
+            _port: port_reservation,
             process: child,
             base_url,
             database_name,
@@ -998,6 +1048,22 @@ impl<A: HarnessApp> TestHarness<A> {
 
 #[cfg(test)]
 mod tests {
+    use super::PortReservation;
+
+    /// Two live servers are never handed the same port, and a dropped server's port becomes available again.
+    #[test]
+    fn port_reservation_never_hands_out_a_held_port() {
+        // A picker that offers 61001 twice before anything else — what `pick_unused_port` can do across threads.
+        let mut seq = vec![61001u16, 61001, 61002].into_iter();
+        let a = PortReservation::pick_with(|| seq.next().unwrap());
+        let b = PortReservation::pick_with(|| seq.next().unwrap());
+        assert_eq!(a.0, 61001);
+        assert_eq!(b.0, 61002, "a port already held by a live server must be skipped");
+        drop(a);
+        let c = PortReservation::pick_with(|| 61001);
+        assert_eq!(c.0, 61001, "a dropped server's port is released");
+    }
+
     use super::*;
 
     struct NamingApp(Vec<PathBuf>);
