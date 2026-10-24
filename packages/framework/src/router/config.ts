@@ -16,6 +16,19 @@ export type RoutePermissionGate = (args: {
   children: ReactNode
 }) => ReactNode
 
+/** A route location face (react-router's `Location`, minus the `state`
+ *  payload's typing). The seam's getter returns one of these; `RouterComponent`
+ *  hands it to `<Routes location={...}>` as the render override. */
+export interface RouterLocation {
+  pathname: string
+  search: string
+  hash: string
+  /** The router's own per-entry key (the route tree's stable identity). */
+  key: string
+  /** The history entry's state payload (opaque — the router never reads it). */
+  state?: unknown
+}
+
 export interface RouterConfig {
   /** Where to redirect unauthenticated access to a protected route when no
    *  `routeGuards` are registered (fail-closed). Default: "/auth". */
@@ -29,6 +42,17 @@ export interface RouterConfig {
   /** Optional app permission gate (see `RoutePermissionGate`). When unset, a
    *  route's `permission` is ignored. */
   permissionGate: RoutePermissionGate | null
+  /** Optional RENDER-time location override (the app-supplied location the
+   *  router must paint instead of the committed one — e.g. a navigation
+   *  transition's held location). Read by `RouterComponent` at render for
+   *  `<Routes location={...}>`. The `null` / unset default is byte-identical
+   *  to today's render in every app. */
+  routesLocation?: () => RouterLocation | null
+  /** The change subscription the router uses to re-render when the held
+   *  location changes (the reader side of the app's holder — `routesLocation`
+   *  alone cannot re-render the router). Called with `onChange`; returns the
+   *  unsubscribe. Unset = nothing ever re-renders via this seam. */
+  routesLocationSubscribe?: (onChange: () => void) => () => void
 }
 
 const config: RouterConfig = {

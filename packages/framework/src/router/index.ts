@@ -35,6 +35,7 @@ export {
   setRouterConfig,
   getRouterConfig,
   type RouterConfig,
+  type RouterLocation,
   type RoutePermissionGate,
 } from './config'
 export type { RouteConfig, LayoutDefinition } from './types'

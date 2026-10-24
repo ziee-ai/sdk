@@ -1,10 +1,11 @@
 import type { ComponentType, ReactNode } from 'react'
+import { useSyncExternalStore } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom'
 import { ModuleSystem } from '../stores'
 import { routesSeam } from '../app-seam'
 import { LazyRouteRenderer } from './LazyRouteRenderer'
 import { LayoutRouteElement, layoutRouteKey } from './layout-route'
-import { getRouterConfig } from './config'
+import { getRouterConfig, type RouterLocation } from './config'
 import type { LayoutDefinition, RouteConfig } from './types'
 
 // @ziee/framework/router — the router component.
@@ -14,7 +15,15 @@ import type { LayoutDefinition, RouteConfig } from './types'
 //  - group routes by layout (one layout instance per layout object),
 //  - wrap protected routes in the registered `routeGuards` (fail-closed),
 //  - apply the app's injected permission gate to routes carrying `permission`,
-//  - mount `routerEffects` inside the router context.
+//  - mount `routerEffects` inside the router context,
+//  - when the app injects `routesLocation`, paint THAT location instead of
+//    the committed one (the render-hold seam) with a subscription because
+//    only the app's holder can say when it changed.
+
+/** The no-op subscription (the null default): with no `routesLocation` the
+ *  router has nothing to re-render for. A module-level constant so the
+ *  subscribe identity is stable across renders. */
+const noopSubscribe = (): (() => void) => () => undefined
 
 let warnedNoGate = false
 
@@ -48,7 +57,19 @@ function renderRouteElement(route: RouteConfig): ReactNode {
 
 export function RouterComponent() {
   const { routes } = routesSeam.get() as { routes: RouteConfig[] }
-  const { loginPath, homePath, fallback } = getRouterConfig()
+  const { loginPath, homePath, fallback, routesLocation, routesLocationSubscribe } =
+    getRouterConfig()
+
+  // The render-hold seam: the app may supply a location the router must paint
+  // instead of the committed one (the held location). The subscription is the
+  // trigger — the app's holder says when the held value changed (a plain
+  // getter read at render cannot re-render the router). The unset default is
+  // the no-op subscription + a constant `null` snapshot — byte-identical to
+  // today's render.
+  const heldLocation = useSyncExternalStore<RouterLocation | null>(
+    routesLocationSubscribe ?? noopSubscribe,
+    () => (routesLocation ? routesLocation() : null),
+  )
 
   const protectedRoutes = routes.filter((r: RouteConfig) => r.requiresAuth)
   const publicRoutes = routes.filter((r: RouteConfig) => !r.requiresAuth)
@@ -137,7 +158,7 @@ export function RouterComponent() {
       {routerEffects.map(({ id, component: Effect }) => (
         <Effect key={id} />
       ))}
-      <Routes>
+      <Routes location={heldLocation ?? undefined}>
         {protectedRoutes.length > 0 && (
           <Route element={guardProtected(<Outlet />)}>
             {renderRoutesForLayoutGroup(protectedRoutes)}
