@@ -167,3 +167,12 @@ describe('PROV-sdk-1 — the router location seam (the SDK reads the app-supplie
     expect(host!.innerHTML).toContain('LOC:/a|KEY:ka')
   })
 })
+
+// SSR NOTE (the getServerSnapshot third argument — React #407): the consumer
+// app's server render mounts RouterComponent and useSyncExternalStore REQUIRES
+// getServerSnapshot there (its absence throws "React error #407"; the app's
+// Rust `ssr::` integration tier would red). The server snapshot is a constant
+// `null` — a server render paints the router's OWN location, never a held one
+// (the app's holder is client-only). A DOM-level SDK test cannot pin the
+// server path (a raw `renderToString` of `BrowserRouter` yields an empty tree
+// outside the app's shim ladder) — the consumer's SSR suite pins it instead.

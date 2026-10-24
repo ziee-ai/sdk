@@ -66,9 +66,14 @@ export function RouterComponent() {
   // getter read at render cannot re-render the router). The unset default is
   // the no-op subscription + a constant `null` snapshot — byte-identical to
   // today's render.
+  //
+  // getServerSnapshot (the 3rd arg — React requires it for a server render):
+  // a server render paints the ROUTER's own location, never a held one (the
+  // app's holder is client-only; an SSR document is today's document).
   const heldLocation = useSyncExternalStore<RouterLocation | null>(
     routesLocationSubscribe ?? noopSubscribe,
     () => (routesLocation ? routesLocation() : null),
+    () => null,
   )
 
   const protectedRoutes = routes.filter((r: RouteConfig) => r.requiresAuth)
