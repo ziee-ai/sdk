@@ -26,13 +26,53 @@ export type ComponentLike = ComponentType<any> | LazyLoader | ReactNode
  */
 const lazyCache = new WeakMap<LazyLoader, ComponentType<any>>()
 
+/**
+ * A loader's module once it has resolved — the component a NEW render uses
+ * directly. React 19's `lazy()` suspends on a type's FIRST render even when
+ * the import has already resolved (its initializer attaches `.then` and
+ * throws the thenable; the resolve lands a microtask later), so a route the
+ * app had preloaded still painted its Suspense fallback for a frame — the
+ * consumer's "the skeleton makes it look like flashing" (2026-11-05).
+ */
+const resolvedLoaders = new WeakMap<LazyLoader, ComponentType<any>>()
+
+function recordResolved(loader: LazyLoader, mod: unknown): void {
+  const C = (mod as { default?: ComponentType<any> } | null)?.default
+  if (C) resolvedLoaders.set(loader, C)
+}
+
 function getCachedLazy(loader: LazyLoader): ComponentType<any> {
   let Lazy = lazyCache.get(loader)
   if (!Lazy) {
-    Lazy = lazy(loader)
+    Lazy = lazy(() =>
+      loader().then(mod => {
+        recordResolved(loader, mod)
+        return mod
+      }),
+    )
     lazyCache.set(loader, Lazy)
   }
   return Lazy
+}
+
+/**
+ * Load a loader's module and record it, so the next `RenderComponentLike` of
+ * that loader renders the component directly — no first-render suspend. An
+ * app's preload (a held navigation's route-element warm) calls this; a
+ * rejected import records nothing (the render's own boundary answers it).
+ */
+export function primeLazyLoader(
+  loader: LazyLoader,
+  /** The import already in flight for `loader` (the caller's own call) —
+   *  awaited instead of calling the loader a second time. */
+  pending?: PromiseLike<unknown>,
+): Promise<void> {
+  return Promise.resolve()
+    .then(() => pending ?? loader())
+    .then(
+      mod => recordResolved(loader, mod),
+      () => undefined,
+    )
 }
 
 /**
@@ -114,11 +154,25 @@ export function RenderComponentLike({
     [component],
   )
 
+  // Decided ONCE per component identity: a loader already resolved renders
+  // its component directly; one that is not stays on its lazy type for this
+  // mount even after it resolves (switching the element type under a live
+  // page would remount it). The Suspense wrapper below stays either way, so
+  // the tree's shape never depends on the choice.
+  const direct = useMemo(
+    () => (kind === 'loader' ? (resolvedLoaders.get(component as LazyLoader) ?? null) : null),
+    [kind, component],
+  )
+
   const rendered = useMemo(() => {
     switch (kind) {
       case 'element':
         return component as ReactElement
       case 'loader': {
+        if (direct) {
+          const Direct = direct
+          return <Direct {...props} />
+        }
         const Lazy = getCachedLazy(component as LazyLoader)
         return <Lazy {...props} />
       }
@@ -144,7 +198,7 @@ export function RenderComponentLike({
         warnUnrenderable(debugId, reason)
         return null
     }
-  }, [component, props, kind, reason, ambiguous, debugId])
+  }, [component, props, kind, reason, ambiguous, debugId, direct])
 
   // Only the two lazy kinds can suspend by design; everything else renders
   // synchronously and must not be wrapped (a stray boundary swallows a real

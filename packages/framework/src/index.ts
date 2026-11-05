@@ -33,6 +33,7 @@ export {
 } from './lazy-component'
 export {
   RenderComponentLike,
+  primeLazyLoader,
   type ComponentLike,
   type RenderComponentLikeProps,
 } from './lazy-component-view'
