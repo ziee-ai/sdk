@@ -11,7 +11,7 @@
 //      read the HELD values (RR's `<Routes location>` re-provision);
 //   3. the SUBSCRIPTION re-renders on release: clearing the held value fires
 //      the change listener and the committed URL's route paints.
-import { act } from 'react'
+import { act, useEffect, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -19,6 +19,7 @@ import { useModuleSystemStore } from '../module-system/store'
 import {
   RouterComponent,
   setRouterConfig,
+  type LayoutDefinition,
   useRoutesStore,
   type RouterLocation,
 } from './index.ts'
@@ -165,6 +166,57 @@ describe('PROV-sdk-1 — the router location seam (the SDK reads the app-supplie
     // The release with no subscription: no re-render, the stale paint stays.
     act(() => setHeld(null))
     expect(host!.innerHTML).toContain('LOC:/a|KEY:ka')
+  })
+})
+
+// The no-remount pin (2026-11-05, the owner's "clicking a cover glitches the
+// whole page like a rerender"): react-router wraps a `<Routes location>` in a
+// LocationContext.Provider that a bare `<Routes>` does not render, so toggling
+// the held location between null and a value used to change the element type
+// at the routes' position — React remounted the layout AND the page at the
+// hold's start and again at its release. The router now always passes a
+// location; holding the CURRENT route keeps the same instances.
+describe('the held location never remounts the route tree', () => {
+  const mounts = { layout: 0, pageA: 0 }
+  function ShellLayout({ children }: { children?: ReactNode }) {
+    useEffect(() => {
+      mounts.layout += 1
+    }, [])
+    return <div>{children}</div>
+  }
+  function CountedPageA() {
+    useEffect(() => {
+      mounts.pageA += 1
+    }, [])
+    return <span>PAGE-A</span>
+  }
+
+  it('hold start and release keep the layout instance; holding the current page keeps the page', () => {
+    mounts.layout = 0
+    mounts.pageA = 0
+    const shell: LayoutDefinition = { component: ShellLayout }
+    useRoutesStore.getState().resetRoutes()
+    useRoutesStore.getState().addRoutes([
+      { path: '/a', element: <CountedPageA />, requiresAuth: false, layout: shell },
+      { path: '/b', element: <PageB />, requiresAuth: false, layout: shell },
+    ])
+    setRouterConfig({
+      routesLocation: () => held,
+      routesLocationSubscribe: subscribeHeld,
+    })
+    bootAt('/a')
+    expect(mounts).toEqual({ layout: 1, pageA: 1 })
+
+    // The hold starts on the page already painted (a tap's navigation).
+    act(() => setHeld({ ...ROUTE_A, key: 'default' }))
+    act(() => navigateFn!('/b'))
+    expect(host!.innerHTML).toContain('PAGE-A')
+    expect(mounts).toEqual({ layout: 1, pageA: 1 })
+
+    // The release paints /b inside the SAME layout instance.
+    act(() => setHeld(null))
+    expect(host!.innerHTML).toContain('PAGE-B')
+    expect(mounts.layout).toBe(1)
   })
 })
 

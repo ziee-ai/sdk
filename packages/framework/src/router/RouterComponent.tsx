@@ -1,6 +1,6 @@
 import type { ComponentType, ReactNode } from 'react'
 import { useSyncExternalStore } from 'react'
-import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { ModuleSystem } from '../stores'
 import { routesSeam } from '../app-seam'
 import { LazyRouteRenderer } from './LazyRouteRenderer'
@@ -163,7 +163,7 @@ export function RouterComponent() {
       {routerEffects.map(({ id, component: Effect }) => (
         <Effect key={id} />
       ))}
-      <Routes location={heldLocation ?? undefined}>
+      <StableRoutes held={heldLocation}>
         {protectedRoutes.length > 0 && (
           <Route element={guardProtected(<Outlet />)}>
             {renderRoutesForLayoutGroup(protectedRoutes)}
@@ -176,7 +176,30 @@ export function RouterComponent() {
           path="*"
           element={guardProtected(<Navigate to={homePath} replace />)}
         />
-      </Routes>
+      </StableRoutes>
     </BrowserRouter>
   )
+}
+
+/**
+ * `<Routes>` that ALWAYS receives a `location` — the held one, else the live
+ * one. react-router wraps a located `<Routes>` in a `LocationContext.Provider`
+ * that an unlocated one does not render, so toggling `location` between
+ * `undefined` and a value changes the element TYPE at the routes' position:
+ * React unmounts and remounts the whole route tree (the layout and the page)
+ * at the hold's start AND at its release — every held navigation flashed the
+ * page it was holding. Passing the live location when nothing is held keeps
+ * the tree shape constant. Inside the routes `useNavigationType()` then reads
+ * POP (react-router's located-Routes contract); read the navigation type from
+ * a `routerEffects` entry, which mounts outside `<Routes>`.
+ */
+function StableRoutes({
+  held,
+  children,
+}: {
+  held: RouterLocation | null
+  children: ReactNode
+}) {
+  const live = useLocation()
+  return <Routes location={held ?? live}>{children}</Routes>
 }
