@@ -292,3 +292,38 @@ test('QUIET-7: a destroy drops the queue (the re-init is the fresh answer)', asy
   unpinStore(p, 'entry')
   assert.deepEqual(log, [])
 })
+
+test('QUIET-8: a reconnect handler registered with { wakeRevalidate: false } is NOT the wake revalidation — onWake owns it', async t => {
+  setQuietPolicy({ revalidateAfterMs: 1000 })
+  t.mock.timers.enable({ apis: ['Date'], now: 9_000_000 })
+  try {
+    const log: string[] = []
+    const h = defineStore(`QuietOptOut${quietSeq++}`, {
+      state: { v: 0 },
+      actions: set => ({ setV: (v: number) => set(() => ({ v })) }),
+      init: ({ on, onWake }) => {
+        on('sync:reconnect' as never, (() => {
+          log.push('destructive-reconnect')
+        }) as never, { wakeRevalidate: false })
+        onWake(info => {
+          if (info.stale) log.push('soft-refresh')
+        })
+      },
+    })
+    const p: any = createStoreProxy(h.store as any)
+    p.setV(0)
+    const rt = p.__refTracker
+    rt.addRef('v')
+    pinStore(p, 'e')
+    rt.removeRef('v')
+    t.mock.timers.tick(2000)
+    rt.addRef('v')
+    assert.deepEqual(log, ['soft-refresh'])
+    // A REAL reconnect while visible still runs the handler.
+    await emit('sync:reconnect', {})
+    assert.deepEqual(log, ['soft-refresh', 'destructive-reconnect'])
+    unpinStore(p, 'e')
+  } finally {
+    setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
+  }
+})

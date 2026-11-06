@@ -86,6 +86,10 @@ export interface QuietOption {
   /** `'defer'` (default): queue it until the store is shown again.
    *  `'run'`: run it now, hidden or not. */
   whileQuiet?: 'defer' | 'run'
+  /** `sync:reconnect` only — `false` keeps this handler out of the wake
+   *  revalidation (a store whose reconnect answer is DESTRUCTIVE — it drops
+   *  what is on screen — revalidates in its own `onWake` instead). */
+  wakeRevalidate?: boolean
 }
 
 /** What a waking store is told (`ctx.onWake`). */
@@ -663,8 +667,9 @@ function makeBuilder<State extends object, Actions extends object>(
         const raw = handler as EventHandler<any>
         const name = event as string
         // The bus dedupes per `group::event`, so this store has ONE handler per
-        // event — the one the revalidation calls.
-        quiet.handlers.set(name, raw)
+        // event — the one the revalidation calls (unless it opted out).
+        if (opts?.wakeRevalidate === false) quiet.handlers.delete(name)
+        else quiet.handlers.set(name, raw)
         const runQuiet = opts?.whileQuiet === 'run'
         const wrapped: EventHandler<any> = ev => {
           if (quiet.quiet && !runQuiet) {
