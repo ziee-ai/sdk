@@ -2,7 +2,7 @@ import type { SSECallback } from './sse-types'
 import { createSSEHandler } from './sse-types'
 import { getSyncConnectionId } from '../sync/connection'
 import { netRequestEnd, netRequestStart } from '../net-idle'
-import { bumpFetchEpoch, coalesce, inflightKey } from './inflight'
+import { bumpFetchEpoch, coalesce, inflightKey, noteMutationSettled } from './inflight'
 import { substitutePathParams } from './path-substitution'
 
 // ─────────────────────── Base-URL resolver (injected) ───────────────────────
@@ -845,6 +845,9 @@ const performCall = async <TResponse = unknown>(
     // round-trip rather than joining a possibly-pre-mutation request. Bumped on
     // failure too: a request that errored client-side may still have been
     // applied server-side, so assuming "nothing changed" would be unsafe.
-    if (!endpointUrl.startsWith('GET ')) bumpFetchEpoch()
+    if (!endpointUrl.startsWith('GET ')) {
+      bumpFetchEpoch()
+      noteMutationSettled(endpointUrl)
+    }
   }
 }

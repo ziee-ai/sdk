@@ -88,6 +88,34 @@ export function bumpFetchEpoch(): void {
   fetchEpoch++
 }
 
+/**
+ * Observers of every SETTLED local mutation (any non-GET call through the
+ * transport, success or failure — the same moment `bumpFetchEpoch` runs), told
+ * the endpoint (`"POST /api/…"`). The global epoch says "something changed";
+ * this says WHAT was written to, so a consumer can keep a per-domain freshness
+ * fact (a reading-progress save need not stale a forum feed). Returns the
+ * unsubscribe.
+ */
+const mutationListeners = new Set<(endpoint: string) => void>()
+
+export function onMutationSettled(listener: (endpoint: string) => void): () => void {
+  mutationListeners.add(listener)
+  return () => {
+    mutationListeners.delete(listener)
+  }
+}
+
+/** Called by the transport for every settled non-GET (see `core.ts`). */
+export function noteMutationSettled(endpoint: string): void {
+  for (const listener of [...mutationListeners]) {
+    try {
+      listener(endpoint)
+    } catch (err) {
+      console.error('[api-client] mutation listener failed', err)
+    }
+  }
+}
+
 /** Current epoch. Exported for tests and for callers that need to detect
  *  "did anything change while I was awaiting?" (e.g. a freshness window). */
 export function currentFetchEpoch(): number {
