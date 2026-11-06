@@ -543,10 +543,15 @@ function createQuietState() {
       const at = st.queue.findIndex(q => q.key === key)
       if (at >= 0) st.queue.splice(at, 1)
       st.queue.push({ key, event, run })
-      if (st.queue.length > QUIET_QUEUE_MAX) {
-        st.queue.length = 0
-        st.staleOnShow = true
-      }
+      if (st.queue.length > QUIET_QUEUE_MAX) st.fold()
+    },
+    /** Fold the queued EVENTS into one revalidation-on-show. Parked `watch`
+     *  callbacks are kept: they carry a value change no revalidation replays
+     *  (an auth/permission edge), and each is one entry, deduped by key. */
+    fold(): void {
+      const before = st.queue.length
+      st.queue = st.queue.filter(q => q.event === null)
+      if (st.queue.length !== before) st.staleOnShow = true
     },
     visibility(v: StoreVisibility): void {
       const wasVisible = st.visible
@@ -561,10 +566,7 @@ function createQuietState() {
         // RELEASED while hidden (the last pin let go): nothing is deferred
         // any more, so what was queued is folded into one revalidation for
         // the moment the store is shown again (or dropped by its destroy).
-        if (st.queue.length > 0) {
-          st.queue.length = 0
-          st.staleOnShow = true
-        }
+        st.fold()
         return
       }
       if (!wasVisible && v.visible) st.wake()

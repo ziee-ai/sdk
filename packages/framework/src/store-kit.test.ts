@@ -327,3 +327,36 @@ test('QUIET-8: a reconnect handler registered with { wakeRevalidate: false } is 
     setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
   }
 })
+
+test('QUIET-9: releasing a hidden store folds its queued EVENTS into a revalidation but keeps a parked watch — the value edge still replays on show', () => {
+  setQuietPolicy({ revalidateAfterMs: 60_000 })
+  try {
+    const src = defineStore(`QuietFoldSrc${quietSeq++}`, { state: { k: 1 } })
+    const log: string[] = []
+    const h = defineStore(`QuietFold${quietSeq++}`, {
+      state: { v: 0 },
+      actions: set => ({ setV: (v: number) => set(() => ({ v })) }),
+      init: ({ watch, on }) => {
+        watch(src.store as any, (s: any) => s.k, (value: number) => {
+          log.push(`k=${value}`)
+        }, { fireImmediately: false })
+        on('sync:reconnect' as never, (() => {
+          log.push('reconnect')
+        }) as never)
+      },
+    })
+    const p: any = createStoreProxy(h.store as any)
+    p.setV(0)
+    const rt = p.__refTracker
+    rt.addRef('v')
+    pinStore(p, 'e')
+    rt.removeRef('v')
+    src.store.setState({ k: 2 })
+    unpinStore(p, 'e') // released while hidden
+    rt.addRef('v')
+    assert.deepEqual(log, ['k=2'])
+    rt.executeDestroy()
+  } finally {
+    setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
+  }
+})
