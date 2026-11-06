@@ -134,3 +134,122 @@ test('TEST-12: executeDestroy is idempotent against a destroy already run', t =>
   assert.throws(() => p.n)
   assert.equal(initRuns, 2)
 })
+
+// ── Pins (history-pinned stores) ────────────────────────────────────────────
+// A pin is an OWNER reference beside the render refs: a store is destroyed only
+// when it has no render refs AND no pins; releasing the last pin while nothing
+// renders the store resumes the ordinary 5 s delayed destroy.
+
+import { pinStore, unpinStore, setStoreActivityObserver, liveStoreProxies } from './stores.ts'
+
+const mkDestroyable = () => {
+  const calls = { destroy: 0, visibility: [] as Array<{ visible: boolean; pinned: boolean }> }
+  const store = create<any>(() => ({
+    n: 0,
+    __destroy__: () => {
+      calls.destroy++
+    },
+    __visibility__: (v: { visible: boolean; pinned: boolean }) => {
+      calls.visibility.push(v)
+    },
+  }))
+  const p: any = createStoreProxy(store as any)
+  return { p, rt: p.__refTracker, calls }
+}
+
+test('PIN-1: a pinned store with zero render refs is never destroyed', t => {
+  const { p, rt, calls } = mkDestroyable()
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  rt.addRef('n')
+  assert.equal(pinStore(p, 'entry:1'), true)
+  rt.removeRef('n')
+  // No render refs, but a pin: no destroy timer was armed…
+  assert.equal(rt.destroyTimeoutId, null)
+  t.mock.timers.tick(DEFAULT_DESTROY_DELAY_MS * 10)
+  // …and nothing ever destroys it.
+  assert.equal(calls.destroy, 0)
+  assert.equal(rt.destroyed, false)
+})
+
+test('PIN-2: releasing the last pin resumes the 5 s destroy (and only then)', t => {
+  const { p, rt, calls } = mkDestroyable()
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  rt.addRef('n')
+  pinStore(p, 'a')
+  pinStore(p, 'b')
+  rt.removeRef('n')
+  unpinStore(p, 'a')
+  // One owner still holds it.
+  assert.equal(rt.destroyTimeoutId, null)
+  unpinStore(p, 'b')
+  assert.notEqual(rt.destroyTimeoutId, null)
+  t.mock.timers.tick(DEFAULT_DESTROY_DELAY_MS - 1)
+  assert.equal(calls.destroy, 0)
+  t.mock.timers.tick(1)
+  assert.equal(calls.destroy, 1)
+})
+
+test('PIN-3: a pin cancels a pending destroy; pins are idempotent per owner and survive a reset', t => {
+  const { p, rt, calls } = mkDestroyable()
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  rt.addRef('n')
+  rt.removeRef('n')
+  assert.notEqual(rt.destroyTimeoutId, null)
+  pinStore(p, 'x')
+  pinStore(p, 'x')
+  assert.equal(rt.destroyTimeoutId, null)
+  assert.equal(rt.pins.size, 1)
+  rt.reset()
+  assert.equal(rt.isPinned(), true)
+  t.mock.timers.tick(DEFAULT_DESTROY_DELAY_MS * 2)
+  assert.equal(calls.destroy, 0)
+  // A render ref coming and going while pinned arms nothing either.
+  rt.addRef('n')
+  rt.removeRef('n')
+  assert.equal(rt.destroyTimeoutId, null)
+  // Unpinning an owner that never pinned is a no-op.
+  unpinStore(p, 'nobody')
+  assert.equal(rt.isPinned(), true)
+})
+
+test('PIN-4: the store hears each visibility CHANGE once (render refs / pins)', () => {
+  const { p, rt, calls } = mkDestroyable()
+  rt.addRef('n')
+  rt.addRef('n')
+  pinStore(p, 'e')
+  rt.removeRef('n')
+  rt.removeRef('n')
+  unpinStore(p, 'e')
+  assert.deepEqual(calls.visibility, [
+    { visible: true, pinned: false },
+    { visible: true, pinned: true },
+    { visible: false, pinned: true },
+    { visible: false, pinned: false },
+  ])
+})
+
+test('PIN-5: the activity observer sees 0→1 and 1→0 render transitions; liveStoreProxies tracks them', () => {
+  const seen: Array<[object, boolean]> = []
+  setStoreActivityObserver((proxy, active) => {
+    seen.push([proxy, active])
+  })
+  try {
+    const { p, rt } = mkDestroyable()
+    rt.addRef('n')
+    rt.addRef('n')
+    assert.ok(liveStoreProxies().includes(p))
+    rt.removeRef('n')
+    rt.removeRef('n')
+    assert.ok(!liveStoreProxies().includes(p))
+    assert.deepEqual(seen, [
+      [p, true],
+      [p, false],
+    ])
+  } finally {
+    setStoreActivityObserver(null)
+  }
+})
+
+test('PIN-6: pinStore refuses a non-proxy value', () => {
+  assert.equal(pinStore({}, 'o'), false)
+})

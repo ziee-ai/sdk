@@ -12,7 +12,7 @@ import { useEffect, useRef } from 'react'
 import type { Mutate, StoreApi, UseBoundStore } from 'zustand'
 import { useEventBusStore } from './events'
 import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
-import { createStoreProxy, type StoreProxy } from './stores'
+import { createStoreProxy, type StoreProxy, type StoreVisibility } from './stores'
 import { onNetworkIdle } from './net-idle'
 import { createLazyActionSequencer, createLazyDispatcher } from './lazy-dispatch'
 import { isStaleBuild } from './chunk-recovery'
@@ -57,27 +57,107 @@ export type StoreSet<S> = (
   partial: Partial<S> | ((draft: S) => Partial<S> | void),
 ) => void
 
+// ============================================================================
+// Quiet while hidden — the store half of `pinStore` (see stores.ts, "Pins").
+//
+// A store that an owner PINS while nothing renders it is QUIET: the page that
+// shows it is not on screen, but the app wants it kept (it is one Back away).
+// A quiet store must not spend the network on a page nobody sees, so:
+//
+//   - every `on(event, …)` handler is DEFERRED while quiet — the event is
+//     queued (deduped by event + payload, oldest first), never run;
+//   - every `watch(…)` callback is likewise parked (first `prev`, latest
+//     value — replayed only when the value really moved);
+//   - when the store is SHOWN again the queue is replayed, in order, once;
+//   - and when it was hidden for at least the app's revalidate window
+//     (`setQuietPolicy`) — or it was RELEASED while hidden with events still
+//     queued — the store's own `sync:reconnect` handler runs once, as the
+//     revalidation (the "refresh in place" every store already answers), and
+//     any queued `sync:*` frame it supersedes is dropped.
+//
+// A handler that must run even while hidden opts out with
+// `on(event, h, { whileQuiet: 'run' })`. `ctx.isQuiet()` lets a timer skip
+// its ticks, and `ctx.onWake(fn)` lets a store revalidate in its own way.
+// A store nothing pins is never quiet — every other app is byte-identical.
+// ============================================================================
+
+/** How a quiet store's handler treats an event that arrives while hidden. */
+export interface QuietOption {
+  /** `'defer'` (default): queue it until the store is shown again.
+   *  `'run'`: run it now, hidden or not. */
+  whileQuiet?: 'defer' | 'run'
+}
+
+/** What a waking store is told (`ctx.onWake`). */
+export interface StoreWakeInfo {
+  /** How long the store was quiet (ms). */
+  hiddenMs: number
+  /** Whether the app's revalidate window passed (or events were lost on a
+   *  release) — the store should revalidate. */
+  stale: boolean
+  /** How many deferred events/watch callbacks were replayed. */
+  replayed: number
+}
+
+/** The app-wide quiet policy. `revalidateAfterMs` = how long a store may stay
+ *  hidden before it revalidates on its return (default: never). */
+export interface QuietPolicy {
+  revalidateAfterMs: number
+}
+
+const quietPolicy: QuietPolicy = { revalidateAfterMs: Number.POSITIVE_INFINITY }
+
+/** Set the app-wide quiet policy (call once at boot). */
+export function setQuietPolicy(policy: Partial<QuietPolicy>): void {
+  if (typeof policy.revalidateAfterMs === 'number' && policy.revalidateAfterMs >= 0) {
+    quietPolicy.revalidateAfterMs = policy.revalidateAfterMs
+  }
+}
+
+/** The current quiet policy (a copy). */
+export function getQuietPolicy(): QuietPolicy {
+  return { ...quietPolicy }
+}
+
+/** At most this many deferred items per store; past it the queue is folded
+ *  into one revalidation (a store hidden through a storm of frames refetches
+ *  once instead of replaying the storm). */
+const QUIET_QUEUE_MAX = 64
+
+/** The event whose handler is a store's "refresh in place" (the SDK sync
+ *  client emits it on a genuine reconnect; every syncing store answers it). */
+const REVALIDATE_EVENT = 'sync:reconnect'
+
 /** Base toolkit passed to `init` (plus `actions`, added in StoreConfig). */
 export interface StoreInitCtx<State> {
   set: StoreSet<State>
   get: () => State
-  /** Subscribe to an app event (auto-grouped by the store name, auto-cleaned). */
+  /** Subscribe to an app event (auto-grouped by the store name, auto-cleaned).
+   *  Deferred while the store is quiet unless `{ whileQuiet: 'run' }`. */
   on: <K extends keyof AppEvents>(
     event: K,
     handler: EventHandler<AppEvents[K]>,
+    opts?: QuietOption,
   ) => void
   /** React to another store's slice (replaces raw `useX.subscribe`, auto-cleaned).
-   *  Fires immediately by default. */
+   *  Fires immediately by default. Parked while quiet unless
+   *  `{ whileQuiet: 'run' }`. */
   watch: <S, U>(
     store: Subscribable<S>,
     selector: (s: S) => U,
     cb: (value: U, prev: U) => void,
-    opts?: { fireImmediately?: boolean; equalityFn?: (a: U, b: U) => boolean },
+    opts?: { fireImmediately?: boolean; equalityFn?: (a: U, b: U) => boolean } & QuietOption,
   ) => void
   /** Register an arbitrary teardown to run on store destroy — the escape hatch
    *  for imperative resources (an SSE AbortController, a timer) that aren't an
    *  `on`/`watch` subscription. Runs alongside the auto-cleaned listeners. */
   onCleanup: (fn: () => void) => void
+  /** Is the store quiet right now (pinned, nothing renders it)? A timer or a
+   *  poll checks this and skips its tick. */
+  isQuiet: () => boolean
+  /** Run `fn` each time the store is shown again after being quiet (after the
+   *  deferred queue replayed). Auto-cleaned on destroy. */
+  onWake: (fn: (info: StoreWakeInfo) => void) => void
 }
 
 // ============================================================================
@@ -383,6 +463,8 @@ export interface StoreConfig<
 /** Internal lifecycle keys the Stores proxy already understands. */
 interface Lifecycle {
   __init__: { __store__: () => void }
+  /** The proxy's visibility facts (render refs / owner pins) — see stores.ts. */
+  __visibility__: (v: StoreVisibility) => void
   // May be async: the callers fire-and-forget it (React cleanup ignores the
   // return; the global ref-count teardown `.catch()`es a returned Promise), so a
   // store whose teardown awaits a lazy action (e.g. Chat saving pane state before
@@ -407,6 +489,120 @@ export type BoundStore<FullState> = UseBoundStore<
 export interface StoreHandle<FullState> {
   name: string
   store: BoundStore<FullState>
+}
+
+/** A deferred event's dedupe key component: the payload, serialized when it
+ *  can be (two identical sync frames collapse into one replay). */
+function payloadKey(data: unknown): string {
+  if (data === undefined) return ''
+  try {
+    return JSON.stringify(data) ?? ''
+  } catch {
+    return '?'
+  }
+}
+
+/** Run one replayed handler the way the EventBus runs it: a throw or a
+ *  rejection is logged and never escapes into the render that woke it. */
+function runIsolated(fn: () => unknown, what: string): void {
+  try {
+    const out = fn()
+    if (out && typeof (out as Promise<unknown>).then === 'function') {
+      ;(out as Promise<unknown>).catch(err => console.error(`[store-kit] ${what} failed`, err))
+    }
+  } catch (err) {
+    console.error(`[store-kit] ${what} failed`, err)
+  }
+}
+
+interface DeferredItem {
+  key: string
+  /** The event name (`null` for a parked `watch`). */
+  event: string | null
+  run: () => void
+}
+
+/** One store's quiet bookkeeping (see "Quiet while hidden" above). */
+function createQuietState() {
+  const st = {
+    quiet: false,
+    visible: false,
+    /** When the store went quiet (null = not hidden-while-pinned). */
+    hiddenSince: null as number | null,
+    /** Events were lost (queue overflow, or released while hidden). */
+    staleOnShow: false,
+    queue: [] as DeferredItem[],
+    handlers: new Map<string, EventHandler<any>>(),
+    wakeFns: [] as Array<(info: StoreWakeInfo) => void>,
+    nextWatchId: 0,
+    defer(key: string, event: string | null, run: () => void): void {
+      const at = st.queue.findIndex(q => q.key === key)
+      if (at >= 0) st.queue.splice(at, 1)
+      st.queue.push({ key, event, run })
+      if (st.queue.length > QUIET_QUEUE_MAX) {
+        st.queue.length = 0
+        st.staleOnShow = true
+      }
+    },
+    visibility(v: StoreVisibility): void {
+      const wasVisible = st.visible
+      const wasQuiet = st.quiet
+      st.visible = v.visible
+      st.quiet = v.pinned && !v.visible
+      if (!wasQuiet && st.quiet) {
+        st.hiddenSince = Date.now()
+        return
+      }
+      if (wasQuiet && !st.quiet && !v.visible) {
+        // RELEASED while hidden (the last pin let go): nothing is deferred
+        // any more, so what was queued is folded into one revalidation for
+        // the moment the store is shown again (or dropped by its destroy).
+        if (st.queue.length > 0) {
+          st.queue.length = 0
+          st.staleOnShow = true
+        }
+        return
+      }
+      if (!wasVisible && v.visible) st.wake()
+    },
+    wake(): void {
+      // Shown for the first time, or shown again after an UNPINNED absence
+      // (the ordinary destroy grace): nothing was deferred, nothing to do.
+      if (st.hiddenSince === null && !st.staleOnShow && st.queue.length === 0) return
+      const now = Date.now()
+      const hiddenMs = st.hiddenSince === null ? 0 : now - st.hiddenSince
+      const windowPassed = st.hiddenSince !== null && hiddenMs >= quietPolicy.revalidateAfterMs
+      const stale = st.staleOnShow || windowPassed
+      st.hiddenSince = null
+      st.staleOnShow = false
+      const revalidate = stale ? st.handlers.get(REVALIDATE_EVENT) : undefined
+      // A revalidation supersedes every queued sync frame (it refetches all
+      // of them); everything else replays in arrival order.
+      const queue = st.queue
+        .splice(0)
+        .filter(q => !(revalidate && q.event !== null && q.event.startsWith('sync:')))
+      for (const item of queue) runIsolated(item.run, 'deferred handler')
+      if (revalidate) {
+        runIsolated(
+          () => revalidate({ type: REVALIDATE_EVENT, data: {}, timestamp: now } as never),
+          'revalidation',
+        )
+      }
+      if (st.wakeFns.length === 0) return
+      const info: StoreWakeInfo = { hiddenMs, stale, replayed: queue.length }
+      for (const fn of st.wakeFns) runIsolated(() => fn(info), 'onWake')
+    },
+    reset(): void {
+      st.quiet = false
+      st.visible = false
+      st.hiddenSince = null
+      st.staleOnShow = false
+      st.queue.length = 0
+      st.handlers.clear()
+      st.wakeFns.length = 0
+    },
+  }
+  return st
 }
 
 /** Build the state object + wire the auto-cleanup lifecycle. Shared by the
@@ -451,27 +647,66 @@ function makeBuilder<State extends object, Actions extends object>(
       }
     }
     const cleanups: Unsubscribe[] = []
+    const quiet = createQuietState()
     const ctx: StoreInitCtx<State> & { actions: Actions } = {
       set,
       get,
       // init sees eager actions AND the lazy dispatchers (so `init` can kick off
       // a lazy loader on first access — it loads that action's chunk on demand).
       actions: { ...actions, ...lazyDispatchers } as Actions,
-      on: (event, handler) => {
+      on: (event, handler, opts) => {
         const busOn = useEventBusStore.getState().on as (
           e: string,
           h: EventHandler<any>,
           g?: string,
         ) => Unsubscribe
-        cleanups.push(busOn(event as string, handler as EventHandler<any>, groupName))
+        const raw = handler as EventHandler<any>
+        const name = event as string
+        // The bus dedupes per `group::event`, so this store has ONE handler per
+        // event — the one the revalidation calls.
+        quiet.handlers.set(name, raw)
+        const runQuiet = opts?.whileQuiet === 'run'
+        const wrapped: EventHandler<any> = ev => {
+          if (quiet.quiet && !runQuiet) {
+            quiet.defer(`${name}|${payloadKey((ev as { data?: unknown } | undefined)?.data)}`, name, () =>
+              raw(ev),
+            )
+            return
+          }
+          return raw(ev)
+        }
+        cleanups.push(busOn(name, wrapped, groupName))
       },
       watch: (store, selector, cb, opts) => {
-        cleanups.push(
-          (store.subscribe as any)(selector, cb, { fireImmediately: true, ...opts }),
-        )
+        const runQuiet = opts?.whileQuiet === 'run'
+        const eq = opts?.equalityFn ?? Object.is
+        const key = `watch|${quiet.nextWatchId++}`
+        let parked: { value: any; prev: any } | null = null
+        const wrapped = (value: any, prev: any) => {
+          if (quiet.quiet && !runQuiet) {
+            parked = parked ? { value, prev: parked.prev } : { value, prev }
+            quiet.defer(key, null, () => {
+              const p = parked
+              parked = null
+              if (p && !eq(p.value, p.prev)) cb(p.value, p.prev)
+            })
+            return
+          }
+          cb(value, prev)
+        }
+        // zustand's own options only (`whileQuiet` is the kit's, not the store's).
+        const subscribeOpts: { fireImmediately: boolean; equalityFn?: (a: any, b: any) => boolean } = {
+          fireImmediately: opts?.fireImmediately ?? true,
+        }
+        if (opts?.equalityFn) subscribeOpts.equalityFn = opts.equalityFn
+        cleanups.push((store.subscribe as any)(selector, wrapped, subscribeOpts))
       },
       onCleanup: fn => {
         cleanups.push(fn)
+      },
+      isQuiet: () => quiet.quiet,
+      onWake: fn => {
+        quiet.wakeFns.push(fn)
       },
     }
     return {
@@ -495,6 +730,12 @@ function makeBuilder<State extends object, Actions extends object>(
           }
         })
         useEventBusStore.getState().removeGroupListeners(groupName)
+        // A destroyed store re-runs `init` on its next access: nothing deferred
+        // survives (the re-init's own load is the fresh answer).
+        quiet.reset()
+      },
+      __visibility__: (v: StoreVisibility) => {
+        quiet.visibility(v)
       },
     } as FullStoreState<State, Actions>
   }

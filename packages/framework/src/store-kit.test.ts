@@ -111,3 +111,184 @@ test('TEST-17: #659 — mixing eager and lazy actions on one store reorders neit
   assert.deepEqual(executed, ['eager-bump', 'lazy-a', 'lazy-b'])
   assert.equal(p.$.n, 1)
 })
+
+// ── Quiet while hidden (history-pinned stores) ──────────────────────────────
+// A pinned store nothing renders is QUIET: its `on`/`watch` handlers are
+// deferred, replayed once when it is shown again; past the app's revalidate
+// window its own `sync:reconnect` handler runs once as the revalidation.
+
+import { pinStore, unpinStore } from './stores.ts'
+import { setQuietPolicy } from './store-kit.ts'
+import { useEventBusStore } from './events/index.ts'
+
+let quietSeq = 0
+function mkQuietStore(opts: { runWhileQuiet?: boolean } = {}) {
+  const log: string[] = []
+  const wakes: any[] = []
+  let isQuiet: () => boolean = () => false
+  const h = defineStore(`QuietProbe${quietSeq++}`, {
+    state: { v: 0 },
+    actions: set => ({ setV: (v: number) => set(() => ({ v })) }),
+    init: ({ on, onWake, isQuiet: q }) => {
+      isQuiet = q
+      on('sync:series' as never, ((e: any) => {
+        log.push(`series:${e.data.id}`)
+      }) as never)
+      on('sync:reconnect' as never, (() => {
+        log.push('reconnect')
+      }) as never)
+      on('app:other' as never, ((e: any) => {
+        log.push(`other:${e.data.n}`)
+      }) as never, opts.runWhileQuiet ? { whileQuiet: 'run' } : undefined)
+      onWake(info => {
+        wakes.push(info)
+      })
+    },
+  })
+  const p: any = createStoreProxy(h.store as any)
+  // First access runs init (the proxy's latch) — a hook-free special does not,
+  // so touch an action.
+  p.setV(0)
+  return { p, rt: p.__refTracker, log, wakes, quiet: () => isQuiet() }
+}
+
+const emit = (type: string, data: unknown) =>
+  useEventBusStore.getState().emit({ type, data } as never)
+
+test('QUIET-1: a pinned, hidden store defers its handlers and replays them ONCE (deduped) when shown', async () => {
+  setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
+  const { p, rt, log, wakes, quiet } = mkQuietStore()
+  rt.addRef('v')
+  pinStore(p, 'entry')
+  await emit('sync:series', { id: 'a' })
+  assert.deepEqual(log, ['series:a'])
+  rt.removeRef('v')
+  assert.equal(quiet(), true)
+  await emit('sync:series', { id: 'b' })
+  await emit('sync:series', { id: 'b' })
+  await emit('app:other', { n: 1 })
+  // Hidden: nothing ran.
+  assert.deepEqual(log, ['series:a'])
+  rt.addRef('v')
+  assert.equal(quiet(), false)
+  // Shown: the queue replays once, in arrival order, the duplicate collapsed.
+  assert.deepEqual(log, ['series:a', 'series:b', 'other:1'])
+  assert.equal(wakes.length, 1)
+  assert.equal(wakes[0].stale, false)
+  assert.equal(wakes[0].replayed, 2)
+  unpinStore(p, 'entry')
+})
+
+test('QUIET-2: past the revalidate window the store revalidates ONCE via its own sync:reconnect handler (queued sync frames superseded)', async t => {
+  setQuietPolicy({ revalidateAfterMs: 1000 })
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
+  try {
+    const { p, rt, log, wakes } = mkQuietStore()
+    rt.addRef('v')
+    pinStore(p, 'entry')
+    rt.removeRef('v')
+    await emit('sync:series', { id: 'z' })
+    await emit('app:other', { n: 7 })
+    t.mock.timers.tick(1500)
+    rt.addRef('v')
+    assert.deepEqual(log, ['other:7', 'reconnect'])
+    assert.equal(wakes[0].stale, true)
+    assert.ok(wakes[0].hiddenMs >= 1500)
+    unpinStore(p, 'entry')
+  } finally {
+    setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
+  }
+})
+
+test('QUIET-3: inside the window and with nothing queued, showing a pinned store fetches nothing', async t => {
+  setQuietPolicy({ revalidateAfterMs: 60_000 })
+  t.mock.timers.enable({ apis: ['Date'], now: 5_000_000 })
+  try {
+    const { p, rt, log, wakes } = mkQuietStore()
+    rt.addRef('v')
+    pinStore(p, 'entry')
+    rt.removeRef('v')
+    t.mock.timers.tick(30_000)
+    rt.addRef('v')
+    assert.deepEqual(log, [])
+    assert.equal(wakes[0].stale, false)
+    unpinStore(p, 'entry')
+  } finally {
+    setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
+  }
+})
+
+test("QUIET-4: { whileQuiet: 'run' } runs while hidden; an unpinned hidden store is not quiet", async () => {
+  const { p, rt, log } = mkQuietStore({ runWhileQuiet: true })
+  rt.addRef('v')
+  pinStore(p, 'entry')
+  rt.removeRef('v')
+  await emit('app:other', { n: 2 })
+  assert.deepEqual(log, ['other:2'])
+  unpinStore(p, 'entry')
+  // Released: no pin, nothing renders → not quiet → handled immediately.
+  await emit('sync:series', { id: 'q' })
+  assert.deepEqual(log, ['other:2', 'series:q'])
+  rt.executeDestroy()
+})
+
+test('QUIET-5: released while hidden with events queued → the next show revalidates even inside the window', async () => {
+  setQuietPolicy({ revalidateAfterMs: 60_000 })
+  try {
+    const { p, rt, log } = mkQuietStore()
+    rt.addRef('v')
+    pinStore(p, 'entry')
+    rt.removeRef('v')
+    await emit('sync:series', { id: 'lost' })
+    unpinStore(p, 'entry')
+    assert.deepEqual(log, [])
+    rt.addRef('v')
+    assert.deepEqual(log, ['reconnect'])
+  } finally {
+    setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
+  }
+})
+
+test('QUIET-6: a parked watch replays once with the first prev and the latest value — and not at all when the value came back', () => {
+  const src = defineStore(`QuietSrc${quietSeq++}`, { state: { k: 1 } })
+  const calls: Array<[number, number]> = []
+  const h = defineStore(`QuietWatch${quietSeq++}`, {
+    state: { v: 0 },
+    actions: set => ({ setV: (v: number) => set(() => ({ v })) }),
+    init: ({ watch }) => {
+      watch(src.store as any, (s: any) => s.k, (value: number, prev: number) => {
+        calls.push([value, prev])
+      })
+    },
+  })
+  const p: any = createStoreProxy(h.store as any)
+  p.setV(0)
+  const rt = p.__refTracker
+  rt.addRef('v')
+  pinStore(p, 'e')
+  rt.removeRef('v')
+  const fired = calls.length // fireImmediately
+  src.store.setState({ k: 2 })
+  src.store.setState({ k: 3 })
+  assert.equal(calls.length, fired)
+  rt.addRef('v')
+  assert.deepEqual(calls.slice(fired), [[3, 1]])
+  // Hidden again: 3 → 4 → 3 is no change at all.
+  rt.removeRef('v')
+  src.store.setState({ k: 4 })
+  src.store.setState({ k: 3 })
+  rt.addRef('v')
+  assert.deepEqual(calls.slice(fired), [[3, 1]])
+  unpinStore(p, 'e')
+})
+
+test('QUIET-7: a destroy drops the queue (the re-init is the fresh answer)', async () => {
+  const { p, rt, log } = mkQuietStore()
+  rt.addRef('v')
+  pinStore(p, 'entry')
+  rt.removeRef('v')
+  await emit('app:other', { n: 9 })
+  rt.executeDestroy()
+  unpinStore(p, 'entry')
+  assert.deepEqual(log, [])
+})

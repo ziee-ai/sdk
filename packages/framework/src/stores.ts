@@ -24,12 +24,85 @@ const IS_DEV = ((): boolean => {
 // Default delay before destroying a store (5 seconds)
 const DEFAULT_DESTROY_DELAY_MS = 5000
 
+// ============================================================================
+// Pins — an OWNER-held reference that is not a render read.
+//
+// The render ref-count answers "is a component showing this store right now?".
+// An app can know something the render tree cannot: that a page the user just
+// LEFT is still one Back (or Forward) away. A pin is that knowledge, stated as
+// a reference: `pinStore(proxy, owner)` keeps the store alive while ANY owner
+// holds it, exactly the way a render ref does — a store is destroyed only when
+// it has no render refs AND no pins. Unpinning the last owner while nothing
+// renders the store resumes the ordinary delayed destroy.
+//
+// A pinned store that nothing renders is QUIET: the proxy tells the store
+// (`__visibility__`, below) and the store-kit defers its event handlers until
+// it is shown again (see `store-kit.ts`, "Quiet while hidden"). The SDK owns
+// the mechanism only; WHICH stores an app pins, and for how long, is app policy.
+// ============================================================================
+
+/** The visibility facts the proxy hands a store whenever either changes:
+ *  `visible` = at least one render ref; `pinned` = at least one owner pin. */
+export interface StoreVisibility {
+  visible: boolean
+  pinned: boolean
+}
+
+/** Observes every store's render activity (0 → ≥1 render refs = active,
+ *  ≥1 → 0 = inactive). ONE app-installed observer — the hook an app uses to
+ *  learn which stores the page it is showing actually rendered. */
+export type StoreActivityObserver = (proxy: object, active: boolean, name: string | null) => void
+
+let activityObserver: StoreActivityObserver | null = null
+
+/** Install (or clear, with `null`) the store-activity observer. */
+export function setStoreActivityObserver(observer: StoreActivityObserver | null): void {
+  activityObserver = observer
+}
+
+/** Every proxy that currently holds ≥1 render ref (an observer installed after
+ *  boot needs the stores that were ALREADY on screen). */
+const liveProxies = new Set<object>()
+
+/** The proxies currently rendered somewhere (a snapshot copy). */
+export function liveStoreProxies(): object[] {
+  return [...liveProxies]
+}
+
+function trackerOf(proxy: object): ReferenceTracker | null {
+  const t = (proxy as { __refTracker?: ReferenceTracker }).__refTracker
+  return t && typeof t.pin === 'function' ? t : null
+}
+
+/** Pin `proxy` on behalf of `owner` (idempotent per owner). A pinned store is
+ *  never destroyed; a pending destroy is cancelled. Returns false when the
+ *  value is not a store proxy. */
+export function pinStore(proxy: object, owner: string): boolean {
+  const t = trackerOf(proxy)
+  if (!t) return false
+  t.pin(owner)
+  return true
+}
+
+/** Release `owner`'s pin. When it was the last pin and nothing renders the
+ *  store, the ordinary delayed destroy is scheduled. */
+export function unpinStore(proxy: object, owner: string): void {
+  trackerOf(proxy)?.unpin(owner)
+}
+
 // Reference tracking interface
 export interface ReferenceTracker {
   counts: Map<string | symbol, number>
   totalCount: number
   destroyTimeoutId: NodeJS.Timeout | null
   destroyed: boolean
+  /** The owners currently pinning this store (see `pinStore`). */
+  pins: Set<string>
+  /** The registered store name, when `registerLazyStore` built the proxy. */
+  name: string | null
+  pin: (owner: string) => void
+  unpin: (owner: string) => void
+  isPinned: () => boolean
   addRef: (prop: string | symbol) => void
   removeRef: (prop: string | symbol) => void
   hasRefs: () => boolean
@@ -104,6 +177,31 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
 ): Readonly<ExtractZustandState<T>> => {
   const propInitCheck = new Map<string | symbol, boolean>()
   let storeInitialized = false
+  // The proxy object itself (assigned below) — the identity the activity
+  // observer and the pin API key on.
+  let self: object = {}
+  // The last visibility pair handed to the store (`__visibility__`), so a
+  // store hears each CHANGE once.
+  let lastVisible = false
+  let lastPinned = false
+
+  // Tell the store when it becomes shown / hidden / pinned / unpinned. The
+  // store-kit uses this to keep a pinned-but-hidden store QUIET. A store
+  // without the hook (a raw zustand store) is unaffected.
+  const notifyVisibility = (): void => {
+    const visible = refTracker.totalCount > 0
+    const pinned = refTracker.pins.size > 0
+    if (visible === lastVisible && pinned === lastPinned) return
+    lastVisible = visible
+    lastPinned = pinned
+    const state = useStore.getState() as { __visibility__?: (v: StoreVisibility) => void } | undefined
+    if (!state || typeof state.__visibility__ !== 'function') return
+    try {
+      state.__visibility__({ visible, pinned })
+    } catch (err) {
+      console.error('Store __visibility__ error:', err)
+    }
+  }
 
   // Reference tracking with delayed destruction
   const refTracker: ReferenceTracker = {
@@ -132,6 +230,11 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
       const current = refTracker.counts.get(prop) || 0
       refTracker.counts.set(prop, current + 1)
       refTracker.totalCount++
+      if (refTracker.totalCount === 1) {
+        liveProxies.add(self)
+        activityObserver?.(self, true, refTracker.name)
+      }
+      notifyVisibility()
     },
 
     removeRef: (prop: string | symbol) => {
@@ -140,14 +243,47 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
         refTracker.counts.set(prop, current - 1)
         refTracker.totalCount--
 
-        // Schedule destruction when no active references
         if (refTracker.totalCount === 0) {
-          refTracker.scheduleDestroy()
+          liveProxies.delete(self)
+          activityObserver?.(self, false, refTracker.name)
+          // Schedule destruction when no active references — and no owner
+          // still pins the store (a pinned store is kept, quiet).
+          if (refTracker.pins.size === 0) {
+            refTracker.scheduleDestroy()
+          }
         }
+        notifyVisibility()
       }
     },
 
     hasRefs: () => refTracker.totalCount > 0,
+
+    pins: new Set<string>(),
+    name: null,
+
+    pin: (owner: string) => {
+      if (refTracker.pins.has(owner)) return
+      refTracker.pins.add(owner)
+      // A pin is a reference: a pending destroy is cancelled exactly as a
+      // render ref cancels it.
+      refTracker.cancelDestroy()
+      notifyVisibility()
+    },
+
+    unpin: (owner: string) => {
+      if (!refTracker.pins.delete(owner)) return
+      if (
+        refTracker.pins.size === 0 &&
+        refTracker.totalCount === 0 &&
+        !refTracker.destroyed &&
+        refTracker.destroyTimeoutId === null
+      ) {
+        refTracker.scheduleDestroy()
+      }
+      notifyVisibility()
+    },
+
+    isPinned: () => refTracker.pins.size > 0,
 
     scheduleDestroy: () => {
       const state = useStore.getState()
@@ -246,11 +382,17 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
 
     reset: () => {
       // Reset initialization flags for re-initialization
+      // Pins are OWNER references, not render reads: they survive a reset.
       propInitCheck.clear()
       storeInitialized = false
       refTracker.destroyed = false
+      if (refTracker.totalCount > 0) {
+        liveProxies.delete(self)
+        activityObserver?.(self, false, refTracker.name)
+      }
       refTracker.totalCount = 0
       refTracker.counts.clear()
+      notifyVisibility()
 
       if (IS_DEV) {
         console.log('🔄 Store tracker reset for re-initialization')
@@ -258,7 +400,7 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
     },
   }
 
-  return new Proxy({} as Readonly<ExtractZustandState<T>>, {
+  const proxy = new Proxy({} as Readonly<ExtractZustandState<T>>, {
     get: (_, prop) => {
       // Special properties.
       // `$` is the SOLE handler-side snapshot escape: `Stores.X.$.field`
@@ -337,6 +479,8 @@ export const createStoreProxy = <T extends UseBoundStore<StoreApi<any>>>(
       )
     },
   })
+  self = proxy
+  return proxy
 }
 
 // ============================================================================
@@ -394,6 +538,7 @@ export function registerLazyStore<
   H extends { name: string; store: UseBoundStore<StoreApi<any>> },
 >(handle: H): StoreProxy<ExtractZustandState<H['store']>> {
   const proxy = createStoreProxy(handle.store)
+  ;(proxy as unknown as { __refTracker: ReferenceTracker }).__refTracker.name = handle.name
   useModuleSystemStore.getState().registerStore(handle.name, proxy as any)
   return proxy as StoreProxy<ExtractZustandState<H['store']>>
 }
