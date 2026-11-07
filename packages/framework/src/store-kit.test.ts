@@ -360,3 +360,29 @@ test('QUIET-9: releasing a hidden store folds its queued EVENTS into a revalidat
     setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
   }
 })
+
+test('QUIET-10: a parked watch edge is dropped when a NEWER edge runs directly after a release — never replayed out of order', () => {
+  const src = defineStore(`QuietOrderSrc${quietSeq++}`, { state: { k: 'A' } })
+  const calls: string[] = []
+  const h = defineStore(`QuietOrder${quietSeq++}`, {
+    state: { v: 0 },
+    actions: set => ({ setV: (v: number) => set(() => ({ v })) }),
+    init: ({ watch }) => {
+      watch(src.store as any, (s: any) => s.k, (value: string, prev: string) => {
+        calls.push(`${prev}->${value}`)
+      }, { fireImmediately: false })
+    },
+  })
+  const p: any = createStoreProxy(h.store as any)
+  p.setV(0)
+  const rt = p.__refTracker
+  rt.addRef('v')
+  pinStore(p, 'e')
+  rt.removeRef('v')
+  src.store.setState({ k: 'B' }) // parked while quiet
+  unpinStore(p, 'e') // released while hidden
+  src.store.setState({ k: 'C' }) // a newer edge, run directly
+  rt.addRef('v') // shown inside the destroy grace
+  assert.deepEqual(calls, ['B->C'])
+  rt.executeDestroy()
+})

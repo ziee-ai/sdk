@@ -545,6 +545,10 @@ function createQuietState() {
       st.queue.push({ key, event, run })
       if (st.queue.length > QUIET_QUEUE_MAX) st.fold()
     },
+    unqueue(key: string): void {
+      const at = st.queue.findIndex(q => q.key === key)
+      if (at >= 0) st.queue.splice(at, 1)
+    },
     /** Fold the queued EVENTS into one revalidation-on-show. Parked `watch`
      *  callbacks are kept: they carry a value change no revalidation replays
      *  (an auth/permission edge), and each is one entry, deduped by key. */
@@ -698,6 +702,12 @@ function makeBuilder<State extends object, Actions extends object>(
               if (p && !eq(p.value, p.prev)) cb(p.value, p.prev)
             })
             return
+          }
+          // Not quiet any more (released while hidden): a parked replay of an
+          // OLDER edge must never run after this newer one.
+          if (parked) {
+            parked = null
+            quiet.unqueue(key)
           }
           cb(value, prev)
         }
