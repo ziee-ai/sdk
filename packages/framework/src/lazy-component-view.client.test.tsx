@@ -6,7 +6,7 @@
 // Suspense fallback for a frame. A loader recorded with `primeLazyLoader`
 // renders its component in the FIRST commit — no fallback; an unprimed one
 // keeps today's lazy path (the fallback first).
-import { act } from 'react'
+import { act, Component, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RenderComponentLike, primeLazyLoader } from './lazy-component-view'
@@ -49,5 +49,59 @@ describe('RenderComponentLike — a primed loader never shows its fallback', () 
     await settled
     const loader = markLazyLoader(() => settled)
     expect(firstCommit(loader)).toContain('FALLBACK')
+  })
+})
+
+// fix/preload-storm: a lazy type whose load REJECTED is rejected forever (React
+// caches the status on the type). The cache must not keep it, or one failed
+// chunk fetch — a background warm that lost to ERR_INSUFFICIENT_RESOURCES —
+// leaves that slot / route broken for the life of the page.
+
+class Boundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false }
+  static getDerivedStateFromError() {
+    return { failed: true }
+  }
+  render() {
+    return this.state.failed ? <b>BOUNDARY</b> : this.props.children
+  }
+}
+
+describe('RenderComponentLike — a rejected load is not cached', () => {
+  it('after a failed load, the next mount calls the loader again and renders', async () => {
+    let calls = 0
+    const loader = markLazyLoader(() => {
+      calls += 1
+      return calls === 1
+        ? Promise.reject(new TypeError('Failed to fetch dynamically imported module: x.js'))
+        : Promise.resolve({ default: Page })
+    })
+    const mount = async () => {
+      host?.remove()
+      act(() => root?.unmount())
+      host = document.createElement('div')
+      document.body.appendChild(host)
+      root = createRoot(host)
+      await act(async () => {
+        root!.render(
+          <Boundary>
+            <RenderComponentLike component={loader} fallback={<i>FALLBACK</i>} />
+          </Boundary>,
+        )
+      })
+      await act(async () => {
+        await new Promise(r => setTimeout(r, 0))
+      })
+      return host.innerHTML
+    }
+    const origError = console.error
+    console.error = () => undefined
+    try {
+      expect(await mount()).toContain('BOUNDARY')
+      expect(await mount()).toContain('PAGE')
+      expect(calls).toBe(2)
+    } finally {
+      console.error = origError
+    }
   })
 })

@@ -78,3 +78,9 @@ export function onNetworkIdle(cb: () => void): void {
   if (document.readyState === 'complete') begin()
   else window.addEventListener('load', begin, { once: true })
 }
+
+/** How many counted (non-SSE) api-client requests are in flight right now —
+ *  a background warm scheduler pauses while the page's own requests run. */
+export function networkInFlight(): number {
+  return inFlight
+}

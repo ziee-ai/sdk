@@ -14,6 +14,7 @@ import { useEventBusStore } from './events'
 import type { AppEvents, EventHandler, Unsubscribe } from './events/types'
 import { createStoreProxy, type StoreProxy, type StoreVisibility } from './stores'
 import { onNetworkIdle } from './net-idle'
+import { getWarmScheduler } from './warm-scheduler'
 import { createLazyActionSequencer, createLazyDispatcher } from './lazy-dispatch'
 import { isStaleBuild } from './chunk-recovery'
 import {
@@ -368,10 +369,31 @@ const STORE_PREFETCH_ENABLED = ((): boolean => {
  *  interactions are instant — with NO per-store `.preload()` wiring. Actions already
  *  invoked in `init` (hot) are a cached no-op; the rest fetch in the background.
  *  Gated by the `VITE_STORE_PREFETCH=off` compile-time flag (see above). */
-function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
-  if (!STORE_PREFETCH_ENABLED) return
+function autoWarmLazyActions(
+  storeName: string,
+  lazyDispatchers: Record<string, any>,
+  enabled: boolean = STORE_PREFETCH_ENABLED,
+): void {
+  if (!enabled) return
   const keys = Object.keys(lazyDispatchers)
   if (!keys.length) return
+  // An app-installed scheduler owns the timing, the cap and the order
+  // (`warm-scheduler.ts`): hand it one task per action and stop. The task
+  // re-checks the stale-build mark when it actually RUNS, which may be long
+  // after this init.
+  const scheduler = getWarmScheduler()
+  if (scheduler) {
+    for (const k of keys) {
+      scheduler(
+        () => {
+          if (isStaleBuild()) return undefined
+          return lazyDispatchers[k].preload?.()
+        },
+        { source: 'store-actions', key: `${storeName}.${k}` },
+      )
+    }
+    return
+  }
   // Wait for the page's CRITICAL api-client calls to finish (network-idle after
   // load) BEFORE warming, so the prefetch never competes with them for the
   // browser's connections — THEN schedule the actual preloads on a main-thread
@@ -415,6 +437,15 @@ function autoWarmLazyActions(lazyDispatchers: Record<string, any>): void {
       }
     }),
   )
+}
+
+/** TEST SEAM ONLY — the warm with the compile-time flag forced on (under
+ *  `node --test` the flag is `false`: there is no bundler to inline it). */
+export function __autoWarmLazyActionsForTests(
+  storeName: string,
+  lazyDispatchers: Record<string, any>,
+): void {
+  autoWarmLazyActions(storeName, lazyDispatchers, true)
 }
 
 export interface StoreConfig<
@@ -740,7 +771,7 @@ function makeBuilder<State extends object, Actions extends object>(
           config.init?.(ctx)
           // Auto-warm this store's lazy-action chunks on idle — every store's
           // interactions become instant with ZERO per-store preload boilerplate.
-          autoWarmLazyActions(lazyDispatchers)
+          autoWarmLazyActions(groupName, lazyDispatchers)
         },
       },
       __destroy__: () => {

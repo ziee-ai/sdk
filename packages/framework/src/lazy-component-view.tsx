@@ -44,12 +44,24 @@ function recordResolved(loader: LazyLoader, mod: unknown): void {
 function getCachedLazy(loader: LazyLoader): ComponentType<any> {
   let Lazy = lazyCache.get(loader)
   if (!Lazy) {
-    Lazy = lazy(() =>
-      loader().then(mod => {
-        recordResolved(loader, mod)
-        return mod
-      }),
+    const created = lazy(() =>
+      loader().then(
+        mod => {
+          recordResolved(loader, mod)
+          return mod
+        },
+        err => {
+          // A lazy type whose load REJECTED is rejected forever (React caches
+          // the status on the type). Evict it, so the next mount — the error
+          // boundary's retry, the next navigation — builds a fresh type and
+          // calls the loader again instead of re-throwing a stale failure for
+          // the life of the page.
+          if (lazyCache.get(loader) === created) lazyCache.delete(loader)
+          throw err
+        },
+      ),
     )
+    Lazy = created
     lazyCache.set(loader, Lazy)
   }
   return Lazy

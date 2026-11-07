@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
 import { routesSeam } from '@ziee/framework'
+import { getWarmScheduler } from '@ziee/framework/warm-scheduler'
 import { authStoreProxy, hasPermissionNow } from '@ziee/framework/permissions'
 import type { PermissionExpr } from '@ziee/framework/permissions'
 import { selectPrefetchRoutes, type PrefetchRoute } from './prefetch-selection'
@@ -72,6 +73,39 @@ export function usePrefetchModules() {
           // Prefetch is best-effort by definition.
         }
       }
+    }
+
+    // An app-installed warm scheduler (`@ziee/framework/warm-scheduler`) owns
+    // the timing, the concurrency cap and the order: hand it one task per
+    // route instead of firing every route's import in one idle callback. The
+    // selection is the same pure policy, taken now; the scheduler dedupes by
+    // route path when this effect re-runs on a later registration wave.
+    const scheduler = getWarmScheduler()
+    if (scheduler) {
+      const selected = selectPrefetchRoutes({
+        routes,
+        isAuthed,
+        pathname: typeof window !== 'undefined' ? window.location.pathname : '',
+        hasPermission: permission =>
+          hasPermissionNow(permission as PermissionExpr),
+      })
+      for (const route of selected) {
+        scheduler(
+          () => {
+            const started = (route.element as () => unknown)()
+            if (
+              started !== null &&
+              typeof started === 'object' &&
+              typeof (started as { catch?: unknown }).catch === 'function'
+            ) {
+              return (started as Promise<unknown>).catch(() => {})
+            }
+            return started
+          },
+          { source: 'route', key: route.path ?? '', path: route.path },
+        )
+      }
+      return
     }
 
     // Gate 3: true idle, no forced timeout (don't preempt boot fetches).
