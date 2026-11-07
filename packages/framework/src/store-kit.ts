@@ -703,11 +703,16 @@ function makeBuilder<State extends object, Actions extends object>(
             })
             return
           }
-          // Not quiet any more (released while hidden): a parked replay of an
-          // OLDER edge must never run after this newer one.
+          // Not quiet any more (released while hidden): the parked OLDER edge
+          // is folded into this newer one — never replayed after it — and the
+          // consumer sees one edge from the value it last OBSERVED (A→B parked,
+          // then B→C runs as A→C; a return to A is no edge at all).
           if (parked) {
+            const from = parked.prev
             parked = null
             quiet.unqueue(key)
+            if (!eq(value, from)) cb(value, from)
+            return
           }
           cb(value, prev)
         }

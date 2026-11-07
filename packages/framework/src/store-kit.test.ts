@@ -417,6 +417,32 @@ test('QUIET-10: a parked watch edge is dropped when a NEWER edge runs directly a
   unpinStore(p, 'e') // released while hidden
   src.store.setState({ k: 'C' }) // a newer edge, run directly
   rt.addRef('v') // shown inside the destroy grace
-  assert.deepEqual(calls, ['B->C'])
+  assert.deepEqual(calls, ['A->C'], 'one edge, from the value the consumer last observed')
+  rt.executeDestroy()
+})
+
+test('QUIET-10: a value that RETURNS to what the consumer last observed (A→B parked, then B→A after a release) is no edge at all', () => {
+  const src = defineStore(`QuietBackSrc${quietSeq++}`, { state: { k: 'A' } })
+  const calls: string[] = []
+  const h = defineStore(`QuietBack${quietSeq++}`, {
+    state: { v: 0 },
+    actions: set => ({ setV: (v: number) => set(() => ({ v })) }),
+    init: ({ watch }) => {
+      watch(src.store as any, (s: any) => s.k, (value: string, prev: string) => {
+        calls.push(`${prev}->${value}`)
+      }, { fireImmediately: false })
+    },
+  })
+  const p: any = createStoreProxy(h.store as any)
+  p.setV(0)
+  const rt = p.__refTracker
+  rt.addRef('v')
+  pinStore(p, 'e')
+  rt.removeRef('v')
+  src.store.setState({ k: 'B' })
+  unpinStore(p, 'e')
+  src.store.setState({ k: 'A' })
+  rt.addRef('v')
+  assert.deepEqual(calls, [])
   rt.executeDestroy()
 })
