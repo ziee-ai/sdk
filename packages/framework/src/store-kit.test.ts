@@ -361,6 +361,40 @@ test('QUIET-9: releasing a hidden store folds its queued EVENTS into a revalidat
   }
 })
 
+test('QUIET-9: the EVENT half — sync frames queued while hidden are folded on release into ONE revalidation on show; none replays', async () => {
+  setQuietPolicy({ revalidateAfterMs: 60_000 })
+  try {
+    const log: string[] = []
+    const h = defineStore(`QuietFoldEv${quietSeq++}`, {
+      state: { v: 0 },
+      actions: set => ({ setV: (v: number) => set(() => ({ v })) }),
+      init: ({ on }) => {
+        on('sync:series' as never, ((e: { data: { id: string } }) => {
+          log.push(`series:${e.data.id}`)
+        }) as never)
+        on('sync:reconnect' as never, (() => {
+          log.push('reconnect')
+        }) as never)
+      },
+    })
+    const p: any = createStoreProxy(h.store as any)
+    p.setV(0)
+    const rt = p.__refTracker
+    rt.addRef('v')
+    pinStore(p, 'e')
+    rt.removeRef('v')
+    await emit('sync:series', { id: 'a' })
+    await emit('sync:series', { id: 'b' })
+    assert.deepEqual(log, [], 'quiet: nothing ran while hidden')
+    unpinStore(p, 'e') // released while hidden → folded
+    rt.addRef('v') // shown inside the destroy grace
+    assert.deepEqual(log, ['reconnect'])
+    rt.executeDestroy()
+  } finally {
+    setQuietPolicy({ revalidateAfterMs: Number.POSITIVE_INFINITY })
+  }
+})
+
 test('QUIET-10: a parked watch edge is dropped when a NEWER edge runs directly after a release — never replayed out of order', () => {
   const src = defineStore(`QuietOrderSrc${quietSeq++}`, { state: { k: 'A' } })
   const calls: string[] = []
