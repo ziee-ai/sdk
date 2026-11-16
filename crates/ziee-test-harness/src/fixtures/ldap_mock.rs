@@ -1,7 +1,7 @@
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage,
+    ContainerAsync, GenericImage, ImageExt,
 };
 
 /// LDAP mock server using rroemhild/test-openldap
@@ -33,24 +33,36 @@ impl LdapMockServer {
     /// - Base DN: dc=planetexpress,dc=com
     /// - Admin DN: cn=admin,dc=planetexpress,dc=com
     /// - Admin Password: GoodNewsEveryone
+    ///
+    /// The start is load-tolerant: it runs under the process-wide start gate
+    /// ([`super::mock_container::start_mock`]), re-attempts a testcontainers
+    /// StartupTimeout (bounded), and removes the timed-out container by the
+    /// unique per-attempt label it applies to the container at create time
+    /// (see [`super::mock_container`] — a StartupTimeout returns without a
+    /// `ContainerAsync`, so testcontainers' Drop-based removal never runs and
+    /// the container would leak).
     pub async fn start() -> Result<Self, Box<dyn std::error::Error>> {
-        // Use the test-openldap Docker image
-        let image = GenericImage::new("rroemhild/test-openldap", "latest")
-            .with_exposed_port(ContainerPort::Tcp(10389))
-            .with_wait_for(WaitFor::message_on_stderr("slapd starting"));
+        super::mock_container::start_mock("ldap mock", |attempt_label: String| async move {
+            // Use the test-openldap Docker image
+            let image = GenericImage::new("rroemhild/test-openldap", "latest")
+                .with_exposed_port(ContainerPort::Tcp(10389))
+                .with_wait_for(WaitFor::message_on_stderr("slapd starting"))
+                .with_label(super::mock_container::ATTEMPT_LABEL_KEY, attempt_label);
 
-        let container = image.start().await?;
-        let host = "127.0.0.1".to_string();
-        let port = container.get_host_port_ipv4(10389).await?;
+            let container = image.start().await?;
+            let host = "127.0.0.1".to_string();
+            let port = container.get_host_port_ipv4(10389).await?;
 
-        Ok(Self {
-            container,
-            host,
-            port,
-            bind_dn: "cn=admin,dc=planetexpress,dc=com".to_string(),
-            bind_password: "GoodNewsEveryone".to_string(),
-            base_dn: "dc=planetexpress,dc=com".to_string(),
+            Ok(Self {
+                container,
+                host,
+                port,
+                bind_dn: "cn=admin,dc=planetexpress,dc=com".to_string(),
+                bind_password: "GoodNewsEveryone".to_string(),
+                base_dn: "dc=planetexpress,dc=com".to_string(),
+            })
         })
+        .await
     }
 
     /// Get the LDAP URL

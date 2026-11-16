@@ -8999,6 +8999,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
+ "ldap3",
  "libc",
  "portpicker",
  "reqwest 0.12.28",

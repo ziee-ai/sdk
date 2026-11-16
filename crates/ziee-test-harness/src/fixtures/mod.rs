@@ -19,6 +19,11 @@
 //! - [`oauth_mock`] — a scriptable OAuth2/OIDC mock (navikt/mock-oauth2-server
 //!   via testcontainers).
 //! - [`ldap_mock`] — a mock LDAP server (testcontainers).
+//! - [`mock_container`] — the load-tolerant, leak-free container START the
+//!   oauth/ldap mocks route through: a per-attempt docker label (unique per
+//!   start attempt, per process), a bounded re-attempt on testcontainers'
+//!   60 s StartupTimeout, and a label-scoped removal of the timed-out
+//!   container (which testcontainers never hands back).
 //! - [`apple_mock`] — a hand-rolled Apple Sign-In mock (wiremock + an RSA
 //!   keypair + JWKS/token stubs). Its `fixture_p8_path()` resolves a committed
 //!   `.p8` under THIS crate's `tests/fixtures/` via `CARGO_MANIFEST_DIR` — the
@@ -53,6 +58,8 @@ compile_error!(
 pub mod apple_mock;
 #[cfg(feature = "auth-mocks")]
 pub mod ldap_mock;
+#[cfg(feature = "auth-mocks")]
+pub mod mock_container;
 #[cfg(feature = "auth-mocks")]
 pub mod oauth_mock;
 #[cfg(feature = "sync-probe")]

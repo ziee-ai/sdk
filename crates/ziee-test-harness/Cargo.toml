@@ -73,3 +73,14 @@ auth-mocks = [
 # Everything — the pre-split meaning of this flag, preserved exactly so no
 # existing consumer changes behaviour.
 fixtures = ["sync-probe", "auth-mocks"]
+
+# --- fixture self-tests only ---
+# The fixtures' in-crate self-tests (`#[cfg(test)]` in oauth_mock.rs /
+# ldap_mock.rs + fixtures/mock_container.rs) did not compile in this standalone
+# workspace: `ldap3` was absent and reqwest lacked the `json` feature. A
+# consuming app masked it (its own dev-deps unified both). Same
+# versions/features as the app catalog, so the lock unifies. These are
+# test-only: they never reach a consumer's build.
+[dev-dependencies]
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

@@ -1,7 +1,7 @@
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
-    ContainerAsync, GenericImage,
+    ContainerAsync, GenericImage, ImageExt,
 };
 
 /// OAuth2/OIDC mock server using navikt/mock-oauth2-server
@@ -29,61 +29,74 @@ impl OAuthMockServer {
     /// - `/token` - Token endpoint
     /// - `/authorize` - Authorization endpoint
     /// - `/jwks` - JSON Web Key Set
+    ///
+    /// The start is load-tolerant: it runs under the process-wide start gate
+    /// ([`super::mock_container::start_mock`]), re-attempts a
+    /// testcontainers StartupTimeout (bounded), and removes the timed-out
+    /// container by the unique per-attempt label it applies to the container
+    /// at create time (see [`super::mock_container`] — a StartupTimeout
+    /// returns without a `ContainerAsync`, so testcontainers' Drop-based
+    /// removal never runs and the container would leak).
     pub async fn start() -> Result<Self, Box<dyn std::error::Error>> {
-        // Use the mock-oauth2-server Docker image
-        // The OAuth server doesn't log a "ready" message, so we use a simple duration wait
-        let image = GenericImage::new("ghcr.io/navikt/mock-oauth2-server", "2.1.10")
-            .with_exposed_port(ContainerPort::Tcp(8080))
-            .with_wait_for(WaitFor::seconds(5));
+        super::mock_container::start_mock("oauth mock", |attempt_label: String| async move {
+            // Use the mock-oauth2-server Docker image
+            // The OAuth server doesn't log a "ready" message, so we use a simple duration wait
+            let image = GenericImage::new("ghcr.io/navikt/mock-oauth2-server", "2.1.10")
+                .with_exposed_port(ContainerPort::Tcp(8080))
+                .with_wait_for(WaitFor::seconds(5))
+                .with_label(super::mock_container::ATTEMPT_LABEL_KEY, attempt_label);
 
-        let container = image.start().await?;
-        let host = "127.0.0.1".to_string();
-        let port = container.get_host_port_ipv4(8080).await?;
-        let issuer_url = format!("http://{}:{}/default", host, port);
+            let container = image.start().await?;
+            let host = "127.0.0.1".to_string();
+            let port = container.get_host_port_ipv4(8080).await?;
+            let issuer_url = format!("http://{}:{}/default", host, port);
 
-        // Wait for the server to be ready with retry logic
-        let well_known_url = format!("{}/.well-known/openid-configuration", issuer_url);
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()?;
+            // Wait for the server to be ready with retry logic
+            let well_known_url = format!("{}/.well-known/openid-configuration", issuer_url);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()?;
 
-        let max_retries = 10;
-        let mut retry_count = 0;
-        let mut last_error = None;
+            let max_retries = 10;
+            let mut retry_count = 0;
+            let mut last_error = None;
 
-        while retry_count < max_retries {
-            match client.get(&well_known_url).send().await {
-                Ok(response) if response.status().is_success() => {
-                    // Server is ready
-                    break;
-                }
-                Ok(_) | Err(_) => {
-                    last_error = Some(format!("Attempt {} failed", retry_count + 1));
-                    retry_count += 1;
-                    if retry_count < max_retries {
-                        // Exponential backoff: 100ms, 200ms, 400ms, 800ms, etc.
-                        let delay =
-                            std::time::Duration::from_millis(100 * 2_u64.pow(retry_count.min(5)));
-                        tokio::time::sleep(delay).await;
+            while retry_count < max_retries {
+                match client.get(&well_known_url).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        // Server is ready
+                        break;
+                    }
+                    Ok(_) | Err(_) => {
+                        last_error = Some(format!("Attempt {} failed", retry_count + 1));
+                        retry_count += 1;
+                        if retry_count < max_retries {
+                            // Exponential backoff: 100ms, 200ms, 400ms, 800ms, etc.
+                            let delay = std::time::Duration::from_millis(
+                                100 * 2_u64.pow(retry_count.min(5)),
+                            );
+                            tokio::time::sleep(delay).await;
+                        }
                     }
                 }
             }
-        }
 
-        if retry_count >= max_retries {
-            return Err(format!(
-                "OAuth mock server failed to become ready after {} attempts. Last error: {:?}",
-                max_retries, last_error
-            )
-            .into());
-        }
+            if retry_count >= max_retries {
+                return Err(format!(
+                    "OAuth mock server failed to become ready after {} attempts. Last error: {:?}",
+                    max_retries, last_error
+                )
+                .into());
+            }
 
-        Ok(Self {
-            container,
-            host,
-            port,
-            issuer_url,
+            Ok(Self {
+                container,
+                host,
+                port,
+                issuer_url,
+            })
         })
+        .await
     }
 
     /// Get the base URL of the mock server
