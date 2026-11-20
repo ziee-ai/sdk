@@ -15,8 +15,18 @@
 //!
 //! A genuine external `DATABASE_URL` override (a host:port other than the
 //! `:54321` sentinel cluster, as CI/production sets) is honored unchanged.
+//!
+//! The DROP/CREATE/migrate critical section is serialized with a session-level
+//! `pg_advisory_lock` keyed on the build DATABASE NAME (shared
+//! `ziee-build-support::schema_bootstrap`), so two concurrent build scripts
+//! pointed at the same build DB wait for each other instead of racing
+//! `DROP SCHEMA public CASCADE` / `CREATE SCHEMA public`; the DROP itself is
+//! retried on transient lock-table exhaustion (SQLSTATE 53200).
 
 use std::path::PathBuf;
+
+use sqlx::Connection;
+use ziee_build_support::schema_bootstrap;
 
 /// The committed build cluster (matches docker-compose.yaml + the app's
 /// `worktree_db::DEFAULT_BUILD_DB_URL`).
@@ -100,40 +110,40 @@ async fn main() {
         explicit.unwrap()
     };
 
-    let pool = match sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&database_url)
-        .await
-    {
-        Ok(p) => p,
+    // Deliberately a single RAW connection — NOT a pool: the session-level
+    // advisory lock below must live on the very session that performs every
+    // schema write, and a pooled connection could be silently
+    // discarded/replaced after a connection-level error, which would DROP the
+    // session lock and reopen the build race.
+    let mut conn = match sqlx::postgres::PgConnection::connect(&database_url).await {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("\nziee-auth build.rs: failed to connect to build DB: {e}");
             panic!("ziee-auth build DB connection failed");
         }
     };
 
-    // Wipe + reapply the auth migration subset (idempotent, isolated schema).
-    sqlx::query("DROP SCHEMA IF EXISTS public CASCADE")
-        .execute(&pool)
+    // Wipe + reapply the auth migration subset under the per-DB session
+    // advisory lock (idempotent, isolated schema). The lock key derives from
+    // the build DATABASE NAME, so concurrent build scripts pointed at the same
+    // database serialize here — the second waits, then rebuilds a consistent
+    // schema — instead of racing DROP/CREATE. The DROP carries a bounded
+    // SQLSTATE 53200 retry for transient lock-table exhaustion.
+    let lock_key =
+        schema_bootstrap::schema_lock_key(schema_bootstrap::database_name_of(&database_url));
+    schema_bootstrap::bootstrap_schema(&mut conn, lock_key, &migrations_path)
         .await
-        .ok();
-    sqlx::query("CREATE SCHEMA public")
-        .execute(&pool)
-        .await
-        .expect("ziee-auth build.rs: create schema failed");
-    sqlx::query("GRANT ALL ON SCHEMA public TO PUBLIC")
-        .execute(&pool)
-        .await
-        .ok();
+        .unwrap_or_else(|e| {
+            eprintln!("\nziee-auth build.rs: schema bootstrap failed: {e}");
+            panic!("ziee-auth schema bootstrap failed");
+        });
 
-    let migrator = sqlx::migrate::Migrator::new(migrations_path.clone())
-        .await
-        .unwrap_or_else(|e| panic!("ziee-auth build.rs: migrator create failed: {e}"));
-    if let Err(e) = migrator.run(&pool).await {
-        eprintln!("\nziee-auth build.rs: auth migration apply failed: {e}");
-        panic!("ziee-auth migration failed");
+    // Best-effort close: the advisory lock is already released inside the
+    // bootstrap above; on a close failure the process exit ends the session
+    // anyway (the lock can never leak past this build script).
+    if let Err(e) = conn.close().await {
+        eprintln!("Warning: failed to close build-DB connection: {e}");
     }
-    pool.close().await;
 
     println!("cargo:rustc-env=DATABASE_URL={database_url}");
 }

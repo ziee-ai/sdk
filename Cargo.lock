@@ -8728,6 +8728,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "ziee-build-support",
  "ziee-core",
  "ziee-framework",
  "ziee-identity",
@@ -8810,6 +8811,7 @@ dependencies = [
  "tracing",
  "uuid",
  "ziee-auth",
+ "ziee-build-support",
  "ziee-core",
  "ziee-framework",
  "ziee-identity",
@@ -8979,6 +8981,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "ziee-build-support",
  "ziee-core",
  "ziee-framework",
 ]

@@ -10,6 +10,7 @@
 //! Deliberately LEAN + build-DB-free (no compile-time `query!`) so it is cheap to
 //! use as a `[build-dependencies]` entry and needs no build DB to compile itself.
 
+pub mod schema_bootstrap;
 pub mod worktree_db;
 
 mod build_db;

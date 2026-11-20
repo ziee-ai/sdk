@@ -14,9 +14,16 @@
 //!     wipe → migrate → return URL) for a plain app's `build.rs`. Spins its own
 //!     current-thread runtime, so it must NOT be called from inside an existing
 //!     tokio runtime.
+//!
+//! The wipe + migrate of BOTH paths is serialized with a per-DB session-level
+//! pg_advisory_lock (see [`crate::schema_bootstrap`]) so two build scripts
+//! pointed at the same build database never race DROP/CREATE.
 
 use std::path::Path;
 
+use sqlx::Connection;
+
+use crate::schema_bootstrap;
 use crate::worktree_db;
 
 /// Ensure `db_name` exists on the cluster of `base_url`: connect to the
@@ -112,33 +119,32 @@ pub fn provision_build_db_named(db_prefix: &str, migrations_dir: &Path) -> Strin
             explicit.unwrap_or_else(|| worktree_db::DEFAULT_BUILD_DB_URL.to_string())
         };
 
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
+        // Deliberately a single RAW connection — NOT a pool: the session-level
+        // advisory lock in the bootstrap below must live on the very session
+        // that performs every schema write, and a pooled connection could be
+        // silently discarded/replaced after a connection-level error, which
+        // would DROP the session lock and reopen the build race.
+        let mut conn = sqlx::postgres::PgConnection::connect(&database_url)
             .await
             .unwrap_or_else(|e| panic!("build.rs: failed to connect to build DB: {e}"));
 
-        // Wipe + reapply the migration set (idempotent, isolated schema).
-        sqlx::query("DROP SCHEMA IF EXISTS public CASCADE")
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query("CREATE SCHEMA public")
-            .execute(&pool)
-            .await
-            .expect("build.rs: create schema failed");
-        sqlx::query("GRANT ALL ON SCHEMA public TO PUBLIC")
-            .execute(&pool)
-            .await
-            .ok();
-
-        let migrator = sqlx::migrate::Migrator::new(migrations_dir)
-            .await
-            .unwrap_or_else(|e| panic!("build.rs: migrator create failed: {e}"));
-        if let Err(e) = migrator.run(&pool).await {
-            panic!("build.rs: migration apply failed: {e}");
+        // Wipe + reapply the migration set under the per-DB session advisory
+        // lock (idempotent, isolated schema); the DROP carries a bounded
+        // SQLSTATE 53200 retry for transient lock-table exhaustion.
+        let lock_key =
+            schema_bootstrap::schema_lock_key(schema_bootstrap::database_name_of(&database_url));
+        if let Err(e) =
+            schema_bootstrap::bootstrap_schema(&mut conn, lock_key, migrations_dir).await
+        {
+            panic!("build.rs: schema bootstrap failed: {e}");
         }
-        pool.close().await;
+
+        // Best-effort close: the advisory lock is already released inside the
+        // bootstrap above; on a close failure the process exit ends the
+        // session anyway.
+        if let Err(e) = conn.close().await {
+            eprintln!("Warning: failed to close build-DB connection: {e}");
+        }
         database_url
     });
 

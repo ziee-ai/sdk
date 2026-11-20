@@ -34,3 +34,7 @@ futures = "0.3"
 # framework/core stay build-DB-free.
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "postgres", "migrate"] }
+# The per-DB session advisory-lock schema bootstrap (lock → DROP w/ 53200
+# retry → CREATE → migrate → unlock) — the SDK twin of the app's build-db race
+# fix, shared with ziee-notification/ziee-onboarding's provision_build_db.
+ziee-build-support = { path = "../ziee-build-support" }

@@ -16,7 +16,7 @@ edition.workspace = true
 # unifies them without a duplicate build. No `macros` feature → no `query!` →
 # build-DB-free.
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "migrate"] }
-tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 # Isolated temp dirs for the migration-composition unit tests (pure filesystem
